@@ -1084,6 +1084,15 @@ function f4(array $stmts, Arr $item, bool $c): void {
     f5($shared);
 }
 function f5(Ns $n): void { echo get_class($n); }
+class Named { function getName(): string { return ''; } }
+function f8(?object $t, iterable $it, ?int $maybe): string {
+    if (!$t instanceof Named || rand()) { return ''; }
+    $n = $t->getName();
+    if ($maybe === null) { throw new \Exception(); }
+    if (rand()) { $o = 1; } elseif (false === $o = f9()) { $o = 2; }
+    return $n . iterator_count($it) . count(iterator_to_array($it)) . $o;
+}
+function f9(): int|false { return 1; }
 function f6(string|array $contents): int { if (is_string($contents)) { $contents = 'x'; return strlen($contents); } else { return count($contents); } }
 function f3(): int { while (true) { switch (rand()) { case 1: break; default: return 1; } } }
 function f7(): int { for (;;) { for (;;) { switch (rand()) { case 1: break 2; } } if (rand()) { return 1; } } }
@@ -1215,6 +1224,9 @@ fn intelephense_parity() {
     assert!(d.is_empty(), "{d:?}");
     let d = diags("<?php\nfunction sd(bool $s) { if (!$s) { echo 1; } else { $d = 2; } if (!$s) { return 0; } else { return $d; } }\n");
     assert!(d.is_empty(), "{d:?}");
+    // narrowing after a guard that leaves the block
+    assert_eq!(type_at(&format!("<?php\n{classes}function gd(?Stmt $s) {{ if (!$s instanceof ClassMethod) {{ return; }} $s<|>; }}\n")), "ClassMethod");
+    assert_eq!(type_at(&format!("<?php\n{classes}function gn(?Token $s) {{ if ($s === null) {{ throw new \\Exception(); }} $s<|>; }}\n")), "Token");
     // attribute classes
     let d = diags(
         "<?php\nnamespace A;\nuse Sym\\AsCommand;\n#[AsCommand('x'), \\Attribute, \\Override]\nclass C {}\n",

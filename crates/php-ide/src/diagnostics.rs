@@ -500,14 +500,23 @@ fn short_circuit_reaches(sema: &Sema, bin: &SyntaxNode, read: TextSize) -> bool 
 /// Every branch of the `if` (which needs an `else`) defines the variable or
 /// never completes.
 fn exhaustive_if_defines(sema: &Sema, if_stmt: &SyntaxNode, defs: &[TextSize]) -> bool {
-    let Some(else_clause) = if_stmt.children().find(|c| c.kind() == ELSE_CLAUSE) else { return false };
     let body = |n: &SyntaxNode| n.children().find(|c| is_statement(c.kind()) || c.kind() == STMT_LIST);
-    let covers = |b: Option<SyntaxNode>| {
-        b.is_some_and(|b| defs.iter().any(|d| b.text_range().contains(*d)) || always_exits(sema, &b))
-    };
-    covers(body(if_stmt))
-        && if_stmt.children().filter(|c| c.kind() == ELSE_IF_CLAUSE).all(|c| covers(body(&c)))
-        && covers(body(&else_clause))
+    let defines = |n: &SyntaxNode| defs.iter().any(|d| n.text_range().contains(*d));
+    let covers = |b: Option<SyntaxNode>| b.is_some_and(|b| defines(&b) || always_exits(sema, &b));
+    if !covers(body(if_stmt)) {
+        return false;
+    }
+    for clause in if_stmt.children().filter(|c| c.kind() == ELSE_IF_CLAUSE) {
+        // `elseif (false === $x = f())`: every later path has `$x`
+        if clause.children().find(|c| crate::infer::is_expr(c.kind())).is_some_and(|c| defines(&c)) {
+            return true;
+        }
+        if !covers(body(&clause)) {
+            return false;
+        }
+    }
+    let Some(else_clause) = if_stmt.children().find(|c| c.kind() == ELSE_CLAUSE) else { return false };
+    covers(body(&else_clause))
 }
 
 /// `if (C) { $x = ...; } ... if (C) { ...$x... }`: the same condition guards

@@ -69,7 +69,10 @@ impl Checker<'_, '_> {
                 !strict && (index.find_method(c, "__toString").is_some() || self.unknown(c))
             }
             (Type::Int | Type::Float | Type::String, _) => false,
-            (Type::Array(..) | Type::List(_) | Type::Shape(_), a) => is_arrayish(a),
+            // `iterable` may be an array
+            (Type::Array(..) | Type::List(_) | Type::Shape(_), a) => {
+                is_arrayish(a) || matches!(a, Type::Iterable(..))
+            }
             (Type::Iterable(..), a) => {
                 is_arrayish(a)
                     || matches!(a, Type::Iterable(..) | Type::Object)
@@ -90,6 +93,8 @@ impl Checker<'_, '_> {
             (Type::Resource, a) => matches!(a, Type::Resource),
             (Type::Named(p, _), a) => match a {
                 Type::Callable if p.short().eq_ignore_ascii_case("Closure") => true,
+                // `iterable` may be a Traversable; resources became objects in PHP 8
+                Type::Iterable(..) | Type::Resource => true,
                 Type::Named(c, _) => {
                     self.unknown(c) || self.unknown(p) || index.is_subtype(c, p) || is_closure_like(p, a)
                 }

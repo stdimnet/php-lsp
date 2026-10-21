@@ -700,7 +700,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         let offset = at.text_range().start();
         let scope = self.sema.variable_scope(at);
         // a narrowing condition wins unless the variable is reassigned after it
-        let narrowed = self.narrowed(name, at, &scope);
+        let narrowed = self.narrowed(name, at, &scope).or_else(|| self.narrowed_by_guard(name, at, &scope));
         let mut best: Option<(TextSize, Type)> = None;
         let consider =
             |pos: TextSize, ty: Box<dyn FnOnce() -> Type + '_>, best: &mut Option<(TextSize, Type)>| {
@@ -1162,6 +1162,75 @@ impl<'s, 'a> Infer<'s, 'a> {
     }
 
     /// `if ($x instanceof Foo) { ... $x ... }`
+    /// Narrowing by an earlier guard that leaves the block:
+    /// `if (!$x instanceof T) { return; }`, `if ($x === null) { throw ...; }`.
+    fn narrowed_by_guard(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<(Type, TextSize)> {
+        let offset = at.text_range().start();
+        for block in at
+            .ancestors()
+            .take_while(|a| a != scope)
+            .filter(|a| matches!(a.kind(), BLOCK | STMT_LIST | SOURCE_FILE))
+        {
+            // the closest guard before `at` wins
+            let guards: Vec<SyntaxNode> =
+                block.children().filter(|c| c.kind() == IF_STMT && c.text_range().end() <= offset).collect();
+            for guard in guards.iter().rev() {
+                if guard.children().any(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE)) {
+                    continue;
+                }
+                let Some(cond) = expr_children(guard).next() else { continue };
+                let Some(body) = guard.children().find(|c| !is_expr(c.kind())) else { continue };
+                if !leaves(&body) {
+                    continue;
+                }
+                if let Some(t) = self.guard_type(&cond, name) {
+                    return Some((t, guard.text_range().end()));
+                }
+            }
+        }
+        None
+    }
+
+    /// The type of `$name` when `cond` is false.
+    fn guard_type(&self, cond: &SyntaxNode, name: &str) -> Option<Type> {
+        let is_var = |n: &SyntaxNode| {
+            n.kind() == VARIABLE_EXPR
+                && ast::VariableExpr::cast(n.clone()).and_then(|v| v.name()).as_deref() == Some(name)
+        };
+        match cond.kind() {
+            PAREN_EXPR => self.guard_type(&expr_children(cond).next()?, name),
+            // `!$x instanceof T`, `!$x`
+            PREFIX_EXPR if cond.children_with_tokens().any(|e| e.kind() == BANG) => {
+                let inner = negated(cond)?;
+                if is_var(&inner) {
+                    let t = self.variable_type(name, cond).without_null();
+                    return (!t.is_mixed()).then_some(t);
+                }
+                self.instanceof_condition(&inner, name)
+            }
+            // `a || b`: both are false afterwards
+            BIN_EXPR if cond.children_with_tokens().any(|e| matches!(e.kind(), PIPE2 | OR_KW)) => {
+                expr_children(cond).find_map(|c| self.guard_type(&c, name))
+            }
+            // `$x === null` / `null === $x` / `is_null($x)`
+            BIN_EXPR if cond.children_with_tokens().any(|e| matches!(e.kind(), EQ3 | EQ2)) => {
+                let parts: Vec<SyntaxNode> = expr_children(cond).collect();
+                let is_null = |n: &SyntaxNode| ast::text_without_trivia(n).eq_ignore_ascii_case("null");
+                let var_side = match parts.as_slice() {
+                    [a, b] if is_null(b) && is_var(a) => true,
+                    [a, b] if is_null(a) && is_var(b) => true,
+                    _ => false,
+                };
+                if !var_side {
+                    return None;
+                }
+                let t = self.variable_type(name, cond).without_null();
+                (!t.is_mixed()).then_some(t)
+            }
+            _ => None,
+        }
+    }
+
     fn narrowed(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<(Type, TextSize)> {
         for anc in at.ancestors() {
             if &anc == scope {
@@ -1316,6 +1385,22 @@ fn is_first_class_callable(call: &SyntaxNode) -> bool {
         let toks: Vec<_> =
             l.children_with_tokens().filter(|e| !e.kind().is_trivia()).map(|e| e.kind()).collect();
         toks == [L_PAREN, DOT3, R_PAREN]
+    })
+}
+
+/// A statement / block that never completes normally: it ends with
+/// `return`, `throw`, `exit`, `continue` or `break`.
+fn leaves(body: &SyntaxNode) -> bool {
+    let last = if matches!(body.kind(), BLOCK | STMT_LIST) {
+        body.children().filter(|c| !is_expr(c.kind())).last()
+    } else {
+        Some(body.clone())
+    };
+    last.is_some_and(|s| match s.kind() {
+        RETURN_STMT | THROW_STMT | CONTINUE_STMT | BREAK_STMT => true,
+        EXPR_STMT => s.children().next().is_some_and(|e| matches!(e.kind(), THROW_EXPR | EXIT_EXPR)),
+        BLOCK => leaves(&s),
+        _ => false,
     })
 }
 
