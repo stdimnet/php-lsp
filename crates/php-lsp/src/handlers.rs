@@ -848,30 +848,20 @@ fn code_lens_resolve(s: &mut Server, mut lens: lsp::CodeLens) -> lsp::CodeLens {
         )?;
         let locations: Vec<lsp::Location> =
             r.targets.iter().filter_map(|t| s.location(t.file, t.focus)).collect();
+        // `editor.action.peekLocations` is the command the Intelephense VS Code
+        // middleware converts into VS Code objects (uri, position, locations).
         let command = if s.caps.vscode {
-            if kind == php_ide::CodeLensKind::Parent {
-                let loc = locations.first()?;
-                lsp::Command {
-                    title: r.title,
-                    command: "editor.action.goToLocations".into(),
-                    arguments: Some(vec![
-                        serde_json::to_value(&uri).ok()?,
-                        serde_json::to_value(lens.range.start).ok()?,
-                        serde_json::to_value(vec![loc]).ok()?,
-                        serde_json::json!("goto"),
-                        serde_json::json!(""),
-                    ]),
-                }
-            } else {
-                lsp::Command {
-                    title: r.title,
-                    command: "editor.action.showReferences".into(),
-                    arguments: Some(vec![
-                        serde_json::to_value(&uri).ok()?,
-                        serde_json::to_value(lens.range.start).ok()?,
-                        serde_json::to_value(locations).ok()?,
-                    ]),
-                }
+            let mode =
+                if kind == php_ide::CodeLensKind::Parent && locations.len() == 1 { "goto" } else { "peek" };
+            lsp::Command {
+                title: r.title,
+                command: "editor.action.peekLocations".into(),
+                arguments: Some(vec![
+                    serde_json::to_value(&uri).ok()?,
+                    serde_json::to_value(lens.range.start).ok()?,
+                    serde_json::to_value(locations).ok()?,
+                    serde_json::json!(mode),
+                ]),
             }
         } else {
             lsp::Command { title: r.title, command: String::new(), arguments: None }

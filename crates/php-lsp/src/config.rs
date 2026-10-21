@@ -258,4 +258,20 @@ mod tests {
         c.update(&json!({"php-lsp.environment.phpVersion": "8.2"}));
         assert_eq!(c.php_version, PhpVersion::PHP_8_2);
     }
+
+    #[test]
+    fn reads_settings_merged_by_vscode_middleware() {
+        let mut c = ServerConfig::default();
+        c.update(&json!({"intelephense": {
+            "files": {"associations": ["*.php", "*.phtml", "*.inc"], "exclude": ["**/.git/**", "**/node_modules/**"], "maxSize": 1000000},
+            "diagnostics": {"run": "onSave", "undefinedTypes": true},
+            "shortOpenEchoAutoClose": true, "runtime": null, "maxMemory": 2048,
+            "telemetry": {"enabled": false}, "licenceKey": null
+        }}));
+        assert!(c.diagnostics_on_save);
+        assert_eq!(c.associations, vec!["*.php", "*.phtml", "*.inc"]);
+        assert_eq!(c.exclude.len(), 2);
+        c.update(&json!({"intelephense": {"diagnostics": {"run": null}}}));
+        assert!(c.diagnostics_on_save);
+    }
 }

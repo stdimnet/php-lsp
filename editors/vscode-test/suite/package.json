@@ -1,0 +1,8 @@
+{
+  "name": "php-lsp-vscode-test-suite",
+  "version": "0.0.0",
+  "publisher": "php-lsp",
+  "engines": { "vscode": "^1.80.0" },
+  "main": "./index.js",
+  "activationEvents": []
+}

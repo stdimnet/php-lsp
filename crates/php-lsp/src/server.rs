@@ -96,7 +96,13 @@ impl Server {
                 storage = Some(PathBuf::from(s));
             }
         }
-        let caps = client_caps(&params);
+        let mut caps = client_caps(&params);
+        // sent by the Intelephense VS Code extension
+        if params.initialization_options.as_ref().and_then(|o| o.get("isVscode")).and_then(Value::as_bool)
+            == Some(true)
+        {
+            caps.vscode = true;
+        }
         let roots = workspace_roots(&params);
         let result = lsp::InitializeResult {
             capabilities: capabilities(encoding),

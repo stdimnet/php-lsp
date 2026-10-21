@@ -114,7 +114,8 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   file rename → class rename + PSR-4 namespace update (`workspace/willRenameFiles`),
   HTML in templates (tag / attribute / closing tag completion, linked editing of tag names)
 - [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
-  `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher
+  `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher,
+  tested inside the real Intelephense VS Code extension (`editors/vscode-test`)
 - [x] **Phase 6, extras:** extract variable / method / constant, inline variable,
   constructor promotion, generate constructor, add return type, PSR-4 namespace fix,
   unused detection, PHPStan / Psalm / PHPCS diagnostics, php-cs-fixer / phpcbf formatting,
