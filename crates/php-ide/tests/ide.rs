@@ -578,3 +578,139 @@ fn phpunit_lenses() {
         .collect();
     assert_eq!(filters, vec!["UserTest", "UserTest::testName", "UserTest::itWorks"]);
 }
+
+/// Creates a project directory with files and indexes its PHP files.
+fn project(name: &str, files: &[(&str, &str)]) -> (Workspace, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("php-lsp-plugin-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (path, text) in files {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    let mut ws = Workspace::new(Config::default());
+    for (path, kind) in php_ide::collect_files(&dir, &php_ide::ScanConfig::default()) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        ws.index_file(&format!("file://{}", path.display()), text.into(), kind);
+    }
+    (ws, dir)
+}
+
+fn open_with_cursor(ws: &mut Workspace, dir: &std::path::Path, path: &str, text: &str) -> (FileId, TextSize) {
+    let offset = TextSize::from(text.find("<|>").unwrap() as u32);
+    let id = ws.set_file(&format!("file://{}", dir.join(path).display()), text.replacen("<|>", "", 1));
+    (id, offset)
+}
+
+#[test]
+fn laravel_plugin() {
+    let (mut ws, dir) = project(
+        "laravel",
+        &[
+            ("composer.json", "{}"),
+            ("artisan", "#!/usr/bin/env php"),
+            (".env", "APP_NAME=Laravel\nDB_HOST=127.0.0.1\n"),
+            ("config/app.php", "<?php\nreturn ['name' => env('APP_NAME'), 'providers' => ['x' => 1]];\n"),
+            ("resources/views/welcome.blade.php", "<h1>Hi</h1>"),
+            ("resources/views/admin/dashboard.blade.php", "<h1>Admin</h1>"),
+            ("routes/web.php", "<?php\nRoute::get('/', fn () => view('welcome'))->name('home');\nRoute::get('/a', fn () => 1)->name('admin.index');\n"),
+            ("lang/en/messages.php", "<?php\nreturn ['welcome' => 'Welcome!'];\n"),
+            (
+                "vendor/laravel/framework/src/Model.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent;\nabstract class Model { public function hasMany($related) {} public function belongsTo($related) {} }\nclass Collection {}\nnamespace Illuminate\\Database\\Eloquent\\Relations;\nabstract class Relation {}\nclass HasMany extends Relation {}\nclass BelongsTo extends Relation {}\n",
+            ),
+            ("app/Models/Post.php", "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Post extends Model { public function title(): string { return ''; } }\n"),
+            (
+                "app/Models/User.php",
+                "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nuse Illuminate\\Database\\Eloquent\\Relations\\HasMany;\nclass User extends Model {\n    public function posts(): HasMany { return $this->hasMany(Post::class); }\n}\n",
+            ),
+            ("app/Services/Billing.php", "<?php\nnamespace App\\Services;\nclass Billing { public function charge(): bool { return true; } }\n"),
+        ],
+    );
+    let labels = |ws: &Workspace, id, offset| -> Vec<String> {
+        let mut l: Vec<String> = ws.completions(id, offset).items.into_iter().map(|i| i.label).collect();
+        l.sort();
+        l
+    };
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\nconfig('app.<|>');\n");
+    let l = labels(&ws, id, off);
+    assert!(l.contains(&"app.name".to_string()) && l.contains(&"app.providers.x".to_string()), "{l:?}");
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\nview('<|>');\n");
+    assert_eq!(labels(&ws, id, off), vec!["admin.dashboard", "welcome"]);
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\nroute('<|>');\n");
+    assert_eq!(labels(&ws, id, off), vec!["admin.index", "home"]);
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\nenv('DB<|>');\n");
+    assert_eq!(labels(&ws, id, off), vec!["DB_HOST"]);
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\n__('mess<|>');\n");
+    assert_eq!(labels(&ws, id, off), vec!["messages.welcome"]);
+    // goto definition of a view
+    let (id, off) = open_with_cursor(&mut ws, &dir, "app/x.php", "<?php\nview('wel<|>come');\n");
+    let targets = ws.string_targets(id, off);
+    assert!(targets[0].0.ends_with("resources/views/welcome.blade.php"), "{targets:?}");
+    // types
+    let (id, off) = open_with_cursor(
+        &mut ws,
+        &dir,
+        "app/x.php",
+        "<?php\n$b = app(\\App\\Services\\Billing::class);\n$b<|>;\n",
+    );
+    assert_eq!(ws.type_at(id, off).unwrap(), "App\\Services\\Billing");
+    let (id, off) = open_with_cursor(
+        &mut ws,
+        &dir,
+        "app/x.php",
+        "<?php\nfunction f(\\App\\Models\\User $u) { $u->posts<|>; }\n",
+    );
+    assert_eq!(
+        ws.type_at(id, off).unwrap(),
+        "Illuminate\\Database\\Eloquent\\Collection<int, App\\Models\\Post>"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn symfony_and_wordpress_plugins() {
+    let (mut ws, dir) = project(
+        "symfony",
+        &[
+            ("composer.json", "{}"),
+            ("symfony.lock", "{}"),
+            ("templates/home/index.html.twig", "hi"),
+            (
+                "src/Controller/HomeController.php",
+                "<?php\nnamespace App\\Controller;\nuse Symfony\\Component\\Routing\\Attribute\\Route;\nclass HomeController {\n    #[Route('/', name: 'app_home')]\n    public function index() {}\n}\n",
+            ),
+            ("vendor/psr/ContainerInterface.php", "<?php\nnamespace Psr\\Container;\ninterface ContainerInterface { public function get(string $id); }\n"),
+            ("src/Mailer.php", "<?php\nnamespace App;\nclass Mailer {}\n"),
+            ("wp/plugin.php", "<?php\ndo_action('my_plugin_init');\n$v = apply_filters('my_plugin_title', 'x');\n"),
+        ],
+    );
+    let labels = |ws: &Workspace, id, offset| -> Vec<String> {
+        ws.completions(id, offset).items.into_iter().map(|i| i.label).collect()
+    };
+    let (id, off) = open_with_cursor(
+        &mut ws,
+        &dir,
+        "src/Controller/X.php",
+        "<?php\nclass X { function a($c) { return $c->redirectToRoute('<|>'); } }\n",
+    );
+    assert_eq!(labels(&ws, id, off), vec!["app_home"]);
+    let (id, off) = open_with_cursor(
+        &mut ws,
+        &dir,
+        "src/Controller/X.php",
+        "<?php\nclass X { function a($c) { return $c->render('<|>'); } }\n",
+    );
+    assert_eq!(labels(&ws, id, off), vec!["home/index.html.twig"]);
+    let (id, off) = open_with_cursor(&mut ws, &dir, "src/x.php", "<?php\nfunction f(\\Psr\\Container\\ContainerInterface $c) { $m = $c->get(\\App\\Mailer::class); $m<|>; }\n");
+    assert_eq!(ws.type_at(id, off).unwrap(), "App\\Mailer");
+    let (id, off) = open_with_cursor(&mut ws, &dir, "wp/other.php", "<?php\nadd_action('<|>', 'cb');\n");
+    assert_eq!(labels(&ws, id, off), vec!["my_plugin_init"]);
+    let (id, off) = open_with_cursor(&mut ws, &dir, "wp/other.php", "<?php\nadd_filter('my<|>', 'cb');\n");
+    assert_eq!(labels(&ws, id, off), vec!["my_plugin_title"]);
+    let (id, off) =
+        open_with_cursor(&mut ws, &dir, "wp/other.php", "<?php\nadd_filter('my_plugin<|>_title', 'cb');\n");
+    let targets = ws.string_targets(id, off);
+    assert!(targets[0].0.ends_with("wp/plugin.php") && targets[0].1 == 2, "{targets:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

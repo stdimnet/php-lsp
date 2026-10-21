@@ -448,12 +448,65 @@ impl<'s, 'a> Infer<'s, 'a> {
         ret.substitute(&subst)
     }
 
+    /// Argument summary for plugins.
+    pub(crate) fn arg_infos(&self, args: Option<&SyntaxNode>) -> Vec<crate::plugins::ArgInfo> {
+        use crate::plugins::ArgInfo;
+        let Some(args) = args else { return Vec::new() };
+        args.children()
+            .filter(|c| c.kind() == ARG)
+            .map(|arg| {
+                let Some(e) = arg.children().find(|c| is_expr(c.kind())) else { return ArgInfo::Other };
+                match e.kind() {
+                    CLASS_CONST_FETCH_EXPR
+                        if e.children()
+                            .find_map(ast::MemberName::cast)
+                            .and_then(|m| m.text())
+                            .is_some_and(|n| n.eq_ignore_ascii_case("class")) =>
+                    {
+                        match e.first_child().and_then(|l| {
+                            crate::classify::static_lhs_classes(self.sema, &l).into_iter().next()
+                        }) {
+                            Some(c) => ArgInfo::ClassString(c),
+                            None => ArgInfo::Other,
+                        }
+                    }
+                    LITERAL => match e.first_token().filter(|t| t.kind() == STRING) {
+                        Some(t) => ArgInfo::String(crate::plugins::unquote(t.text())),
+                        None => ArgInfo::Other,
+                    },
+                    _ => ArgInfo::Other,
+                }
+            })
+            .collect()
+    }
+
+    fn plugin_call_type(&self, callee: crate::plugins::Callee, args: Option<&SyntaxNode>) -> Option<Type> {
+        let plugins = self.sema.ws.plugins();
+        if plugins.is_empty() {
+            return None;
+        }
+        let call = crate::plugins::CallInfo { callee, args: self.arg_infos(args) };
+        let cx = crate::plugins::PluginCx { ws: self.sema.ws, file: self.sema.file };
+        plugins.iter().find_map(|p| p.call_return_type(&cx, &call))
+    }
+
     fn call_type(&self, node: &SyntaxNode) -> Type {
         let Some(callee) = node.first_child() else { return Type::Mixed };
         let args = node.children().find(|c| c.kind() == ARG_LIST);
         if callee.kind() == NAME_EXPR {
             let text = ast::text_without_trivia(&callee);
-            return match self.sema.resolve_function(&text, callee.text_range().start()) {
+            let found = self.sema.resolve_function(&text, callee.text_range().start());
+            let fqn = match found {
+                Some((_, f)) => f.fqn.clone(),
+                None => {
+                    let r = self.sema.scope_at(callee.text_range().start()).resolve_function(&text);
+                    r.fallback.unwrap_or(r.name)
+                }
+            };
+            if let Some(t) = self.plugin_call_type(crate::plugins::Callee::Function(fqn), args.as_ref()) {
+                return t;
+            }
+            return match found {
                 Some((_, f)) => self.function_return(f, args.as_ref()),
                 None => Type::Mixed,
             };
@@ -491,6 +544,15 @@ impl<'s, 'a> Infer<'s, 'a> {
         let receiver_ty =
             node.first_child().filter(|_| node.kind() == METHOD_CALL_EXPR).map(|r| self.expr_type(&r));
         for class in self.receiver_classes(node) {
+            let callee = crate::plugins::Callee::Method {
+                class: class.clone(),
+                name: name.clone(),
+                is_static: node.kind() == STATIC_CALL_EXPR,
+            };
+            if let Some(t) = self.plugin_call_type(callee, args.as_ref()) {
+                out.push(t);
+                continue;
+            }
             let Some(m) = self.sema.index().find_method(&class, &name) else { continue };
             let mut t = self.function_return(m.def, args.as_ref());
             // class level generics: `Collection<User>` with `@template T`
@@ -527,6 +589,11 @@ impl<'s, 'a> Infer<'s, 'a> {
                     out.push(self.resolve_rel(&t, Some(&p.owner.fqn), Some(&class)));
                     continue;
                 }
+            }
+            let cx = crate::plugins::PluginCx { ws: self.sema.ws, file: self.sema.file };
+            if let Some(t) = self.sema.ws.plugins().iter().find_map(|p| p.property_type(&cx, &class, &name)) {
+                out.push(t);
+                continue;
             }
             // enum `->name` / `->value`
             if let Some((_, c)) = self.sema.index().class(&class) {

@@ -171,7 +171,25 @@ fn locations(s: &Server, locs: Vec<php_ide::Location>) -> Option<lsp::GotoDefini
 fn definition(s: &mut Server, p: lsp::GotoDefinitionParams) -> Option<lsp::GotoDefinitionResponse> {
     let (id, offset) = position(s, &p.text_document_position_params)?;
     let locs = s.workspace.goto_definition(id, offset);
-    locations(s, locs)
+    if !locs.is_empty() {
+        return locations(s, locs);
+    }
+    // string arguments resolved by framework plugins (views, config keys, routes, hooks)
+    let targets: Vec<lsp::Location> = s
+        .workspace
+        .string_targets(id, offset)
+        .into_iter()
+        .filter_map(|(key, line)| {
+            let uri: lsp::Uri = crate::uri::uri_from_key(&key).parse().ok()?;
+            let pos = lsp::Position::new(line, 0);
+            Some(lsp::Location { uri, range: lsp::Range::new(pos, pos) })
+        })
+        .collect();
+    if targets.is_empty() {
+        None
+    } else {
+        Some(lsp::GotoDefinitionResponse::Array(targets))
+    }
 }
 
 fn type_definition(s: &mut Server, p: lsp::GotoDefinitionParams) -> Option<lsp::GotoDefinitionResponse> {
@@ -227,6 +245,7 @@ fn completion_kind(k: CompletionKind) -> lsp::CompletionItemKind {
         CompletionKind::Keyword => lsp::CompletionItemKind::KEYWORD,
         CompletionKind::Namespace => lsp::CompletionItemKind::MODULE,
         CompletionKind::Snippet => lsp::CompletionItemKind::SNIPPET,
+        CompletionKind::File => lsp::CompletionItemKind::FILE,
     }
 }
 

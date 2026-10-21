@@ -25,6 +25,7 @@ pub enum CompletionKind {
     Keyword,
     Namespace,
     Snippet,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,7 +271,11 @@ impl Cx<'_, '_> {
                 }
                 return;
             }
-            STRING | ENCAPSED_TEXT | COMMENT | INLINE_HTML | HEREDOC_START => return,
+            STRING => {
+                self.string_values(&left);
+                return;
+            }
+            ENCAPSED_TEXT | COMMENT | INLINE_HTML | HEREDOC_START => return,
             _ => {}
         }
         // the identifier being typed (prefix) and its range
@@ -798,6 +803,30 @@ impl Cx<'_, '_> {
         }
     }
 
+    /// Values for a string literal argument contributed by plugins.
+    fn string_values(&mut self, token: &SyntaxToken) {
+        let Some((arg, content)) = string_arg_at(self.sema, self.offset) else { return };
+        let cx = crate::plugins::PluginCx { ws: self.sema.ws, file: self.sema.file };
+        let prefix_len = usize::from(self.offset.checked_sub(content.start()).unwrap_or_default());
+        let prefix: String = arg.value.chars().take(prefix_len).collect();
+        let _ = token;
+        let mut seen = HashSet::new();
+        for p in self.sema.ws.plugins() {
+            for c in p.string_candidates(&cx, &arg) {
+                if !c.value.to_ascii_lowercase().contains(&prefix.to_ascii_lowercase())
+                    || !seen.insert(c.value.clone())
+                {
+                    continue;
+                }
+                let mut item = CompletionItem::new(c.value.clone(), c.kind, content);
+                item.detail = c.detail;
+                item.sort_text =
+                    Some(format!("{}{}", if c.value.starts_with(&prefix) { 0 } else { 1 }, c.value));
+                self.items.push(item);
+            }
+        }
+    }
+
     /// `/** */` directly before a declaration: offer a generated PHPDoc.
     fn docblock(&mut self, token: &SyntaxToken) -> bool {
         let inner = token.text().trim_start_matches("/**").trim_end_matches("*/");
@@ -884,4 +913,53 @@ pub(crate) fn use_edit(sema: &Sema, scope: &NamespaceScope, what: &str) -> TextE
         format!("\nuse {what};\n")
     };
     TextEdit { range: TextRange::empty(at), new_text }
+}
+
+/// The string literal argument at `offset`: plugin info and the range of
+/// its content (between the quotes).
+pub(crate) fn string_arg_at(sema: &Sema, offset: TextSize) -> Option<(crate::plugins::StringArg, TextRange)> {
+    use crate::plugins::{Callee, StringArg};
+    use php_syntax::ast::AstNode;
+    let token = sema.root.token_at_offset(offset).find(|t| t.kind() == STRING)?;
+    let r = token.text_range();
+    let text = token.text();
+    let quote_len = TextSize::from(1);
+    let closed = text.len() >= 2 && text.ends_with(&text[..1]);
+    let content = TextRange::new(r.start() + quote_len, if closed { r.end() - quote_len } else { r.end() });
+    if !content.contains_inclusive(offset) {
+        return None;
+    }
+    let lit = token.parent().filter(|p| p.kind() == LITERAL)?;
+    let arg = lit.parent().filter(|p| p.kind() == ARG)?;
+    let list = arg.parent()?;
+    let call = list.parent()?;
+    let index = list.children().filter(|c| c.kind() == ARG).position(|a| a == arg)?;
+    let callee = match call.kind() {
+        CALL_EXPR => {
+            let callee = call.first_child().filter(|c| c.kind() == NAME_EXPR)?;
+            let name = php_syntax::ast::text_without_trivia(&callee);
+            let fqn = match sema.resolve_function(&name, callee.text_range().start()) {
+                Some((_, f)) => f.fqn.clone(),
+                None => {
+                    let r = sema.scope_at(callee.text_range().start()).resolve_function(&name);
+                    r.fallback.unwrap_or(r.name)
+                }
+            };
+            Callee::Function(fqn)
+        }
+        METHOD_CALL_EXPR | STATIC_CALL_EXPR => {
+            let name = call.children().find_map(php_syntax::ast::MemberName::cast)?.text()?;
+            let lhs = call.first_child()?;
+            let classes = if call.kind() == STATIC_CALL_EXPR {
+                crate::classify::static_lhs_classes(sema, &lhs)
+            } else {
+                sema.infer().expr_type(&lhs).class_names()
+            };
+            let class = classes.into_iter().next().unwrap_or_else(|| Fqn::new(""));
+            Callee::Method { class, name, is_static: call.kind() == STATIC_CALL_EXPR }
+        }
+        _ => return None,
+    };
+    let value = sema.text[content].to_string();
+    Some((StringArg { callee, index, value }, content))
 }

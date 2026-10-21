@@ -116,7 +116,16 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   constructor promotion, generate constructor, add return type, PSR-4 namespace fix,
   unused detection, PHPStan / Psalm / PHPCS diagnostics, php-cs-fixer / phpcbf formatting,
   PHPUnit code lenses
-- [ ] **Phase 7, frameworks:** plugin API, Laravel, Symfony, WordPress
+- [x] **Phase 7, frameworks:** plugin API (`php_ide::plugins::Plugin`, register your own with
+  `Workspace::register_plugin`) with built-in plugins:
+  - **Laravel:** `app()` / `resolve()` / `make()` container types, Eloquent relations as
+    properties (`$user->posts` → `Collection<int, Post>`), completion + go to definition for
+    `config()`, `view()`, `route()`, `__()` / `trans()` and `env()`
+  - **Symfony:** typed `$container->get(Foo::class)` and Doctrine `getRepository()`, route
+    names (`#[Route(name: ...)]`, YAML) and Twig templates for `redirectToRoute()`,
+    `generateUrl()`, `render()`
+  - **WordPress:** action / filter hook names for `add_action()`, `add_filter()`, ... from
+    `do_action()` / `apply_filters()` calls, with go to definition
 
 ## Development
 

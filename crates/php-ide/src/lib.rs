@@ -27,6 +27,7 @@ mod infer;
 mod inlay_hints;
 mod line_index;
 mod navigation;
+pub mod plugins;
 mod refactor;
 mod rename;
 mod render;
@@ -129,6 +130,9 @@ pub struct Workspace {
     /// While `false` (e.g. during initial indexing) diagnostics about
     /// undefined symbols are suppressed.
     index_not_ready: bool,
+    plugins: plugins::Plugins,
+    /// Incremented on every change (used to invalidate plugin caches).
+    revision: u64,
 }
 
 impl Workspace {
@@ -142,6 +146,20 @@ impl Workspace {
 
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Changes whenever a file is added, changed or removed.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Adds a framework plugin (Laravel, Symfony and WordPress are built in).
+    pub fn register_plugin(&mut self, plugin: Arc<dyn plugins::Plugin>) {
+        self.plugins.0.push(plugin);
+    }
+
+    pub fn plugins(&self) -> &[Arc<dyn plugins::Plugin>] {
+        &self.plugins.0
     }
 
     /// Whether the index is complete enough to report undefined symbols.
@@ -196,6 +214,7 @@ impl Workspace {
 
     fn set_file_with_kind(&mut self, path: &str, text: String, kind: FileKind) -> FileId {
         let id = self.file_id_or_insert(path);
+        self.revision += 1;
         let parse = php_syntax::parse(&text, self.config.php_version);
         let (scopes, symbols) = php_hir::analyze_file(&parse.tree(), self.opts());
         self.index.set_file(id, kind, Arc::new(symbols));
@@ -224,6 +243,7 @@ impl Workspace {
             return id;
         }
         self.index.set_file(id, file.kind, file.symbols);
+        self.revision += 1;
         let line_index = Arc::new(LineIndex::new(&file.text));
         self.files[id.0 as usize] =
             Some(SourceFile { path: file.path, kind: file.kind, text: file.text, line_index, open: None });
@@ -247,6 +267,7 @@ impl Workspace {
     }
 
     pub fn remove_file(&mut self, id: FileId) {
+        self.revision += 1;
         if let Some(slot) = self.files.get_mut(id.0 as usize) {
             if let Some(file) = slot.take() {
                 self.ids.remove(&file.path);
@@ -472,6 +493,21 @@ impl Workspace {
     /// Semantic tokens of a file (optionally limited to `range`).
     pub fn semantic_tokens(&self, id: FileId, range: Option<TextRange>) -> Vec<SemanticToken> {
         sema::Sema::new(self, id).map(|s| semantic_tokens::semantic_tokens(&s, range)).unwrap_or_default()
+    }
+
+    /// Definition targets of the string literal at `offset` contributed by
+    /// plugins (config keys, views, routes, hooks, ...): `(path key, line)`.
+    pub fn string_targets(&self, id: FileId, offset: TextSize) -> Vec<(String, u32)> {
+        let Some(sema) = sema::Sema::new(self, id) else { return Vec::new() };
+        let Some((arg, _)) = completion::string_arg_at(&sema, offset) else { return Vec::new() };
+        let cx = plugins::PluginCx { ws: self, file: id };
+        self.plugins
+            .0
+            .iter()
+            .flat_map(|p| p.string_candidates(&cx, &arg))
+            .filter(|c| c.value == arg.value)
+            .filter_map(|c| c.location)
+            .collect()
     }
 
     /// The inferred type of the expression at `offset`, rendered as text.
