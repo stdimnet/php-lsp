@@ -18,7 +18,7 @@ pub mod ast;
 
 use std::fmt::Write;
 
-pub use lexer::{tokenize, LexError, Token};
+pub use lexer::{tokenize, tokenize_from, LexError, Token};
 pub use rowan::{Direction, NodeOrToken, TextRange, TextSize, TokenAtOffset, WalkEvent};
 pub use syntax_kind::SyntaxKind;
 pub use version::PhpVersion;
@@ -90,7 +90,17 @@ impl Parse {
 
 /// Parses PHP source text.
 pub fn parse(text: &str, version: PhpVersion) -> Parse {
-    let (tokens, lex_errors) = tokenize(text, version);
+    parse_from(text, version, false)
+}
+
+/// Parses PHP code without an open tag (the text starts in PHP mode), e.g.
+/// code generated from templates.
+pub fn parse_php_code(text: &str, version: PhpVersion) -> Parse {
+    parse_from(text, version, true)
+}
+
+fn parse_from(text: &str, version: PhpVersion, php_code: bool) -> Parse {
+    let (tokens, lex_errors) = tokenize_from(text, version, php_code);
     let mut p = parser::Parser::new(text, &tokens, version);
     grammar::source_file(&mut p);
     let (green, parse_errors) = p.finish();

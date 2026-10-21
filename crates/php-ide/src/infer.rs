@@ -711,6 +711,9 @@ impl<'s, 'a> Infer<'s, 'a> {
             }
         }
 
+        // in templates the loop body follows `@foreach(...)` as separate statements
+        let template = scope.kind() == SOURCE_FILE
+            && self.sema.ws.file(self.sema.file).is_some_and(|f| crate::blade::is_blade(&f.path));
         let mut stack: Vec<SyntaxNode> = scope.children().collect();
         while let Some(n) = stack.pop() {
             if n.text_range().start() >= offset {
@@ -741,7 +744,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                         }
                     }
                 }
-                FOREACH_STMT if n.text_range().contains(offset) => {
+                FOREACH_STMT if n.text_range().contains(offset) || template => {
                     let iter = expr_children(&n).next();
                     let bound = |child_kind: SyntaxKind, best: &mut Option<(TextSize, Type)>, key: bool| {
                         let Some(binding) = n.children().find(|c| c.kind() == child_kind) else { return };
@@ -847,11 +850,26 @@ impl<'s, 'a> Infer<'s, 'a> {
                 }
             }
         }
+        if best.is_none() && scope.kind() == SOURCE_FILE {
+            if let Some(t) = self.template_variable(name) {
+                return t;
+            }
+        }
         best.map(|(_, t)| t).unwrap_or(if is_superglobal(name) {
             Type::Array(None, None)
         } else {
             Type::Mixed
         })
+    }
+
+    /// Variables of a template passed in by its caller (see plugins).
+    fn template_variable(&self, name: &str) -> Option<Type> {
+        let file = self.sema.ws.file(self.sema.file)?;
+        if !crate::blade::is_blade(&file.path) {
+            return None;
+        }
+        let cx = crate::plugins::PluginCx { ws: self.sema.ws, file: self.sema.file };
+        self.sema.ws.plugins().iter().find_map(|p| p.template_variable_type(&cx, name))
     }
 
     fn iteration_value(&self, t: &Type) -> Type {

@@ -54,9 +54,168 @@ struct ProjectData {
     env: Vec<StringCandidate>,
 }
 
+/// Variables Blade provides to every template.
+const TEMPLATE_GLOBALS: &[(&str, &str)] = &[
+    ("errors", "Illuminate\\Support\\ViewErrorBag"),
+    ("slot", "Illuminate\\View\\ComponentSlot"),
+    ("attributes", "Illuminate\\View\\ComponentAttributeBag"),
+    ("component", "Illuminate\\View\\Component"),
+    ("app", "Illuminate\\Foundation\\Application"),
+    ("__env", "Illuminate\\View\\Factory"),
+];
+
+/// Methods / functions rendering a view given as first (or second) argument.
+const VIEW_CALLS: &[&str] = &["view", "make", "render", "markdown", "text", "html", "first"];
+
+type TemplateVars = std::collections::HashMap<(String, String), Option<Type>>;
+
 #[derive(Default)]
 pub struct Laravel {
     data: Cached<(Option<PathBuf>, ProjectData)>,
+    template_vars: std::sync::Mutex<(u64, TemplateVars)>,
+}
+
+/// `resources/views/users/show.blade.php` -> `users.show`.
+fn d_views(data: &(Option<PathBuf>, ProjectData)) -> Vec<StringCandidate> {
+    data.1.views.clone()
+}
+
+fn view_name(key: &str) -> Option<String> {
+    const DIR: &str = "/resources/views/";
+    let rest = &key[key.find(DIR)? + DIR.len()..];
+    Some(rest.strip_suffix(".blade.php")?.replace('/', "."))
+}
+
+fn call_name(call: &php_syntax::SyntaxNode) -> Option<String> {
+    use php_syntax::{ast, ast::AstNode, SyntaxKind::*};
+    match call.kind() {
+        CALL_EXPR => {
+            call.first_child().filter(|c| c.kind() == NAME_EXPR).map(|c| ast::text_without_trivia(&c))
+        }
+        METHOD_CALL_EXPR | STATIC_CALL_EXPR => {
+            call.children().find_map(ast::MemberName::cast).and_then(|m| m.text())
+        }
+        _ => None,
+    }
+}
+
+fn arg_exprs(call: &php_syntax::SyntaxNode) -> Vec<php_syntax::SyntaxNode> {
+    use php_syntax::SyntaxKind::*;
+    call.children()
+        .find(|c| c.kind() == ARG_LIST)
+        .map(|l| {
+            l.children()
+                .filter(|c| c.kind() == ARG)
+                .filter_map(|a| a.children().find(|c| crate::infer::is_expr(c.kind())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_value(expr: &php_syntax::SyntaxNode) -> Option<String> {
+    use php_syntax::SyntaxKind::*;
+    let tok = expr.first_token().filter(|t| t.kind() == STRING && expr.kind() == LITERAL)?;
+    Some(super::unquote(tok.text()))
+}
+
+/// Type of `var` in view data: `['var' => $x]` or `compact('var')`.
+fn data_type(sema: &crate::sema::Sema, data: &php_syntax::SyntaxNode, var: &str) -> Option<Type> {
+    use php_syntax::SyntaxKind::*;
+    match data.kind() {
+        ARRAY_EXPR => data.children().filter(|c| c.kind() == ARRAY_ELEMENT).find_map(|el| {
+            let parts: Vec<_> = el.children().filter(|c| crate::infer::is_expr(c.kind())).collect();
+            (parts.len() == 2 && string_value(&parts[0]).as_deref() == Some(var))
+                .then(|| sema.infer().expr_type(&parts[1]))
+        }),
+        CALL_EXPR
+            if call_name(data)
+                .is_some_and(|n| n.trim_start_matches('\\').eq_ignore_ascii_case("compact")) =>
+        {
+            arg_exprs(data)
+                .iter()
+                .any(|a| string_value(a).as_deref() == Some(var))
+                .then(|| sema.infer().variable_type(var, data))
+        }
+        _ => None,
+    }
+}
+
+impl Laravel {
+    /// Types of `var` passed to view `view` anywhere in the workspace.
+    fn view_variable(&self, cx: &PluginCx, view: &str, var: &str) -> Option<Type> {
+        let key = (view.to_string(), var.to_string());
+        {
+            let guard = self.template_vars.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.0 == cx.ws.revision() {
+                if let Some(t) = guard.1.get(&key) {
+                    return t.clone();
+                }
+            }
+        }
+        let t = collect_view_variable(cx, view, var);
+        let mut guard = self.template_vars.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.0 != cx.ws.revision() {
+            *guard = (cx.ws.revision(), Default::default());
+        }
+        guard.1.insert(key, t.clone());
+        t
+    }
+}
+
+fn collect_view_variable(cx: &PluginCx, view: &str, var: &str) -> Option<Type> {
+    use php_syntax::SyntaxKind::*;
+    let quoted = [format!("'{view}'"), format!("\"{view}\"")];
+    let mut types = Vec::new();
+    let files: Vec<_> = cx
+        .ws
+        .files()
+        .filter(|(_, f)| {
+            f.kind == crate::FileKind::Workspace
+                && !crate::blade::is_blade(&f.path)
+                && quoted.iter().any(|q| f.text.contains(q.as_str()))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    for id in files {
+        let Some(sema) = crate::sema::Sema::new(cx.ws, id) else { continue };
+        for call in sema
+            .root
+            .descendants()
+            .filter(|n| matches!(n.kind(), CALL_EXPR | METHOD_CALL_EXPR | STATIC_CALL_EXPR))
+        {
+            let Some(name) = call_name(&call) else { continue };
+            let name = name.trim_start_matches('\\').to_ascii_lowercase();
+            if !VIEW_CALLS.contains(&name.as_str()) {
+                continue;
+            }
+            let args = arg_exprs(&call);
+            // `view('name', $data)`; `Route::view('/uri', 'name', $data)`
+            let Some(pos) = args.iter().take(2).position(|a| string_value(a).as_deref() == Some(view)) else {
+                continue;
+            };
+            if let Some(t) = args.get(pos + 1).and_then(|d| data_type(&sema, d, var)) {
+                types.push(t);
+            }
+            // `view('name')->with('var', $x)` / `->with([...])`
+            let mut cur = call.clone();
+            while let Some(parent) = cur.parent().filter(|p| p.kind() == METHOD_CALL_EXPR) {
+                if call_name(&parent).is_some_and(|n| n.eq_ignore_ascii_case("with")) {
+                    let wargs = arg_exprs(&parent);
+                    match wargs.first() {
+                        Some(k) if string_value(k).as_deref() == Some(var) => {
+                            if let Some(v) = wargs.get(1) {
+                                types.push(sema.infer().expr_type(v));
+                            }
+                        }
+                        Some(d) => types.extend(data_type(&sema, d, var)),
+                        None => {}
+                    }
+                }
+                cur = parent;
+            }
+        }
+    }
+    (!types.is_empty()).then(|| Type::union(types))
 }
 
 fn is_laravel_root(root: &Path) -> bool {
@@ -311,6 +470,14 @@ impl Plugin for Laravel {
         }
     }
 
+    fn template_variable_type(&self, cx: &PluginCx, name: &str) -> Option<Type> {
+        if let Some((_, class)) = TEMPLATE_GLOBALS.iter().find(|(n, _)| *n == name) {
+            return Some(Type::Named(Fqn::new(class), Vec::new()));
+        }
+        let view = view_name(&cx.ws.file(cx.file)?.path)?;
+        self.view_variable(cx, &view, name)
+    }
+
     fn string_candidates(&self, cx: &PluginCx, arg: &StringArg) -> Vec<StringCandidate> {
         let c = &arg.callee;
         let method = c.method_name().map(str::to_ascii_lowercase);
@@ -321,6 +488,16 @@ impl Plugin for Laravel {
         let data = self.data(cx);
         let d = &data.1;
         let pick = |v: &Vec<StringCandidate>| v.clone();
+        // Blade: `@include('view')`, `@includeWhen($cond, 'view')`
+        if let Callee::Function(f) = c {
+            if let Some(d) = f.as_str().strip_prefix('@') {
+                let view_arg = if matches!(d, "includeWhen" | "includeUnless") { 1 } else { 0 };
+                if crate::blade::VIEW_DIRECTIVES.contains(&d) && arg.index == view_arg {
+                    return pick(&d_views(&data));
+                }
+                return Vec::new();
+            }
+        }
         if arg.index == 0 {
             if c.is_function("config")
                 || class_short == "config"

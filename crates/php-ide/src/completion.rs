@@ -943,6 +943,15 @@ pub(crate) fn string_arg_at(sema: &Sema, offset: TextSize) -> Option<(crate::plu
         CALL_EXPR => {
             let callee = call.first_child().filter(|c| c.kind() == NAME_EXPR)?;
             let name = php_syntax::ast::text_without_trivia(&callee);
+            // Blade directive: `@include('view')` -> callee `@include`
+            let original = &sema.text[callee.text_range()];
+            if original != name && sema.ws.file(sema.file).is_some_and(|f| crate::blade::is_blade(&f.path)) {
+                let value = sema.text[content].to_string();
+                return Some((
+                    StringArg { callee: Callee::Function(Fqn::new(&format!("@{original}"))), index, value },
+                    content,
+                ));
+            }
             let fqn = match sema.resolve_function(&name, callee.text_range().start()) {
                 Some((_, f)) => f.fqn.clone(),
                 None => {

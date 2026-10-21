@@ -125,6 +125,11 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   - **Laravel:** `app()` / `resolve()` / `make()` container types, Eloquent relations as
     properties (`$user->posts` → `Collection<int, Post>`), completion + go to definition for
     `config()`, `view()`, `route()`, `__()` / `trans()` and `env()`
+  - **Blade:** templates are analysed as PHP (echoes, directives, `@php`, `@use`, component
+    attributes): hover, completion, definition, references, rename and diagnostics in
+    `{{ }}` / `@if(...)` / `@foreach(...)`; variable types come from the controllers' `view()`
+    / `->with()` / `compact()` calls; directive snippets, HTML completion, view names in
+    `@include` / `@extends`
   - **Symfony:** typed `$container->get(Foo::class)` and Doctrine `getRepository()`, route
     names (`#[Route(name: ...)]`, YAML) and Twig templates for `redirectToRoute()`,
     `generateUrl()`, `render()`

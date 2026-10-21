@@ -14,6 +14,7 @@
 //! assert_eq!(symbols[0].children[0].name, "f");
 //! ```
 
+mod blade;
 mod classify;
 mod code_actions;
 mod completion;
@@ -219,7 +220,7 @@ impl Workspace {
     fn set_file_with_kind(&mut self, path: &str, text: String, kind: FileKind) -> FileId {
         let id = self.file_id_or_insert(path);
         self.revision += 1;
-        let parse = php_syntax::parse(&text, self.config.php_version);
+        let parse = indexer::parse_source(path, &text, self.config.php_version);
         let (scopes, symbols) = php_hir::analyze_file(&parse.tree(), self.opts());
         self.index.set_file(id, kind, Arc::new(symbols));
         let line_index = Arc::new(LineIndex::new(&text));
@@ -235,7 +236,7 @@ impl Workspace {
 
     /// Adds or replaces a file that is only indexed (not opened).
     pub fn index_file(&mut self, path: &str, text: Arc<str>, kind: FileKind) -> FileId {
-        let symbols = indexer::extract_symbols(&text, self.opts());
+        let symbols = indexer::extract_symbols(path, &text, self.opts());
         self.add_indexed(IndexedFile { path: path.into(), text, kind, symbols: Arc::new(symbols) })
     }
 
@@ -339,7 +340,7 @@ impl Workspace {
         let f = self.file(id)?;
         Some(match &f.open {
             Some(o) => o.parse.clone(),
-            None => php_syntax::parse(&f.text, self.config.php_version),
+            None => indexer::parse_source(&f.path, &f.text, self.config.php_version),
         })
     }
 
@@ -409,7 +410,13 @@ impl Workspace {
 
     /// Opening and closing tag names of the HTML element at `offset`.
     pub fn linked_editing_ranges(&self, id: FileId, offset: TextSize) -> Option<Vec<TextRange>> {
-        html::linked_editing_ranges(&self.parse(id)?.syntax_node(), offset)
+        let f = self.file(id)?;
+        let root = if blade::is_blade(&f.path) {
+            php_syntax::parse(&f.text, self.config.php_version).syntax_node()
+        } else {
+            self.parse(id)?.syntax_node()
+        };
+        html::linked_editing_ranges(&root, offset)
     }
 
     /// Occurrences of the symbol at `offset` in the same file.
@@ -418,6 +425,19 @@ impl Workspace {
     }
 
     pub fn completions(&self, id: FileId, offset: TextSize) -> CompletionList {
+        if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
+            let b = blade::virtual_php(&f.text);
+            if !blade::in_code(&b, offset) {
+                let items = blade::directive_completions(&f.text, offset).unwrap_or_else(|| {
+                    html::completions(
+                        &php_syntax::parse(&f.text, self.config.php_version).syntax_node(),
+                        offset,
+                    )
+                    .unwrap_or_default()
+                });
+                return CompletionList { items, incomplete: false };
+            }
+        }
         sema::Sema::new(self, id).map(|s| completion::completions(&s, offset)).unwrap_or_default()
     }
 
@@ -485,6 +505,10 @@ impl Workspace {
         options: &FormatOptions,
     ) -> Option<Vec<TextEdit>> {
         let file = self.file(id)?;
+        if blade::is_blade(&file.path) {
+            // the formatter does not know Blade
+            return Some(Vec::new());
+        }
         let mut options = options.clone();
         options.php_version = self.config.php_version;
         let edits = match range {

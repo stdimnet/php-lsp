@@ -127,6 +127,11 @@ pub trait Plugin: Send + Sync {
     fn string_candidates(&self, _cx: &PluginCx, _arg: &StringArg) -> Vec<StringCandidate> {
         Vec::new()
     }
+
+    /// Type of a variable a template (`cx.file`) receives from its caller.
+    fn template_variable_type(&self, _cx: &PluginCx, _name: &str) -> Option<Type> {
+        None
+    }
 }
 
 /// The registered plugins.

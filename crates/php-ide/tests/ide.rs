@@ -847,3 +847,69 @@ fn html_in_templates() {
     assert_eq!(names[0].0, "div");
     assert_eq!(names[1], ("div", text.find("x</div>").unwrap() + 3));
 }
+
+#[test]
+fn blade_templates() {
+    let (mut ws, dir) = project(
+        "blade",
+        &[
+            ("composer.json", "{}"),
+            ("artisan", "#!/usr/bin/env php"),
+            ("app/Models/User.php", "<?php\nnamespace App\\Models;\n/** A user. */\nclass User {\n    /** @var Post[] */\n    public array $posts = [];\n    public function displayName(): string { return ''; }\n}\nclass Post { public string $title = ''; }\n"),
+            (
+                "app/Http/UserController.php",
+                "<?php\nnamespace App\\Http;\nuse App\\Models\\User;\nclass UserController {\n    public function show(User $user) {\n        $count = 3;\n        return view('users.show', ['user' => $user])->with('count', $count);\n    }\n    public function list() { $users = [new User]; return view('users.list', compact('users')); }\n}\n",
+            ),
+            ("resources/views/layouts/app.blade.php", "<html>@yield('content')</html>"),
+            ("resources/views/users/list.blade.php", "@foreach($users as $u) {{ $u->displayName() }} @endforeach"),
+        ],
+    );
+    let path = "resources/views/users/show.blade.php";
+    let template = "@extends('layouts.app')\n@section('content')\n<div class=\"user\">\n  <h1>{{ $user->displayName() }}</h1>\n  @foreach($user->posts as $post)\n    <p>{{ $post->title }} {{ $loop->index }}</p>\n  @endforeach\n  {{ $count }} {{ $user->missing() }}\n  @if($errors->any()) x @endif\n</div>\n@endsection\n";
+    let key = format!("file://{}", dir.join(path).display());
+    let id = ws.set_file(&key, template.into());
+    let at = |needle: &str, delta: usize| TextSize::from((template.find(needle).unwrap() + delta) as u32);
+
+    // types flow from the controller into the template
+    assert_eq!(ws.type_at(id, at("$user->displayName", 1)).unwrap(), "App\\Models\\User");
+    assert_eq!(ws.type_at(id, at("$post->title", 1)).unwrap(), "App\\Models\\Post");
+    assert_eq!(ws.type_at(id, at("$count }}", 1)).unwrap(), "int");
+    assert_eq!(ws.type_at(id, at("$errors", 1)).unwrap(), "Illuminate\\Support\\ViewErrorBag");
+    assert!(ws.hover(id, at("displayName", 2)).unwrap().markdown.contains("displayName(): string"));
+    let defs = ws.goto_definition(id, at("displayName", 2));
+    assert!(ws.file(defs[0].file).unwrap().path.ends_with("app/Models/User.php"));
+
+    // member completion inside an echo
+    let labels = |ws: &Workspace, offset: TextSize| -> Vec<String> {
+        ws.completions(id, offset).items.into_iter().map(|i| i.label).collect()
+    };
+    assert!(labels(&ws, at("$user->displayName", 7)).contains(&"displayName".to_string()));
+    // directives and HTML outside of PHP code
+    let (id2, off) =
+        open_with_cursor(&mut ws, &dir, "resources/views/x.blade.php", "<div>\n  @fore<|>\n</div>");
+    let l: Vec<String> = ws.completions(id2, off).items.into_iter().map(|i| i.label).collect();
+    assert!(l.contains(&"@foreach".to_string()) && l.contains(&"@forelse".to_string()), "{l:?}");
+    let (id2, off) =
+        open_with_cursor(&mut ws, &dir, "resources/views/x.blade.php", "<div>\n  {{ $a }} <sp<|>\n</div>");
+    let l: Vec<String> = ws.completions(id2, off).items.into_iter().map(|i| i.label).collect();
+    assert!(l.contains(&"span".to_string()), "{l:?}");
+    // view names in directives
+    let l = labels(&ws, at("layouts.app", 1));
+    assert!(l.contains(&"layouts.app".to_string()) && l.contains(&"users.list".to_string()), "{l:?}");
+    assert!(ws.string_targets(id, at("layouts.app", 2))[0].0.ends_with("layouts/app.blade.php"));
+
+    // diagnostics: only the real problem
+    let diags: Vec<String> = ws.diagnostics(id).into_iter().map(|d| d.message).collect();
+    assert_eq!(diags, vec!["Undefined method 'missing'.".to_string()]);
+    // compact()
+    let list = ws
+        .file_id(&format!("file://{}", dir.join("resources/views/users/list.blade.php").display()))
+        .unwrap();
+    let text = ws.file(list).unwrap().text.to_string();
+    assert_eq!(
+        ws.type_at(list, TextSize::from(text.find("$u->").unwrap() as u32 + 1)).unwrap(),
+        "App\\Models\\User"
+    );
+    assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

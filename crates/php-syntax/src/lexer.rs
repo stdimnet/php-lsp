@@ -21,13 +21,19 @@ pub struct LexError {
 
 /// Tokenizes `text` according to the rules of PHP `version`.
 pub fn tokenize(text: &str, version: PhpVersion) -> (Vec<Token>, Vec<LexError>) {
+    tokenize_from(text, version, false)
+}
+
+/// Like [`tokenize`]; with `php_code` the text starts in PHP mode (as if
+/// preceded by `<?php`).
+pub fn tokenize_from(text: &str, version: PhpVersion, php_code: bool) -> (Vec<Token>, Vec<LexError>) {
     let mut lexer = Lexer {
         src: text.as_bytes(),
         pos: 0,
         version,
         tokens: Vec::new(),
         errors: Vec::new(),
-        states: vec![State::Html],
+        states: vec![if php_code { State::Php { braces: 0, in_string: false } } else { State::Html }],
         halt_pending: false,
         last_significant: EOF,
     };

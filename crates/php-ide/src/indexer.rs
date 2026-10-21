@@ -17,9 +17,18 @@ pub struct IndexedFile {
     pub symbols: Arc<FileSymbols>,
 }
 
-pub(crate) fn extract_symbols(text: &str, opts: ExtractOptions) -> FileSymbols {
-    let parse = php_syntax::parse(text, opts.php_version);
+pub(crate) fn extract_symbols(path: &str, text: &str, opts: ExtractOptions) -> FileSymbols {
+    let parse = parse_source(path, text, opts.php_version);
     php_hir::analyze_file(&parse.tree(), opts).1
+}
+
+/// Parses a file; Blade templates are parsed as their virtual PHP code.
+pub(crate) fn parse_source(path: &str, text: &str, version: php_syntax::PhpVersion) -> php_syntax::Parse {
+    if crate::blade::is_blade(path) {
+        php_syntax::parse_php_code(&crate::blade::virtual_php(text).text, version)
+    } else {
+        php_syntax::parse(text, version)
+    }
 }
 
 /// Parses and analyses files in parallel.
@@ -27,7 +36,7 @@ pub fn index_files(files: Vec<(String, Arc<str>, FileKind)>, opts: ExtractOption
     files
         .into_par_iter()
         .map(|(path, text, kind)| {
-            let symbols = Arc::new(extract_symbols(&text, opts));
+            let symbols = Arc::new(extract_symbols(&path, &text, opts));
             IndexedFile { path: path.into(), text, kind, symbols }
         })
         .collect()

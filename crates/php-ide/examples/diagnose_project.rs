@@ -1,6 +1,7 @@
 //! Runs all diagnostics over every workspace file of a project and prints a
 //! summary per code (useful to find false positives).
 //! Usage: `cargo run --release -p php-ide --example diagnose_project -- <dir> [CODE] [N]`
+//! (`ONLY=.blade.php` restricts the report to files with that suffix)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,7 +27,12 @@ fn main() {
         })
         .collect();
     ws.index_files(texts);
-    let ids: Vec<_> = ws.files().filter(|(_, f)| f.kind == FileKind::Workspace).map(|(id, _)| id).collect();
+    let only = std::env::var("ONLY").unwrap_or_default();
+    let ids: Vec<_> = ws
+        .files()
+        .filter(|(_, f)| f.kind == FileKind::Workspace && f.path.ends_with(only.as_str()))
+        .map(|(id, _)| id)
+        .collect();
     let t = std::time::Instant::now();
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut shown = 0;

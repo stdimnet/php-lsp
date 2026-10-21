@@ -13,4 +13,9 @@ class Service
         $missing = undefined_function();
         return greet($user->getName());
     }
+
+    public function page(User $user)
+    {
+        return view('users.show', ['user' => $user]);
+    }
 }

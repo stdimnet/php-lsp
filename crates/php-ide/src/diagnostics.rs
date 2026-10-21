@@ -139,7 +139,12 @@ pub(crate) fn semantic_diagnostics(sema: &Sema) -> Vec<Diagnostic> {
     if !config.enable {
         return Vec::new();
     }
-    let mut cx = Checker { sema, config, out: Vec::new() };
+    let blade = sema
+        .ws
+        .file(sema.file)
+        .filter(|f| crate::blade::is_blade(&f.path))
+        .map(|f| crate::blade::virtual_php(&f.text));
+    let mut cx = Checker { sema, config, out: Vec::new(), blade };
     cx.run();
     let mut out = cx.out;
     out.sort_by_key(|d| (d.range.start(), d.range.end()));
@@ -156,6 +161,8 @@ struct Checker<'s, 'a> {
     sema: &'s Sema<'a>,
     config: &'s DiagnosticsConfig,
     out: Vec<Diagnostic>,
+    /// Set for Blade templates.
+    blade: Option<crate::blade::Blade>,
 }
 
 impl Checker<'_, '_> {
@@ -325,7 +332,11 @@ impl Checker<'_, '_> {
                 self.deprecated(callee.text_range(), f.fqn.as_str(), f.deprecated.as_ref());
             }
             None => {
-                if self.config.undefined_functions {
+                let directive = self
+                    .blade
+                    .as_ref()
+                    .is_some_and(|b| b.directives.iter().any(|(r, _)| *r == callee.text_range()));
+                if self.config.undefined_functions && !directive {
                     let name = self.sema.scope_at(callee.text_range().start()).resolve_function(&text);
                     let shown = name.fallback.unwrap_or(name.name);
                     self.push(Diagnostic::new(
@@ -814,7 +825,9 @@ impl Checker<'_, '_> {
                     }
                 }
             }
-            if self.config.unused_symbols && v.reads.is_empty() && !v.param {
+            // template variables are often only used by included views
+            let template = self.blade.is_some() && scope.kind() == SOURCE_FILE;
+            if self.config.unused_symbols && v.reads.is_empty() && !v.param && !template {
                 for r in &v.def_ranges {
                     let mut d = Diagnostic::new(
                         *r,

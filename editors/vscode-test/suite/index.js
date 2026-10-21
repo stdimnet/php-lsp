@@ -68,6 +68,13 @@ const checks = [
     const list = await exec('vscode.executeCompletionItemProvider', doc.uri, pos(doc, '<div', 3));
     assert.ok(labels(list).includes('div'), labels(list).slice(0, 20).join(','));
   }],
+  ['blade template', async () => {
+    const doc = await open('resources/views/users/show.blade.php');
+    const h = await exec('vscode.executeHoverProvider', doc.uri, pos(doc, 'getName', 2));
+    assert.match(hoverText(h), /Returns the display name/);
+    const list = await exec('vscode.executeCompletionItemProvider', doc.uri, pos(doc, '@foreach', 4));
+    assert.ok(labels(list).includes('@foreach'), labels(list).slice(0, 20).join(','));
+  }],
   ['references', async () => {
     const doc = await open('src/Models/User.php');
     const refs = await exec('vscode.executeReferenceProvider', doc.uri, pos(doc, 'class User', 7));
