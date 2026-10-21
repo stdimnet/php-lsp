@@ -25,6 +25,17 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         SignatureHelpRequest::METHOD => handle(s, req, signature_help),
         WorkspaceSymbolRequest::METHOD => handle(s, req, workspace_symbol),
         InlayHintRequest::METHOD => handle(s, req, inlay_hints),
+        PrepareRenameRequest::METHOD => handle(s, req, prepare_rename),
+        Rename::METHOD => handle(s, req, rename),
+        CodeActionRequest::METHOD => handle(s, req, code_action),
+        CallHierarchyPrepare::METHOD => handle(s, req, call_hierarchy_prepare),
+        CallHierarchyIncomingCalls::METHOD => handle(s, req, incoming_calls),
+        CallHierarchyOutgoingCalls::METHOD => handle(s, req, outgoing_calls),
+        TypeHierarchyPrepare::METHOD => handle(s, req, type_hierarchy_prepare),
+        TypeHierarchySupertypes::METHOD => handle(s, req, supertypes),
+        TypeHierarchySubtypes::METHOD => handle(s, req, subtypes),
+        CodeLensRequest::METHOD => handle(s, req, code_lens),
+        CodeLensResolve::METHOD => handle(s, req, code_lens_resolve),
         SemanticTokensFullRequest::METHOD => handle(s, req, semantic_tokens_full),
         SemanticTokensRangeRequest::METHOD => handle(s, req, semantic_tokens_range),
         crate::ext::SyntaxTree::METHOD => handle(s, req, syntax_tree),
@@ -385,4 +396,322 @@ fn semantic_tokens_range(
     let index = s.workspace.line_index(id)?;
     let range = convert::text_range(&index, s.encoding, p.range);
     encode_tokens(s, id, Some(range)).map(lsp::SemanticTokensRangeResult::Tokens)
+}
+
+// ---------------------------------------------------------------------- rename
+
+fn workspace_edit(s: &Server, change: php_ide::SourceChange) -> Option<lsp::WorkspaceEdit> {
+    let mut changes = std::collections::HashMap::new();
+    for (file, edits) in change.edits {
+        let index = s.workspace.line_index(file)?;
+        let uri = s.uri_for(file)?;
+        let edits: Vec<lsp::TextEdit> = edits
+            .into_iter()
+            .map(|e| lsp::TextEdit {
+                range: convert::range(&index, s.encoding, e.range),
+                new_text: e.new_text,
+            })
+            .collect();
+        changes.insert(uri, edits);
+    }
+    Some(lsp::WorkspaceEdit { changes: Some(changes), document_changes: None, change_annotations: None })
+}
+
+fn prepare_rename(s: &mut Server, p: lsp::TextDocumentPositionParams) -> Option<lsp::PrepareRenameResponse> {
+    let (id, offset) = position(s, &p)?;
+    let index = s.workspace.line_index(id)?;
+    match s.workspace.prepare_rename(id, offset) {
+        Ok((range, text)) => Some(lsp::PrepareRenameResponse::RangeWithPlaceholder {
+            range: convert::range(&index, s.encoding, range),
+            placeholder: text,
+        }),
+        Err(e) => {
+            s.show_message(&e.0);
+            None
+        }
+    }
+}
+
+fn rename(s: &mut Server, p: lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
+    let (id, offset) = position(s, &p.text_document_position)?;
+    match s.workspace.rename(id, offset, &p.new_name) {
+        Ok(change) => workspace_edit(s, change),
+        Err(e) => {
+            s.show_message(&e.0);
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------- code actions
+
+fn code_action(s: &mut Server, p: lsp::CodeActionParams) -> Option<Vec<lsp::CodeActionOrCommand>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    let range = convert::text_range(&index, s.encoding, p.range);
+    let only = p.context.only.clone();
+    let actions = s.workspace.code_actions(id, range);
+    let mut out = Vec::new();
+    for a in actions {
+        let kind = match a.kind {
+            php_ide::CodeActionKind::QuickFix => lsp::CodeActionKind::QUICKFIX,
+            php_ide::CodeActionKind::Refactor => lsp::CodeActionKind::REFACTOR,
+            php_ide::CodeActionKind::RefactorRewrite => lsp::CodeActionKind::REFACTOR_REWRITE,
+            php_ide::CodeActionKind::Source => lsp::CodeActionKind::SOURCE,
+            php_ide::CodeActionKind::SourceOrganizeImports => lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+        };
+        if let Some(only) = &only {
+            if !only.iter().any(|o| kind.as_str().starts_with(o.as_str())) {
+                continue;
+            }
+        }
+        let diagnostics: Vec<lsp::Diagnostic> = a
+            .fixes
+            .map(|code| {
+                p.context
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code == Some(lsp::NumberOrString::String(code.as_str().to_string())))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(lsp::CodeActionOrCommand::CodeAction(lsp::CodeAction {
+            title: a.title,
+            kind: Some(kind),
+            diagnostics: if diagnostics.is_empty() { None } else { Some(diagnostics) },
+            edit: workspace_edit(s, a.change),
+            command: None,
+            is_preferred: Some(a.is_preferred),
+            disabled: None,
+            data: None,
+        }));
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------- hierarchies
+
+fn symbol_kind_from_lsp(k: lsp::SymbolKind) -> php_ide::SymbolKind {
+    match k {
+        lsp::SymbolKind::INTERFACE => php_ide::SymbolKind::Interface,
+        lsp::SymbolKind::ENUM => php_ide::SymbolKind::Enum,
+        lsp::SymbolKind::METHOD => php_ide::SymbolKind::Method,
+        lsp::SymbolKind::CONSTRUCTOR => php_ide::SymbolKind::Constructor,
+        lsp::SymbolKind::FUNCTION => php_ide::SymbolKind::Function,
+        lsp::SymbolKind::NAMESPACE => php_ide::SymbolKind::Namespace,
+        _ => php_ide::SymbolKind::Class,
+    }
+}
+
+fn to_lsp_item(s: &Server, item: &php_ide::HierarchyItem) -> Option<(lsp::Uri, lsp::Range, lsp::Range)> {
+    let index = s.workspace.line_index(item.file)?;
+    Some((
+        s.uri_for(item.file)?,
+        convert::range(&index, s.encoding, item.range),
+        convert::range(&index, s.encoding, item.selection_range),
+    ))
+}
+
+fn call_item(s: &Server, item: &php_ide::HierarchyItem) -> Option<lsp::CallHierarchyItem> {
+    let (uri, range, selection_range) = to_lsp_item(s, item)?;
+    Some(lsp::CallHierarchyItem {
+        name: item.name.clone(),
+        kind: convert::symbol_kind(item.kind),
+        tags: None,
+        detail: item.detail.clone(),
+        uri,
+        range,
+        selection_range,
+        data: None,
+    })
+}
+
+fn from_lsp_item(
+    s: &Server,
+    uri: &lsp::Uri,
+    name: &str,
+    kind: lsp::SymbolKind,
+    range: lsp::Range,
+    sel: lsp::Range,
+) -> Option<php_ide::HierarchyItem> {
+    let file = s.file_for(uri)?;
+    let index = s.workspace.line_index(file)?;
+    Some(php_ide::HierarchyItem {
+        name: name.to_string(),
+        kind: symbol_kind_from_lsp(kind),
+        detail: None,
+        file,
+        range: convert::text_range(&index, s.encoding, range),
+        selection_range: convert::text_range(&index, s.encoding, sel),
+    })
+}
+
+fn call_hierarchy_prepare(
+    s: &mut Server,
+    p: lsp::CallHierarchyPrepareParams,
+) -> Option<Vec<lsp::CallHierarchyItem>> {
+    let (id, offset) = position(s, &p.text_document_position_params)?;
+    Some(s.workspace.prepare_call_hierarchy(id, offset).iter().filter_map(|i| call_item(s, i)).collect())
+}
+
+fn ranges_in(s: &Server, file: FileId, ranges: &[php_ide::TextRange]) -> Vec<lsp::Range> {
+    let Some(index) = s.workspace.line_index(file) else { return Vec::new() };
+    ranges.iter().map(|r| convert::range(&index, s.encoding, *r)).collect()
+}
+
+fn incoming_calls(
+    s: &mut Server,
+    p: lsp::CallHierarchyIncomingCallsParams,
+) -> Option<Vec<lsp::CallHierarchyIncomingCall>> {
+    let i = &p.item;
+    let item = from_lsp_item(s, &i.uri, &i.name, i.kind, i.range, i.selection_range)?;
+    Some(
+        s.workspace
+            .incoming_calls(&item)
+            .iter()
+            .filter_map(|c| {
+                Some(lsp::CallHierarchyIncomingCall {
+                    from: call_item(s, &c.item)?,
+                    from_ranges: ranges_in(s, c.item.file, &c.ranges),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn outgoing_calls(
+    s: &mut Server,
+    p: lsp::CallHierarchyOutgoingCallsParams,
+) -> Option<Vec<lsp::CallHierarchyOutgoingCall>> {
+    let i = &p.item;
+    let item = from_lsp_item(s, &i.uri, &i.name, i.kind, i.range, i.selection_range)?;
+    Some(
+        s.workspace
+            .outgoing_calls(&item)
+            .iter()
+            .filter_map(|c| {
+                Some(lsp::CallHierarchyOutgoingCall {
+                    to: call_item(s, &c.item)?,
+                    from_ranges: ranges_in(s, item.file, &c.ranges),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn type_item(s: &Server, item: &php_ide::HierarchyItem) -> Option<lsp::TypeHierarchyItem> {
+    let (uri, range, selection_range) = to_lsp_item(s, item)?;
+    Some(lsp::TypeHierarchyItem {
+        name: item.name.clone(),
+        kind: convert::symbol_kind(item.kind),
+        tags: None,
+        detail: item.detail.clone(),
+        uri,
+        range,
+        selection_range,
+        data: None,
+    })
+}
+
+fn type_hierarchy_prepare(
+    s: &mut Server,
+    p: lsp::TypeHierarchyPrepareParams,
+) -> Option<Vec<lsp::TypeHierarchyItem>> {
+    let (id, offset) = position(s, &p.text_document_position_params)?;
+    Some(s.workspace.prepare_type_hierarchy(id, offset).iter().filter_map(|i| type_item(s, i)).collect())
+}
+
+fn supertypes(s: &mut Server, p: lsp::TypeHierarchySupertypesParams) -> Option<Vec<lsp::TypeHierarchyItem>> {
+    let i = &p.item;
+    let item = from_lsp_item(s, &i.uri, &i.name, i.kind, i.range, i.selection_range)?;
+    Some(s.workspace.supertypes(&item).iter().filter_map(|i| type_item(s, i)).collect())
+}
+
+fn subtypes(s: &mut Server, p: lsp::TypeHierarchySubtypesParams) -> Option<Vec<lsp::TypeHierarchyItem>> {
+    let i = &p.item;
+    let item = from_lsp_item(s, &i.uri, &i.name, i.kind, i.range, i.selection_range)?;
+    Some(s.workspace.subtypes(&item).iter().filter_map(|i| type_item(s, i)).collect())
+}
+
+// ---------------------------------------------------------------------- code lens
+
+fn code_lens(s: &mut Server, p: lsp::CodeLensParams) -> Option<Vec<lsp::CodeLens>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    Some(
+        s.workspace
+            .code_lenses(id)
+            .into_iter()
+            .map(|l| lsp::CodeLens {
+                range: convert::range(&index, s.encoding, l.range),
+                command: None,
+                data: Some(serde_json::json!({
+                    "uri": p.text_document.uri.as_str(),
+                    "start": u32::from(l.range.start()),
+                    "end": u32::from(l.range.end()),
+                    "kind": match l.kind {
+                        php_ide::CodeLensKind::References => "references",
+                        php_ide::CodeLensKind::Implementations => "implementations",
+                        php_ide::CodeLensKind::Parent => "parent",
+                    },
+                })),
+            })
+            .collect(),
+    )
+}
+
+fn code_lens_resolve(s: &mut Server, mut lens: lsp::CodeLens) -> lsp::CodeLens {
+    let resolved = (|| {
+        let data = lens.data.as_ref()?;
+        let uri: lsp::Uri = data.get("uri")?.as_str()?.parse().ok()?;
+        let id = s.file_for(&uri)?;
+        let start = TextSize::from(data.get("start")?.as_u64()? as u32);
+        let end = TextSize::from(data.get("end")?.as_u64()? as u32);
+        let kind = match data.get("kind")?.as_str()? {
+            "references" => php_ide::CodeLensKind::References,
+            "implementations" => php_ide::CodeLensKind::Implementations,
+            _ => php_ide::CodeLensKind::Parent,
+        };
+        let r = s
+            .workspace
+            .resolve_code_lens(id, &php_ide::CodeLens { range: php_ide::TextRange::new(start, end), kind })?;
+        let locations: Vec<lsp::Location> =
+            r.targets.iter().filter_map(|t| s.location(t.file, t.focus)).collect();
+        let command = if s.caps.vscode {
+            if kind == php_ide::CodeLensKind::Parent {
+                let loc = locations.first()?;
+                lsp::Command {
+                    title: r.title,
+                    command: "editor.action.goToLocations".into(),
+                    arguments: Some(vec![
+                        serde_json::to_value(&uri).ok()?,
+                        serde_json::to_value(lens.range.start).ok()?,
+                        serde_json::to_value(vec![loc]).ok()?,
+                        serde_json::json!("goto"),
+                        serde_json::json!(""),
+                    ]),
+                }
+            } else {
+                lsp::Command {
+                    title: r.title,
+                    command: "editor.action.showReferences".into(),
+                    arguments: Some(vec![
+                        serde_json::to_value(&uri).ok()?,
+                        serde_json::to_value(lens.range.start).ok()?,
+                        serde_json::to_value(locations).ok()?,
+                    ]),
+                }
+            }
+        } else {
+            lsp::Command { title: r.title, command: String::new(), arguments: None }
+        };
+        Some(command)
+    })();
+    lens.command = Some(resolved.unwrap_or(lsp::Command {
+        title: String::new(),
+        command: String::new(),
+        arguments: None,
+    }));
+    lens
 }

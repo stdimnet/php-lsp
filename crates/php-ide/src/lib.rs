@@ -15,15 +15,18 @@
 //! ```
 
 mod classify;
+mod code_actions;
 mod completion;
 mod diagnostics;
 mod folding;
+mod hierarchy;
 mod hover;
 mod indexer;
 mod infer;
 mod inlay_hints;
 mod line_index;
 mod navigation;
+mod rename;
 mod render;
 mod selection;
 mod sema;
@@ -36,9 +39,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use classify::Definition;
+pub use code_actions::{CodeAction, CodeActionKind};
 pub use completion::{CompletionItem, CompletionKind, CompletionList, TextEdit};
 pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
 pub use folding::{Fold, FoldKind};
+pub use hierarchy::{CodeLens, CodeLensKind, HierarchyCall, HierarchyItem, ResolvedCodeLens};
 pub use hover::Hover;
 pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
 pub use inlay_hints::{InlayHint, InlayHintKind, InlayHintsConfig};
@@ -47,6 +52,7 @@ pub use navigation::{Location, Reference, ReferenceKind};
 pub use php_hir as hir;
 pub use php_index::{FileId, FileKind, Index};
 pub use php_syntax::{self as syntax, PhpVersion, TextRange, TextSize};
+pub use rename::{RenameError, SourceChange};
 pub use semantic_tokens::{SemanticToken, SemanticTokenType, TOKEN_MODIFIERS, TOKEN_TYPES};
 pub use signature_help::{ParameterInfo, SignatureHelp, SignatureInfo};
 pub use symbols::{Symbol, SymbolKind};
@@ -388,6 +394,54 @@ impl Workspace {
 
     pub fn workspace_symbols(&self, query: &str, limit: usize) -> Vec<WorkspaceSymbol> {
         workspace_symbols::workspace_symbols(self, query, limit)
+    }
+
+    /// Range and current text of the symbol at `offset`, if it can be renamed.
+    pub fn prepare_rename(&self, id: FileId, offset: TextSize) -> Result<(TextRange, String), RenameError> {
+        let sema = sema::Sema::new(self, id).ok_or_else(|| RenameError("unknown file".into()))?;
+        rename::prepare_rename(&sema, offset)
+    }
+
+    pub fn rename(&self, id: FileId, offset: TextSize, new_name: &str) -> Result<SourceChange, RenameError> {
+        let sema = sema::Sema::new(self, id).ok_or_else(|| RenameError("unknown file".into()))?;
+        rename::rename(&sema, offset, new_name)
+    }
+
+    pub fn prepare_call_hierarchy(&self, id: FileId, offset: TextSize) -> Vec<HierarchyItem> {
+        sema::Sema::new(self, id).map(|s| hierarchy::prepare_call_hierarchy(&s, offset)).unwrap_or_default()
+    }
+
+    pub fn incoming_calls(&self, item: &HierarchyItem) -> Vec<HierarchyCall> {
+        hierarchy::incoming_calls(self, item)
+    }
+
+    pub fn outgoing_calls(&self, item: &HierarchyItem) -> Vec<HierarchyCall> {
+        hierarchy::outgoing_calls(self, item)
+    }
+
+    pub fn prepare_type_hierarchy(&self, id: FileId, offset: TextSize) -> Vec<HierarchyItem> {
+        sema::Sema::new(self, id).map(|s| hierarchy::prepare_type_hierarchy(&s, offset)).unwrap_or_default()
+    }
+
+    pub fn supertypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
+        hierarchy::supertypes(self, item)
+    }
+
+    pub fn subtypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
+        hierarchy::subtypes(self, item)
+    }
+
+    /// Code lenses of a file; titles are computed by [`Workspace::resolve_code_lens`].
+    pub fn code_lenses(&self, id: FileId) -> Vec<CodeLens> {
+        sema::Sema::new(self, id).map(|s| hierarchy::code_lenses(&s)).unwrap_or_default()
+    }
+
+    pub fn resolve_code_lens(&self, id: FileId, lens: &CodeLens) -> Option<ResolvedCodeLens> {
+        hierarchy::resolve_code_lens(&sema::Sema::new(self, id)?, lens)
+    }
+
+    pub fn code_actions(&self, id: FileId, range: TextRange) -> Vec<CodeAction> {
+        sema::Sema::new(self, id).map(|s| code_actions::code_actions(&s, range)).unwrap_or_default()
     }
 
     pub fn inlay_hints(&self, id: FileId, range: TextRange) -> Vec<InlayHint> {

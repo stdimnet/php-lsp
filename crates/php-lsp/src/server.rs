@@ -82,7 +82,10 @@ impl Server {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         };
-        connection.initialize_finish(id, serde_json::to_value(result)?)?;
+        let mut result = serde_json::to_value(result)?;
+        // not modelled by lsp-types yet
+        result["capabilities"]["typeHierarchyProvider"] = Value::Bool(true);
+        connection.initialize_finish(id, result)?;
         let workspace = Workspace::new(config.ide_config());
         let stub_dir = storage
             .unwrap_or_else(std::env::temp_dir)
@@ -189,6 +192,13 @@ impl Server {
         self.pending.insert(id.clone(), R::METHOD);
         let params = serde_json::to_value(params).unwrap_or(Value::Null);
         self.send(Message::Request(Request { id, method: R::METHOD.to_string(), params }));
+    }
+
+    pub(crate) fn show_message(&self, message: &str) {
+        self.notify::<lsp::notification::ShowMessage>(lsp::ShowMessageParams {
+            typ: lsp::MessageType::INFO,
+            message: message.to_string(),
+        });
     }
 
     pub(crate) fn log(&self, message: &str) {
@@ -680,6 +690,21 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
         document_highlight_provider: Some(lsp::OneOf::Left(true)),
         workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
         inlay_hint_provider: Some(lsp::OneOf::Left(true)),
+        rename_provider: Some(lsp::OneOf::Right(lsp::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        code_action_provider: Some(lsp::CodeActionProviderCapability::Options(lsp::CodeActionOptions {
+            code_action_kinds: Some(vec![
+                lsp::CodeActionKind::QUICKFIX,
+                lsp::CodeActionKind::REFACTOR,
+                lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            work_done_progress_options: Default::default(),
+            resolve_provider: Some(false),
+        })),
+        call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
+        code_lens_provider: Some(lsp::CodeLensOptions { resolve_provider: Some(true) }),
         semantic_tokens_provider: Some(lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(
             lsp::SemanticTokensOptions {
                 work_done_progress_options: Default::default(),

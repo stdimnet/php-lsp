@@ -390,3 +390,118 @@ fn inlay_hints_and_semantic_tokens() {
         "{toks:?}"
     );
 }
+
+fn apply(text: &str, change: &php_ide::SourceChange, file: FileId) -> String {
+    let mut edits: Vec<_> =
+        change.edits.iter().filter(|(f, _)| *f == file).flat_map(|(_, e)| e.clone()).collect();
+    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start()));
+    let mut out = text.to_string();
+    for e in edits {
+        out.replace_range(usize::from(e.range.start())..usize::from(e.range.end()), &e.new_text);
+    }
+    out
+}
+
+#[test]
+fn rename_symbols() {
+    let text = "<?php\nclass Foo { public int $count = 0; function inc() { $this->count++; return $this->count; } }\n$f = new Foo();\necho $f->count;\n";
+    let mut ws = Workspace::new(Config::default());
+    let id = ws.set_file("file:///r.php", text.to_string());
+    let at = TextSize::from(text.find("$count").unwrap() as u32 + 1);
+    let change = ws.rename(id, at, "total").unwrap();
+    assert_eq!(
+        apply(text, &change, id),
+        "<?php\nclass Foo { public int $total = 0; function inc() { $this->total++; return $this->total; } }\n$f = new Foo();\necho $f->total;\n"
+    );
+    let at = TextSize::from(text.find("Foo()").unwrap() as u32);
+    let change = ws.rename(id, at, "Bar").unwrap();
+    assert!(
+        apply(text, &change, id).contains("class Bar {") && apply(text, &change, id).contains("new Bar()")
+    );
+    let at = TextSize::from(text.find("$f =").unwrap() as u32);
+    let change = ws.rename(id, at, "$obj").unwrap();
+    assert!(apply(text, &change, id).contains("$obj = new Foo();\necho $obj->count;"));
+    assert!(ws.prepare_rename(id, TextSize::from(text.find("this").unwrap() as u32)).is_err());
+}
+
+#[test]
+fn code_actions_fix_things() {
+    let models = "<?php\nnamespace App\\Models;\ninterface Shape { public function area(): float; }\nclass User { private string $name; }\n";
+    let main = "<?php\nnamespace App;\n\nuse Unused\\Thing;\n\nclass Circle implements Models\\Shape {\n}\n$u = new User();\n";
+    let mut ws = Workspace::new(Config::default());
+    ws.set_file("file:///m.php", models.to_string());
+    let id = ws.set_file("file:///main.php", main.to_string());
+    let titles = |offset: usize| -> Vec<(String, String)> {
+        ws.code_actions(id, php_ide::TextRange::empty(TextSize::from(offset as u32)))
+            .into_iter()
+            .map(|a| (a.title.clone(), apply(main, &a.change, id)))
+            .collect()
+    };
+    let acts = titles(main.find("User()").unwrap());
+    let import = acts.iter().find(|(t, _)| t == "Import 'App\\Models\\User'").expect("import action");
+    assert!(import.1.contains("use Unused\\Thing;\nuse App\\Models\\User;"), "{}", import.1);
+    let acts = titles(main.find("Circle").unwrap());
+    let imp =
+        acts.iter().find(|(t, _)| t.starts_with("Implement 1 missing method")).expect("implement action");
+    assert!(imp.1.contains("    public function area(): float\n    {\n        throw new \\Exception('Not implemented');\n    }\n}"), "{}", imp.1);
+    let acts = titles(main.find("Thing").unwrap());
+    let rm = acts.iter().find(|(t, _)| t == "Remove unused import").expect("remove import");
+    assert!(!rm.1.contains("Unused"), "{}", rm.1);
+    let acts = titles(main.find("Circle").unwrap());
+    let doc = acts.iter().find(|(t, _)| t == "Add PHPDoc").expect("phpdoc");
+    assert!(doc.1.contains("/**\n *\n */\nclass Circle"), "{}", doc.1);
+
+    let id2 = ws.file_id("file:///m.php").unwrap();
+    let acts =
+        ws.code_actions(id2, php_ide::TextRange::empty(TextSize::from(models.find("$name").unwrap() as u32)));
+    let gs = acts.iter().find(|a| a.title == "Generate getter and setter for $name").expect("getter/setter");
+    let out = apply(models, &gs.change, id2);
+    assert!(
+        out.contains("public function getName(): string\n    {\n        return $this->name;\n    }"),
+        "{out}"
+    );
+    assert!(out.contains("public function setName(string $name): static"), "{out}");
+}
+
+#[test]
+fn hierarchies_and_lenses() {
+    let text = "<?php\ninterface I { function run(); }\nclass A implements I { function run() { helper(); } }\nclass B extends A { function run() { parent::run(); } }\nfunction helper() {}\nfunction main() { (new B)->run(); helper(); }\n";
+    let mut ws = Workspace::new(Config::default());
+    let id = ws.set_file("file:///h.php", text.to_string());
+    let at = TextSize::from(text.find("helper() {}").unwrap() as u32);
+    let item = ws.prepare_call_hierarchy(id, at).remove(0);
+    let callers: Vec<String> = ws.incoming_calls(&item).into_iter().map(|c| c.item.name).collect();
+    assert_eq!(callers, vec!["run", "main"]);
+    let main_at = TextSize::from(text.find("main()").unwrap() as u32);
+    let main_item = ws.prepare_call_hierarchy(id, main_at).remove(0);
+    let callees: Vec<String> = ws
+        .outgoing_calls(&main_item)
+        .into_iter()
+        .map(|c| c.item.detail.unwrap_or_default() + "::" + &c.item.name)
+        .collect();
+    assert_eq!(callees, vec!["B::run", "::helper"]);
+
+    let a_at = TextSize::from(text.find("A implements").unwrap() as u32);
+    let a = ws.prepare_type_hierarchy(id, a_at).remove(0);
+    assert_eq!(ws.supertypes(&a).into_iter().map(|i| i.name).collect::<Vec<_>>(), vec!["I"]);
+    assert_eq!(ws.subtypes(&a).into_iter().map(|i| i.name).collect::<Vec<_>>(), vec!["B"]);
+
+    let lenses = ws.code_lenses(id);
+    let titles: Vec<String> =
+        lenses.iter().filter_map(|l| ws.resolve_code_lens(id, l)).map(|r| r.title).collect();
+    assert!(titles.contains(&"2 implementations".to_string()), "{titles:?}");
+    assert!(titles.contains(&"implements I::run".to_string()), "{titles:?}");
+    assert!(titles.contains(&"overrides A::run".to_string()), "{titles:?}");
+    assert!(titles.contains(&"2 references".to_string()), "{titles:?}");
+}
+
+#[test]
+fn docblock_completion() {
+    let f = fixture("<?php\n/**<|> */\nfunction f(int $a, $b): string {}\n");
+    let items = f.ws.completions(f.file, f.offset).items;
+    let doc = items.iter().find(|i| i.label == "/** */").expect("docblock item");
+    assert_eq!(
+        doc.insert_text,
+        "/**\n * ${1:}\n *\n * @param ${2:int} $a\n * @param ${3:mixed} $b\n * @return ${4:string}\n */"
+    );
+}

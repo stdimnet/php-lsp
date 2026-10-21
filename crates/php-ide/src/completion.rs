@@ -264,11 +264,13 @@ impl Cx<'_, '_> {
             return;
         };
         match left.kind() {
-            STRING | ENCAPSED_TEXT | COMMENT | INLINE_HTML | HEREDOC_START => return,
-            DOC_COMMENT => {
-                self.doc_tags(&left);
+            DOC_COMMENT | COMMENT if left.text().starts_with("/**") => {
+                if !self.docblock(&left) {
+                    self.doc_tags(&left);
+                }
                 return;
             }
+            STRING | ENCAPSED_TEXT | COMMENT | INLINE_HTML | HEREDOC_START => return,
             _ => {}
         }
         // the identifier being typed (prefix) and its range
@@ -794,6 +796,36 @@ impl Cx<'_, '_> {
                 self.items.push(item);
             }
         }
+    }
+
+    /// `/** */` directly before a declaration: offer a generated PHPDoc.
+    fn docblock(&mut self, token: &SyntaxToken) -> bool {
+        let inner = token.text().trim_start_matches("/**").trim_end_matches("*/");
+        if !inner.trim().is_empty() || self.offset != token.text_range().start() + TextSize::from(3) {
+            return false;
+        }
+        let mut next = token.next_sibling_or_token();
+        while let Some(php_syntax::NodeOrToken::Token(t)) = &next {
+            if t.kind() != WHITESPACE {
+                return false;
+            }
+            next = t.next_sibling_or_token();
+        }
+        let Some(php_syntax::NodeOrToken::Node(decl)) = next else { return false };
+        let text = &self.sema.text;
+        let start = usize::from(token.text_range().start());
+        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let indent: String = text[line_start..start].chars().take_while(|c| c.is_whitespace()).collect();
+        let Some(doc) = crate::code_actions::phpdoc_for(self.sema, &decl, &indent, true) else {
+            return false;
+        };
+        let mut item = CompletionItem::new("/** */", CompletionKind::Snippet, token.text_range());
+        item.detail = Some("PHPDoc".into());
+        item.insert_text = doc;
+        item.is_snippet = true;
+        item.sort_text = Some("0".into());
+        self.items.push(item);
+        true
     }
 
     fn doc_tags(&mut self, token: &SyntaxToken) {
