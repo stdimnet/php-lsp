@@ -363,6 +363,12 @@ impl Workspace {
     pub fn diagnostics(&self, id: FileId) -> Vec<Diagnostic> {
         let Some(parse) = self.parse(id) else { return Vec::new() };
         let mut out = diagnostics::syntax_diagnostics(&self.config, &parse);
+        // a template ending in a directive / echo without a final newline: its
+        // virtual code has no room for the closing `;`
+        if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
+            let end = TextSize::from(f.text.len() as u32);
+            out.retain(|d| !(d.range.start() >= end && d.message == "expected `;`"));
+        }
         if let Some(sema) = sema::Sema::new(self, id) {
             out.extend(diagnostics::semantic_diagnostics(&sema));
         }

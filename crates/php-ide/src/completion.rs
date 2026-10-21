@@ -948,7 +948,12 @@ pub(crate) fn string_arg_at(sema: &Sema, offset: TextSize) -> Option<(crate::plu
             // Blade directive: `@include('view')` -> callee `@include`
             let original = &sema.text[callee.text_range()];
             if original != name && sema.ws.file(sema.file).is_some_and(|f| crate::blade::is_blade(&f.path)) {
-                let value = sema.text[content].to_string();
+                // (the virtual code of Blade templates is one character longer)
+                let value = sema
+                    .text
+                    .get(usize::from(content.start())..usize::from(content.end()))
+                    .unwrap_or("")
+                    .to_string();
                 return Some((
                     StringArg { callee: Callee::Function(Fqn::new(&format!("@{original}"))), index, value },
                     content,
@@ -976,6 +981,8 @@ pub(crate) fn string_arg_at(sema: &Sema, offset: TextSize) -> Option<(crate::plu
         }
         _ => return None,
     };
-    let value = sema.text[content].to_string();
+    // (the virtual code of Blade templates is one character longer)
+    let value =
+        sema.text.get(usize::from(content.start())..usize::from(content.end())).unwrap_or("").to_string();
     Some((StringArg { callee, index, value }, content))
 }

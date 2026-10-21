@@ -439,7 +439,14 @@ pub(crate) fn virtual_php(text: &str) -> Blade {
     }
     let mut text =
         String::from_utf8(b.out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-    text.push(';');
+    // terminate the last statement without changing the length: on the final
+    // whitespace character (offsets stay identical to the template)
+    if !text.trim_end().ends_with(';') && !text.trim_end().ends_with("*/") {
+        if text.ends_with(char::is_whitespace) {
+            let last = text.char_indices().last().map(|(i, _)| i).unwrap_or(0);
+            text.replace_range(last.., ";");
+        }
+    }
     Blade { text, regions: b.regions, directives: b.directives, delimiters: b.delimiters }
 }
 
@@ -847,7 +854,7 @@ mod tests {
 
     fn check(src: &str, expect: expect_test::Expect) {
         let b = virtual_php(src);
-        assert_eq!(b.text.len(), src.len() + 1);
+        assert_eq!(b.text.len(), src.len());
         assert_eq!(
             b.text.match_indices('\n').map(|m| m.0).collect::<Vec<_>>(),
             src.match_indices('\n').map(|m| m.0).collect::<Vec<_>>()
@@ -863,7 +870,7 @@ mod tests {
             expect_test::expect![[r#"
                 ···;(·$user->name·);····
                 ;(··$html·);··················
-                /**··@var·\App\User·$u·*····*/;"#]],
+                /**··@var·\App\User·$u·*····*/"#]],
         );
         check(
             "@if($a)\n  @foreach ($items as $item)\n    @include('row', ['i' => $item])\n  @endforeach\n@elseif(count($b) > 1)\n@else\n@endif",
@@ -874,14 +881,14 @@ mod tests {
                 ··;··········
                 ;if····(count($b)·>·1)
                 ;····
-                ;·····;"#]],
+                ;·····"#]],
         );
         check(
             "@use('Illuminate\\Support\\Str')\n@use('App\\Models\\User', 'U')\n{{ Str::of($x) }}",
             expect_test::expect![[r#"
                 ;use··Illuminate\Support\Str·;
                 ;use··App\Models\User·as·U·;
-                ;(·Str::of($x)·);;"#]],
+                ;(·Str::of($x)·);"#]],
         );
         check(
             "@php\n  $x = 1;\n@endphp\n@php($y = 2)\n<style>@media (x) {}</style>\n<x-alert :type=\"$t\" class=\"a\" />\n@verbatim {{ no }} @endverbatim",
@@ -892,7 +899,7 @@ mod tests {
                 ;···($y·=·2)
                 ····························
                 ·········;·····($t)·············
-                ·······························;"#]],
+                ······························;"#]],
         );
     }
 
@@ -902,7 +909,7 @@ mod tests {
             "<p>{{ $user-></p>\n<b>",
             expect_test::expect![[r#"
                 ···;··$user-></p>
-                ···;"#]],
+                ··;"#]],
         );
     }
 }

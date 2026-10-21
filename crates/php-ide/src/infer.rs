@@ -105,7 +105,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         depth.set(depth.get() + 1);
         let t = self.expr_type_inner(node);
         depth.set(depth.get() - 1);
-        if self.sema.infer_truncated.get() == truncated {
+        if self.sema.infer_truncated.get() == truncated && !self.sema.in_loop_carried.get() {
             self.sema.expr_cache.borrow_mut().insert(key, t.clone());
         }
         t
@@ -690,7 +690,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         depth.set(depth.get() + 1);
         let t = self.variable_type_inner(name, at);
         depth.set(depth.get() - 1);
-        if self.sema.infer_truncated.get() == truncated {
+        if self.sema.infer_truncated.get() == truncated && !self.sema.in_loop_carried.get() {
             self.sema.var_cache.borrow_mut().insert(key, t.clone());
         }
         t
@@ -1042,6 +1042,17 @@ impl<'s, 'a> Infer<'s, 'a> {
 
     /// Types assigned to `$name` after `at` inside loops enclosing `at`.
     fn loop_carried(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Vec<Type> {
+        let flag = &self.sema.in_loop_carried;
+        if flag.get() {
+            return Vec::new();
+        }
+        flag.set(true);
+        let out = self.loop_carried_inner(name, at, scope);
+        flag.set(false);
+        out
+    }
+
+    fn loop_carried_inner(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Vec<Type> {
         let offset = at.text_range().start();
         let mut out = Vec::new();
         for lp in at.ancestors().take_while(|a| a != scope) {

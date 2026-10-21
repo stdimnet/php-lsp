@@ -22,6 +22,9 @@ pub(crate) struct Sema<'a> {
     /// How often inference stopped at the depth limit (results computed
     /// meanwhile are incomplete and not cached).
     pub infer_truncated: std::cell::Cell<u32>,
+    /// Set while loop-carried assignments are evaluated (they are not
+    /// followed again from there).
+    pub in_loop_carried: std::cell::Cell<bool>,
     /// Inferred types of expressions (by range and kind) and of variables
     /// (by name and position) for this request.
     pub expr_cache:
@@ -43,6 +46,7 @@ impl<'a> Sema<'a> {
             text,
             infer_depth: std::cell::Cell::new(0),
             infer_truncated: std::cell::Cell::new(0),
+            in_loop_carried: std::cell::Cell::new(false),
             expr_cache: Default::default(),
             var_cache: Default::default(),
         })
