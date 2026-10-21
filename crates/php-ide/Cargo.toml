@@ -11,6 +11,7 @@ php-syntax.workspace = true
 php-hir.workspace = true
 php-index.workspace = true
 php-stubs.workspace = true
+php-fmt.workspace = true
 rayon.workspace = true
 walkdir.workspace = true
 globset.workspace = true

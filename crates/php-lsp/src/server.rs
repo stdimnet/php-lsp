@@ -704,6 +704,8 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             resolve_provider: Some(false),
         })),
         call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
+        document_formatting_provider: Some(lsp::OneOf::Left(true)),
+        document_range_formatting_provider: Some(lsp::OneOf::Left(true)),
         code_lens_provider: Some(lsp::CodeLensOptions { resolve_provider: Some(true) }),
         semantic_tokens_provider: Some(lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(
             lsp::SemanticTokensOptions {

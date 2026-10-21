@@ -36,6 +36,8 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         TypeHierarchySubtypes::METHOD => handle(s, req, subtypes),
         CodeLensRequest::METHOD => handle(s, req, code_lens),
         CodeLensResolve::METHOD => handle(s, req, code_lens_resolve),
+        Formatting::METHOD => handle(s, req, formatting),
+        RangeFormatting::METHOD => handle(s, req, range_formatting),
         SemanticTokensFullRequest::METHOD => handle(s, req, semantic_tokens_full),
         SemanticTokensRangeRequest::METHOD => handle(s, req, semantic_tokens_range),
         crate::ext::SyntaxTree::METHOD => handle(s, req, syntax_tree),
@@ -400,6 +402,53 @@ fn semantic_tokens_range(
 
 // ---------------------------------------------------------------------- rename
 
+// ---------------------------------------------------------------------- formatting
+
+fn format_options(s: &Server, o: &lsp::FormattingOptions) -> php_ide::FormatOptions {
+    php_ide::FormatOptions {
+        indent_size: o.tab_size.max(1) as usize,
+        use_tabs: !o.insert_spaces,
+        braces: s.config.format_braces,
+        insert_final_newline: o.insert_final_newline.unwrap_or(true),
+        ..Default::default()
+    }
+}
+
+fn format_edits(
+    s: &Server,
+    id: FileId,
+    range: Option<php_ide::TextRange>,
+    o: &lsp::FormattingOptions,
+) -> Option<Vec<lsp::TextEdit>> {
+    if !s.config.format_enable {
+        return None;
+    }
+    let index = s.workspace.line_index(id)?;
+    let edits = s.workspace.format(id, range, &format_options(s, o))?;
+    Some(
+        edits
+            .into_iter()
+            .map(|e| lsp::TextEdit {
+                range: convert::range(&index, s.encoding, e.range),
+                new_text: e.new_text,
+            })
+            .collect(),
+    )
+}
+
+fn formatting(s: &mut Server, p: lsp::DocumentFormattingParams) -> Option<Vec<lsp::TextEdit>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    format_edits(s, id, None, &p.options)
+}
+
+fn range_formatting(s: &mut Server, p: lsp::DocumentRangeFormattingParams) -> Option<Vec<lsp::TextEdit>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    let range = convert::text_range(&index, s.encoding, p.range);
+    format_edits(s, id, Some(range), &p.options)
+}
+
+#[allow(clippy::mutable_key_type)]
 fn workspace_edit(s: &Server, change: php_ide::SourceChange) -> Option<lsp::WorkspaceEdit> {
     let mut changes = std::collections::HashMap::new();
     for (file, edits) in change.edits {

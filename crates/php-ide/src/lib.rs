@@ -49,6 +49,7 @@ pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
 pub use inlay_hints::{InlayHint, InlayHintKind, InlayHintsConfig};
 pub use line_index::{LineCol, LineIndex, PositionEncoding};
 pub use navigation::{Location, Reference, ReferenceKind};
+pub use php_fmt::{BraceStyle, FormatOptions};
 pub use php_hir as hir;
 pub use php_index::{FileId, FileKind, Index};
 pub use php_syntax::{self as syntax, PhpVersion, TextRange, TextSize};
@@ -442,6 +443,24 @@ impl Workspace {
 
     pub fn code_actions(&self, id: FileId, range: TextRange) -> Vec<CodeAction> {
         sema::Sema::new(self, id).map(|s| code_actions::code_actions(&s, range)).unwrap_or_default()
+    }
+
+    /// Whitespace edits formatting the file (`None` if it has syntax errors).
+    pub fn format(
+        &self,
+        id: FileId,
+        range: Option<TextRange>,
+        options: &FormatOptions,
+    ) -> Option<Vec<TextEdit>> {
+        let file = self.file(id)?;
+        let mut options = options.clone();
+        options.php_version = self.config.php_version;
+        let edits = match range {
+            Some(r) => php_fmt::format_range(&file.text, r, &options),
+            None => php_fmt::format(&file.text, &options),
+        }
+        .ok()?;
+        Some(edits.into_iter().map(|e| TextEdit { range: e.range, new_text: e.new_text }).collect())
     }
 
     pub fn inlay_hints(&self, id: FileId, range: TextRange) -> Vec<InlayHint> {

@@ -1,0 +1,10 @@
+[package]
+name = "php-fmt"
+description = "Whitespace-only PHP formatter (PSR-12 / PER coding style)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+php-syntax.workspace = true

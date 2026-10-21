@@ -261,3 +261,49 @@ fn indexes_workspace_and_navigates() {
     c.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn editing_features_over_lsp() {
+    let mut c = Client::start(json!({}));
+    let uri = "file:///edit.php";
+    c.open(uri, "<?php\nclass Greeter{\npublic function hi($name){return 'hi '.$name;}\n}\n$g=new Greeter();\n$g->hi('x');\n");
+    c.wait_notification("textDocument/publishDiagnostics");
+
+    let edits = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(!edits.as_array().unwrap().is_empty());
+
+    let prep = c.request(
+        "textDocument/prepareRename",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 17}}),
+    );
+    assert_eq!(prep["placeholder"], "hi");
+    let edit = c.request(
+        "textDocument/rename",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 17}, "newName": "greet"}),
+    );
+    assert_eq!(edit["changes"][uri].as_array().unwrap().len(), 2, "{edit}");
+
+    let actions = c.request(
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri}, "range": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 7}}, "context": {"diagnostics": []}}),
+    );
+    let titles: Vec<&str> =
+        actions.as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"Add PHPDoc"), "{titles:?}");
+
+    let lenses = c.request("textDocument/codeLens", json!({"textDocument": {"uri": uri}}));
+    let resolved = c.request("codeLens/resolve", lenses[0].clone());
+    assert_eq!(resolved["command"]["title"], "1 reference");
+
+    let hints = c.request(
+        "textDocument/inlayHint",
+        json!({"textDocument": {"uri": uri}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}}),
+    );
+    assert!(hints.as_array().unwrap().iter().any(|h| h["label"] == "name:"), "{hints}");
+    let toks = c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri}}));
+    assert!(!toks["data"].as_array().unwrap().is_empty());
+    c.shutdown();
+}

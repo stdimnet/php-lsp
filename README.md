@@ -19,6 +19,7 @@ It can be used in three ways:
 | `php-hir`    | Semantic model: namespaces/imports, PHPDoc (incl. PHPStan/Psalm types), type model, declared symbols |
 | `php-index`  | Global symbol index with inheritance aware member lookup (traits, parents, interfaces, mixins) |
 | `php-stubs`  | JetBrains phpstorm-stubs (Apache-2.0) embedded in compressed form |
+| `php-fmt`    | Whitespace-only formatter (PSR-12 / PER), never changes tokens, idempotent |
 | `php-ide`    | IDE features as a Rust API (`Workspace`): completion, hover, navigation, references, symbols, ... |
 | `php-lsp`    | LSP server and `php-lsp` binary |
 
@@ -60,6 +61,10 @@ when both set the same key, `php-lsp` wins.
 | `stubs`                   | Intelephense default stub list |
 | `completion.insertUseDeclaration` | `true` |
 | `completion.maxItems`     | `100` |
+| `diagnostics.*`           | `undefinedTypes`, `undefinedFunctions`, `undefinedConstants`, `undefinedClassConstants`, `undefinedMethods`, `undefinedProperties`, `undefinedVariables`, `unusedSymbols`, `deprecated`, `argumentCount`, `implementationErrors` (all `true`) |
+| `inlayHint.*`             | `parameterNames`, `returnTypes`, `parameterTypes` (all `true`) |
+| `format.enable`           | `true` |
+| `format.braces`           | `psr12` (`allman`, `k&r`) |
 
 ## Status / roadmap
 
@@ -70,10 +75,12 @@ when both set the same key, `php-lsp` wins.
   indexing, phpstorm-stubs, hover, definition / type definition / implementation,
   references, document highlights, workspace symbols, completion with auto import,
   signature help, file watching (on-disk index cache and Composer/PSR-4 still open)
-- [ ] **Phase 3, types & diagnostics:** type inference (generics, `@template`, array shapes),
-  undefined symbol / type diagnostics, inlay hints, semantic tokens, highlights
-- [ ] **Phase 4, editing:** rename, code actions, formatter, implementations,
-  call/type hierarchy, code lens, PHPDoc generation
+- [x] **Phase 3, types & diagnostics:** type inference (generics via `@template`, array
+  shapes, narrowing), undefined symbol / argument count / implementation / deprecation /
+  unused diagnostics, inlay hints, semantic tokens, highlights
+- [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
+  imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
+  hierarchy, code lens, PHPDoc completion
 - [ ] **Phase 5, Intelephense compatibility:** full settings schema, `--node-ipc`, custom
   messages, `intelephense` alias binary
 - [ ] **Phase 6, extras:** refactorings, dead code / unused detection, PHPStan / Psalm /
@@ -87,4 +94,6 @@ cargo test --workspace
 cargo run --release -p php-syntax --example parse_corpus -- path/to/php/project
 cargo run -p php-syntax --example fuzz_truncate -- some/file.php
 cargo run --release -p php-ide --example index_project -- path/to/php/project ClassName
+cargo run --release -p php-ide --example diagnose_project -- path/to/php/project [CODE]
+cargo run --release -p php-fmt --example fmt_corpus -- path/to/php/project
 ```

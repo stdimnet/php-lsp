@@ -23,6 +23,8 @@ pub struct ServerConfig {
     pub exclude: Vec<String>,
     pub stubs: Vec<String>,
     pub insert_use_declaration: bool,
+    pub format_enable: bool,
+    pub format_braces: php_ide::BraceStyle,
     pub max_completion_items: usize,
 }
 
@@ -40,6 +42,8 @@ impl Default for ServerConfig {
             exclude: scan.exclude,
             stubs: ide.stubs,
             insert_use_declaration: ide.auto_import,
+            format_enable: true,
+            format_braces: php_ide::BraceStyle::Psr12,
             max_completion_items: ide.max_completion_items,
         }
     }
@@ -128,6 +132,16 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "completion.insertUseDeclaration").and_then(Value::as_bool) {
                 self.insert_use_declaration = v;
+            }
+            if let Some(v) = get(&root, "format.enable").and_then(Value::as_bool) {
+                self.format_enable = v;
+            }
+            if let Some(v) = get(&root, "format.braces").and_then(Value::as_str) {
+                self.format_braces = match v.to_ascii_lowercase().as_str() {
+                    "allman" => php_ide::BraceStyle::Allman,
+                    "k&r" | "k_and_r" | "kandr" => php_ide::BraceStyle::KAndR,
+                    _ => php_ide::BraceStyle::Psr12,
+                };
             }
             if let Some(v) = get(&root, "completion.maxItems").and_then(Value::as_u64) {
                 self.max_completion_items = v as usize;
