@@ -6,7 +6,7 @@ use php_hir::symbols::{ConstDef, FunctionDef};
 use php_hir::{FileScopes, Fqn, NamespaceScope};
 use php_index::{FileId, Index};
 use php_syntax::ast::{self, AstNode};
-use php_syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken, TextSize, TokenAtOffset};
+use php_syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, TextSize, TokenAtOffset};
 
 use crate::infer::Infer;
 use crate::Workspace;
@@ -19,6 +19,14 @@ pub(crate) struct Sema<'a> {
     pub text: Arc<str>,
     /// Recursion depth of type inference (shared by all `Infer` instances).
     pub infer_depth: std::cell::Cell<u32>,
+    /// How often inference stopped at the depth limit (results computed
+    /// meanwhile are incomplete and not cached).
+    pub infer_truncated: std::cell::Cell<u32>,
+    /// Inferred types of expressions (by range and kind) and of variables
+    /// (by name and position) for this request.
+    pub expr_cache:
+        std::cell::RefCell<std::collections::HashMap<(TextRange, php_syntax::SyntaxKind), php_hir::Type>>,
+    pub var_cache: std::cell::RefCell<std::collections::HashMap<(String, TextSize), php_hir::Type>>,
 }
 
 impl<'a> Sema<'a> {
@@ -27,7 +35,17 @@ impl<'a> Sema<'a> {
         let scopes = ws.scopes(file, &parse);
         let root = parse.syntax_node();
         let text = ws.file(file)?.text.clone();
-        Some(Sema { ws, file, root, scopes, text, infer_depth: std::cell::Cell::new(0) })
+        Some(Sema {
+            ws,
+            file,
+            root,
+            scopes,
+            text,
+            infer_depth: std::cell::Cell::new(0),
+            infer_truncated: std::cell::Cell::new(0),
+            expr_cache: Default::default(),
+            var_cache: Default::default(),
+        })
     }
 
     pub fn index(&self) -> &'a Index {

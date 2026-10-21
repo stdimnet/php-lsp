@@ -149,6 +149,9 @@ cargo test --workspace
 cargo run --release -p php-syntax --example parse_corpus -- path/to/php/project
 cargo run -p php-syntax --example fuzz_truncate -- some/file.php
 cargo run --release -p php-ide --example index_project -- path/to/php/project ClassName
-cargo run --release -p php-ide --example diagnose_project -- path/to/php/project [CODE]
+cargo run --release -p php-ide --example diagnose_project -- path/to/php/project [CODE,CODE]
+cargo run --release -p php-ide --example fuzz_ide -- some/*.php   # IDE features on truncated files
 cargo run --release -p php-fmt --example fmt_corpus -- path/to/php/project
+node editors/compare/compare.js path/to/php/project              # differences to Intelephense
+xvfb-run -a node editors/vscode-test/run.js                      # inside the real VS Code
 ```

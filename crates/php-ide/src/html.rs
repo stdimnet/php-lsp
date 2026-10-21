@@ -386,6 +386,10 @@ pub(crate) fn completions(root: &SyntaxNode, offset: TextSize) -> Option<Vec<Com
     let State::InTag { tag, quote: None, after_name, attr_start } = state else { return Some(Vec::new()) };
     let mut items = Vec::new();
     if !after_name {
+        // cursor between `<` and `/` (the name starts after it)
+        if tag.name_range.start() > offset {
+            return Some(Vec::new());
+        }
         let range = TextRange::new(tag.name_range.start(), offset);
         if tag.closing {
             if let Some(open) = open_elements(&tags).last() {
@@ -401,7 +405,7 @@ pub(crate) fn completions(root: &SyntaxNode, offset: TextSize) -> Option<Vec<Com
             }
         }
     } else if !tag.closing && !text_before(root, offset).ends_with('=') {
-        let start = attr_start.unwrap_or(offset);
+        let start = attr_start.unwrap_or(offset).min(offset);
         let range = TextRange::new(start, offset);
         let lower = tag.name.to_ascii_lowercase();
         for &a in element_attrs(&lower).iter().chain(GLOBAL_ATTRS) {

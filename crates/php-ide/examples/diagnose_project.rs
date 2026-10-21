@@ -38,10 +38,18 @@ fn main() {
     let mut shown = 0;
     let mut structure = 0;
     for id in &ids {
+        let started = std::time::Instant::now();
+        if std::env::var("VERBOSE").is_ok() {
+            eprintln!("start: {}", ws.file(*id).unwrap().path);
+        }
         // also exercise the structural features (panic check)
         structure += ws.folding_ranges(*id).len() + ws.document_symbols(*id).len();
         structure += ws.semantic_tokens(*id, None).len();
-        for d in ws.diagnostics(*id) {
+        let diagnostics = ws.diagnostics(*id);
+        if started.elapsed() > std::time::Duration::from_secs(1) {
+            eprintln!("slow: {} {:?}", ws.file(*id).unwrap().path, started.elapsed());
+        }
+        for d in diagnostics {
             *counts.entry(d.code.as_str()).or_default() += 1;
             if show.as_deref().is_some_and(|s| s.split(',').any(|c| c == d.code.as_str())) && shown < n {
                 shown += 1;

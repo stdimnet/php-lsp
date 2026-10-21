@@ -896,8 +896,9 @@ fn string_value(node: &SyntaxNode) -> Option<String> {
     if t.kind() != STRING {
         return None;
     }
-    let s = t.text();
-    Some(s[1..s.len().saturating_sub(1)].to_string())
+    // unterminated while typing: `'`
+    let s = t.text().trim_end_matches(['\'', '"']);
+    Some(s.get(1..).unwrap_or("").to_string())
 }
 
 /// Evaluates `#[PhpStormStubsElementAvailable(from: 'x', to: 'y')]` and, in

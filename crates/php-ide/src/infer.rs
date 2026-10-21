@@ -92,13 +92,22 @@ impl<'s, 'a> Infer<'s, 'a> {
 
     /// Infers the type of an expression. `self`/`static`/`parent` are resolved.
     pub fn expr_type(&self, node: &SyntaxNode) -> Type {
+        let key = (node.text_range(), node.kind());
+        if let Some(t) = self.sema.expr_cache.borrow().get(&key) {
+            return t.clone();
+        }
         let depth = &self.sema.infer_depth;
         if depth.get() > MAX_DEPTH {
+            self.sema.infer_truncated.set(self.sema.infer_truncated.get() + 1);
             return Type::Mixed;
         }
+        let truncated = self.sema.infer_truncated.get();
         depth.set(depth.get() + 1);
         let t = self.expr_type_inner(node);
         depth.set(depth.get() - 1);
+        if self.sema.infer_truncated.get() == truncated {
+            self.sema.expr_cache.borrow_mut().insert(key, t.clone());
+        }
         t
     }
 
@@ -212,7 +221,9 @@ impl<'s, 'a> Infer<'s, 'a> {
             }
             CALL_EXPR => self.call_type(node),
             METHOD_CALL_EXPR | STATIC_CALL_EXPR => self.method_call_type(node),
-            PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR => self.property_type(node),
+            PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR => {
+                self.narrowed_expr(node).unwrap_or_else(|| self.property_type(node))
+            }
             CLASS_CONST_FETCH_EXPR => self.class_const_type(node),
             INDEX_EXPR => {
                 let mut children = expr_children(node);
@@ -221,7 +232,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                     let t = k.first_token()?;
                     if k.kind() == LITERAL && t.kind() == STRING {
                         let s = t.text();
-                        Some(s[1..s.len().saturating_sub(1)].to_string())
+                        Some(crate::plugins::unquote(s))
                     } else if k.kind() == LITERAL {
                         Some(t.text().to_string())
                     } else {
@@ -420,7 +431,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
     }
 
-    fn syntax_type(&self, ty: &SyntaxNode, at: &SyntaxNode) -> Type {
+    pub(crate) fn syntax_type(&self, ty: &SyntaxNode, at: &SyntaxNode) -> Type {
         let scope = self.sema.scope_at(at.text_range().start());
         let tr = TypeResolver { scope, templates: &[], class_templates: &[] };
         let t = tr.syntax_type(ty);
@@ -428,7 +439,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         self.resolve_rel(&t, class.as_ref(), class.as_ref())
     }
 
-    fn doc_type(&self, text: &str, at: &SyntaxNode) -> Type {
+    pub(crate) fn doc_type(&self, text: &str, at: &SyntaxNode) -> Type {
         let scope = self.sema.scope_at(at.text_range().start());
         let tr = TypeResolver { scope, templates: &[], class_templates: &[] };
         let t = tr.doc_type(text);
@@ -666,13 +677,22 @@ impl<'s, 'a> Infer<'s, 'a> {
 
     /// Type of variable `$name` as seen at `at`.
     pub fn variable_type(&self, name: &str, at: &SyntaxNode) -> Type {
+        let key = (name.to_string(), at.text_range().start());
+        if let Some(t) = self.sema.var_cache.borrow().get(&key) {
+            return t.clone();
+        }
         let depth = &self.sema.infer_depth;
         if depth.get() > MAX_DEPTH {
+            self.sema.infer_truncated.set(self.sema.infer_truncated.get() + 1);
             return Type::Mixed;
         }
+        let truncated = self.sema.infer_truncated.get();
         depth.set(depth.get() + 1);
         let t = self.variable_type_inner(name, at);
         depth.set(depth.get() - 1);
+        if self.sema.infer_truncated.get() == truncated {
+            self.sema.var_cache.borrow_mut().insert(key, t.clone());
+        }
         t
     }
 
@@ -738,6 +758,12 @@ impl<'s, 'a> Infer<'s, 'a> {
             match n.kind() {
                 FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR | CLASS_DECL | INTERFACE_DECL | TRAIT_DECL
                 | ENUM_DECL | ANON_CLASS => continue,
+                // inside an `if`: assignments of the other branches do not reach `at`
+                IF_STMT | ELSE_IF_CLAUSE if n.text_range().contains(offset) => {
+                    stack.extend(
+                        n.children().filter(|c| is_expr(c.kind()) || c.text_range().contains(offset)),
+                    );
+                }
                 ASSIGN_EXPR if n.text_range().end() <= offset => {
                     if let Some(lhs) = n.first_child() {
                         if lhs.kind() == VARIABLE_EXPR
@@ -870,6 +896,14 @@ impl<'s, 'a> Infer<'s, 'a> {
             if best.as_ref().is_none_or(|(p, _)| *p <= anchor) {
                 return t;
             }
+        }
+        // inside a loop, assignments later in the loop reach the next iteration
+        if let Some((pos, t)) = best.take() {
+            let carried = self.loop_carried(name, at, &scope);
+            best = Some((
+                pos,
+                if carried.is_empty() { t } else { Type::union(std::iter::once(t).chain(carried).collect()) },
+            ));
         }
         if best.is_none() && scope.kind() == SOURCE_FILE {
             if let Some(t) = self.template_variable(name) {
@@ -1006,6 +1040,94 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
     }
 
+    /// Types assigned to `$name` after `at` inside loops enclosing `at`.
+    fn loop_carried(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Vec<Type> {
+        let offset = at.text_range().start();
+        let mut out = Vec::new();
+        for lp in at.ancestors().take_while(|a| a != scope) {
+            if !matches!(lp.kind(), FOREACH_STMT | WHILE_STMT | FOR_STMT | DO_WHILE_STMT) {
+                continue;
+            }
+            for assign in
+                lp.descendants().filter(|n| n.kind() == ASSIGN_EXPR && n.text_range().start() > offset)
+            {
+                // not inside nested functions
+                if assign
+                    .ancestors()
+                    .take_while(|a| a != &lp)
+                    .any(|a| matches!(a.kind(), CLOSURE_EXPR | ARROW_FN_EXPR | FUNCTION_DECL))
+                {
+                    continue;
+                }
+                let Some(lhs) = assign.first_child() else { continue };
+                let is_eq = assign.children_with_tokens().any(|e| e.kind() == EQ);
+                if is_eq
+                    && lhs.kind() == VARIABLE_EXPR
+                    && ast::VariableExpr::cast(lhs).and_then(|v| v.name()).as_deref() == Some(name)
+                {
+                    if let Some(rhs) = expr_children(&assign).nth(1) {
+                        out.push(self.expr_type(&rhs));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `if ($a->b instanceof C) { ...$a->b... }` (also after `&&` and in `?:`).
+    fn narrowed_expr(&self, node: &SyntaxNode) -> Option<Type> {
+        let text = ast::text_without_trivia(node);
+        let scope = self.sema.variable_scope(node);
+        for anc in node.ancestors() {
+            if anc == scope {
+                break;
+            }
+            let cond = match anc.kind() {
+                IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT => {
+                    let c = expr_children(&anc).next()?;
+                    let in_else = anc
+                        .children()
+                        .filter(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE))
+                        .any(|c| c.text_range().contains_range(node.text_range()));
+                    (!c.text_range().contains_range(node.text_range()) && !in_else).then_some(c)
+                }
+                BIN_EXPR if anc.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW)) => {
+                    expr_children(&anc).next().filter(|l| !l.text_range().contains_range(node.text_range()))
+                }
+                TERNARY_EXPR => {
+                    let parts: Vec<SyntaxNode> = expr_children(&anc).collect();
+                    (parts.len() == 3 && parts[1].text_range().contains_range(node.text_range()))
+                        .then(|| parts[0].clone())
+                }
+                _ => None,
+            };
+            if let Some(t) = cond.and_then(|c| self.instanceof_expr(&c, &text)) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn instanceof_expr(&self, cond: &SyntaxNode, text: &str) -> Option<Type> {
+        match cond.kind() {
+            INSTANCEOF_EXPR => {
+                let mut parts = expr_children(cond);
+                let lhs = parts.next()?;
+                let rhs = parts.next()?;
+                if ast::text_without_trivia(&lhs) != text || rhs.kind() != NAME_EXPR {
+                    return None;
+                }
+                let name = ast::text_without_trivia(&rhs);
+                self.sema.resolve_class_name(&name, &rhs).map(|c| Type::Named(c, Vec::new()))
+            }
+            PAREN_EXPR => self.instanceof_expr(&expr_children(cond).next()?, text),
+            BIN_EXPR if cond.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW)) => {
+                expr_children(cond).find_map(|c| self.instanceof_expr(&c, text))
+            }
+            _ => None,
+        }
+    }
+
     /// `@param` type of parameter `name` in a method overridden by `func`.
     fn inherited_param_doc(&self, func: &SyntaxNode, name: &str) -> Option<Type> {
         if func.kind() != METHOD_DECL {
@@ -1131,6 +1253,24 @@ impl<'s, 'a> Infer<'s, 'a> {
                 })
             }
             BIN_EXPR => {
+                // `$x !== null`, `null !== $x`, `$x != null`
+                if cond.children_with_tokens().any(|e| matches!(e.kind(), NEQ | NEQ2)) {
+                    let parts: Vec<SyntaxNode> = expr_children(cond).collect();
+                    let is_null = |n: &SyntaxNode| ast::text_without_trivia(n).eq_ignore_ascii_case("null");
+                    let var = match parts.as_slice() {
+                        [a, b] if is_null(b) => a,
+                        [a, b] if is_null(a) => b,
+                        _ => return None,
+                    };
+                    if var.kind() != VARIABLE_EXPR
+                        || ast::VariableExpr::cast(var.clone()).and_then(|v| v.name()).as_deref()
+                            != Some(name)
+                    {
+                        return None;
+                    }
+                    let t = self.variable_type(name, cond).without_null();
+                    return (!t.is_mixed()).then_some(t);
+                }
                 let is_and = cond.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW));
                 if !is_and {
                     return None;

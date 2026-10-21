@@ -4,6 +4,7 @@
 //! declares `strict_types=1`), and unknown classes are always accepted.
 
 use php_hir::{Fqn, Type};
+use php_syntax::ast::AstNode;
 use php_syntax::{SyntaxKind::*, SyntaxNode};
 
 use crate::diagnostics::{Checker, Diagnostic, DiagnosticCode, Severity};
@@ -88,6 +89,7 @@ impl Checker<'_, '_> {
             (Type::ClassString(_), a) => matches!(a, Type::String | Type::Literal(_) | Type::ClassString(_)),
             (Type::Resource, a) => matches!(a, Type::Resource),
             (Type::Named(p, _), a) => match a {
+                Type::Callable if p.short().eq_ignore_ascii_case("Closure") => true,
                 Type::Named(c, _) => {
                     self.unknown(c) || self.unknown(p) || index.is_subtype(c, p) || is_closure_like(p, a)
                 }
@@ -148,6 +150,95 @@ impl Checker<'_, '_> {
                 ));
             }
         }
+    }
+}
+
+impl Checker<'_, '_> {
+    /// P1131: a `@param` / `@return` type that cannot be a value of the
+    /// declared type (e.g. `@param string $x` on `int $x`).
+    pub(crate) fn check_doc_compatibility(&mut self, func: &SyntaxNode) {
+        if !self.config.type_errors {
+            return;
+        }
+        let Some(doc_tok) = php_syntax::ast::doc_comment(func) else { return };
+        let doc = php_hir::DocBlock::parse(doc_tok.text());
+        let infer = self.sema.infer();
+        let mut checks: Vec<(Type, Type, String)> = Vec::new();
+        if let Some(list) = func.children().find_map(php_syntax::ast::ParamList::cast) {
+            for p in list.params() {
+                let (Some(name), Some(ty)) = (p.name(), p.ty()) else { continue };
+                let Some(tag) = doc.param(&name).filter(|t| !t.type_text.is_empty()) else { continue };
+                let declared = infer.syntax_type(&ty, func);
+                let declared = if p
+                    .default_value()
+                    .is_some_and(|d| php_syntax::ast::text_without_trivia(&d).eq_ignore_ascii_case("null"))
+                {
+                    Type::union(vec![declared, Type::Null])
+                } else {
+                    declared
+                };
+                checks.push((declared, infer.doc_type(&tag.type_text, func), format!("${name}")));
+            }
+        }
+        if let (Some(ret), Some(tag)) = (
+            func.children().find(|c| c.kind() == RETURN_TYPE).and_then(|r| r.children().last()),
+            doc.return_tag().filter(|t| !t.type_text.is_empty()),
+        ) {
+            checks.push((
+                infer.syntax_type(&ret, func),
+                infer.doc_type(&tag.type_text, func),
+                "@return".into(),
+            ));
+        }
+        for (declared, documented, what) in checks {
+            // every documented alternative must be possible for the declared type
+            let ok = documented.members().into_iter().all(|m| self.accepts(&declared, m, true));
+            if ok {
+                continue;
+            }
+            // the tag's line in the doc comment
+            let text = doc_tok.text();
+            let needle = if what == "@return" { "@return".to_string() } else { what.clone() };
+            let range = text
+                .match_indices(needle.as_str())
+                .find(|(i, _)| {
+                    what == "@return"
+                        || text[..*i].rfind('@').is_some_and(|at| {
+                            text[at..].starts_with("@param")
+                                || text[at..].starts_with("@phpstan-param")
+                                || text[at..].starts_with("@psalm-param")
+                        })
+                })
+                .map(|(i, _)| {
+                    let line_start = text[..i].rfind('\n').map_or(0, |n| n + 1);
+                    let line_end = text[i..].find('\n').map_or(text.len(), |n| i + n);
+                    let start = line_start + text[line_start..line_end].find('@').unwrap_or(0);
+                    php_syntax::TextRange::new(
+                        doc_tok.text_range().start() + php_syntax::TextSize::from(start as u32),
+                        doc_tok.text_range().start()
+                            + php_syntax::TextSize::from(line_end.trim_end_matches_len(text) as u32),
+                    )
+                })
+                .unwrap_or(doc_tok.text_range());
+            self.push(Diagnostic::new(
+                range,
+                Severity::Information,
+                DiagnosticCode::DocTypeIncompatible,
+                "Documented type is not compatible with the declared type.",
+            ));
+        }
+    }
+}
+
+trait TrimLen {
+    fn trim_end_matches_len(self, text: &str) -> usize;
+}
+
+impl TrimLen for usize {
+    /// End offset without trailing whitespace / `*/`.
+    fn trim_end_matches_len(self, text: &str) -> usize {
+        let line = &text[..self];
+        line.trim_end().trim_end_matches("*/").trim_end().len()
     }
 }
 

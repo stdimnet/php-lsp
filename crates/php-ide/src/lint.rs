@@ -88,6 +88,9 @@ impl Checker<'_, '_> {
         }
         if node.kind() == METHOD_DECL || node.kind() == FUNCTION_DECL {
             self.lint_doc_params(node);
+            if index_ready {
+                self.check_doc_compatibility(node);
+            }
         }
     }
 

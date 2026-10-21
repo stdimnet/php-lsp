@@ -839,6 +839,7 @@ fn html_in_templates() {
     assert_eq!(labels("<ul><li><?php echo 1; ?></li></<|>"), vec!["ul".to_string()]);
     assert_eq!(labels("<script>if (a < b) {}</script><p></<|>"), vec!["p".to_string()]);
     assert!(labels("<a href=\"x<|>\">").is_empty());
+    assert!(labels("<p></p><<|>/div>").is_empty());
 
     let Fixture { ws, file, offset } =
         fixture("<div class=\"a\">\n  <br><di<|>v>x</div>\n<?php if ($a): ?></div><?php endif; ?>\n</div>\n");
@@ -1032,6 +1033,24 @@ nums([], new Other());
     );
 }
 
+#[test]
+fn documented_type_compatibility() {
+    let src = r#"<?php
+class Base {} class Sub extends Base {}
+/**
+ * @param string $a wrong
+ * @param int[] $b fine
+ * @param Sub $c fine
+ * @param int|null $d fine
+ * @param callable $e fine
+ * @return Base wrong
+ */
+function dc(int $a, array $b, Base $c, ?int $d, \Closure $e): string { return ''; }
+"#;
+    let d: Vec<String> = diags(src).into_iter().filter(|d| d.starts_with("P1131")).collect();
+    assert_eq!(d, vec!["P1131 Documented type is not compatible with the declared type."; 2]);
+}
+
 /// False positives found in the third comparison run.
 #[test]
 fn comparison_regressions() {
@@ -1055,7 +1074,19 @@ function f1(array $conds, ?array $data, $v): string {
     return implode(',', [$m, $t, $q ?? '']);
 }
 function f2(int $a, string $optional = ''): int { return $a; }
+class Ns {} class Arr { public ?Ns $value = null; }
+function f4(array $stmts, Arr $item, bool $c): void {
+    $last = null;
+    foreach ($stmts as $s) { if ($last !== null) { f5($last); } $last = $s instanceof Ns ? $s : new Ns(); }
+    if ($item->value instanceof Ns) { f5($item->value); }
+    if ($c) { $shared = new Ns(); }
+    if (empty($shared)) { $shared = new Ns(); }
+    f5($shared);
+}
+function f5(Ns $n): void { echo get_class($n); }
+function f6(string|array $contents): int { if (is_string($contents)) { $contents = 'x'; return strlen($contents); } else { return count($contents); } }
 function f3(): int { while (true) { switch (rand()) { case 1: break; default: return 1; } } }
+function f7(): int { for (;;) { for (;;) { switch (rand()) { case 1: break 2; } } if (rand()) { return 1; } } }
 "#;
     let d = diags(src);
     assert_eq!(d, vec!["P1132 Parameter $v has no type information available."]);

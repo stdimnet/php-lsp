@@ -68,6 +68,7 @@ pub enum DiagnosticCode {
     VoidAssignment,
     UnknownParamName,
     TypeMismatch,
+    DocTypeIncompatible,
     UndefinedConstant,
     UndefinedVariable,
     UndefinedMethod,
@@ -133,6 +134,7 @@ impl DiagnosticCode {
             DiagnosticCode::VoidAssignment => "P1125",
             DiagnosticCode::UnknownParamName => "P1130",
             DiagnosticCode::TypeMismatch => "P1006",
+            DiagnosticCode::DocTypeIncompatible => "P1131",
         }
     }
 }
@@ -320,7 +322,14 @@ fn class_guarded(node: &SyntaxNode, fqn: &Fqn) -> bool {
 /// loop bodies, switch cases, catch blocks, `&&` / `||` / `??` / `?:`
 /// operands, match arms) leaves out `read`. An `if` with `else` where every
 /// branch defines the variable counts as a definition.
-fn def_reaches(sema: &Sema, scope: &SyntaxNode, def: TextSize, read: TextSize, defs: &[TextSize]) -> bool {
+fn def_reaches(
+    sema: &Sema,
+    scope: &SyntaxNode,
+    name: &str,
+    def: TextSize,
+    read: TextSize,
+    defs: &[TextSize],
+) -> bool {
     let Some(tok) = scope.token_at_offset(def).right_biased() else { return true };
     let mut prev: Option<SyntaxNode> = None;
     for anc in tok.parent_ancestors() {
@@ -359,6 +368,10 @@ fn def_reaches(sema: &Sema, scope: &SyntaxNode, def: TextSize, read: TextSize, d
         if !conditional || anc.text_range().contains(read) {
             continue;
         }
+        // `if (empty($x)) { $x = ...; }`: set either way afterwards
+        if matches!(anc.kind(), IF_STMT | ELSE_IF_CLAUSE) && fills_if_missing(&anc, name) {
+            continue;
+        }
         // `if (...) { $x = 1; } else { $x = 2; }`
         let if_stmt = anc.ancestors().find(|a| a.kind() == IF_STMT);
         if let Some(if_stmt) = if_stmt.filter(|i| {
@@ -393,6 +406,25 @@ fn isset_guarded(scope: &SyntaxNode, read: TextRange, name: &str) -> bool {
 }
 
 /// `if (a && $x = f()) { ...$x... }`: in the "then" branch every operand
+/// The condition of `if_stmt` tests that `$name` is missing: `empty($x)`,
+/// `!isset($x)`, `is_null($x)`, `$x === null`, `!$x`.
+fn fills_if_missing(if_stmt: &SyntaxNode, name: &str) -> bool {
+    let Some(cond) = if_stmt.children().find(|c| crate::infer::is_expr(c.kind())) else { return false };
+    let t = ast::text_without_trivia(&cond).to_ascii_lowercase();
+    let v = format!("${}", name.to_ascii_lowercase());
+    [
+        format!("empty({v})"),
+        format!("!isset({v})"),
+        format!("is_null({v})"),
+        format!("{v}===null"),
+        format!("null==={v}"),
+        format!("{v}==null"),
+        format!("!{v}"),
+    ]
+    .iter()
+    .any(|c| t == *c || t == format!("({c})"))
+}
+
 fn is_and_op(n: &SyntaxNode) -> bool {
     n.kind() == BIN_EXPR && n.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW))
 }
@@ -615,17 +647,23 @@ fn always_exits(sema: &Sema, stmt: &SyntaxNode) -> bool {
             // a `break` of this loop (not of a nested loop / switch)
             infinite
                 && !stmt.descendants().filter(|n| n.kind() == BREAK_STMT).any(|b| {
-                    b.children().any(|c| crate::infer::is_expr(c.kind()))
-                        || b.ancestors()
-                            .skip(1)
-                            .find(|a| {
-                                matches!(
-                                    a.kind(),
-                                    WHILE_STMT | DO_WHILE_STMT | FOR_STMT | FOREACH_STMT | SWITCH_STMT
-                                )
-                            })
-                            .as_ref()
-                            == Some(stmt)
+                    // `break N` leaves the N-th enclosing loop / switch
+                    let levels = b
+                        .children()
+                        .find(|c| crate::infer::is_expr(c.kind()))
+                        .map_or(Some(1), |n| ast::text_without_trivia(&n).parse::<usize>().ok());
+                    let Some(levels) = levels.filter(|l| *l >= 1) else { return true };
+                    b.ancestors()
+                        .skip(1)
+                        .filter(|a| {
+                            matches!(
+                                a.kind(),
+                                WHILE_STMT | DO_WHILE_STMT | FOR_STMT | FOREACH_STMT | SWITCH_STMT
+                            )
+                        })
+                        .nth(levels - 1)
+                        .as_ref()
+                        == Some(stmt)
                 })
         }
         _ => false,
@@ -1731,7 +1769,7 @@ impl Checker<'_, '_> {
                         && !isset_guarded(scope, *range, name)
                     {
                         let before: Vec<TextSize> = v.defs.iter().copied().filter(|d| *d < pos).collect();
-                        if !before.iter().any(|d| def_reaches(self.sema, scope, *d, pos, &before)) {
+                        if !before.iter().any(|d| def_reaches(self.sema, scope, name, *d, pos, &before)) {
                             diags.push(Diagnostic::new(
                                 *range,
                                 Severity::Warning,
