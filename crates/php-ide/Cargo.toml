@@ -1,0 +1,13 @@
+[package]
+name = "php-ide"
+description = "IDE features for PHP (symbols, diagnostics, folding, ...) as a plain Rust API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+php-syntax.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true

@@ -19,7 +19,7 @@ pub mod ast;
 use std::fmt::Write;
 
 pub use lexer::{tokenize, LexError, Token};
-pub use rowan::{Direction, NodeOrToken, TextRange, TextSize, WalkEvent};
+pub use rowan::{Direction, NodeOrToken, TextRange, TextSize, TokenAtOffset, WalkEvent};
 pub use syntax_kind::SyntaxKind;
 pub use version::PhpVersion;
 
