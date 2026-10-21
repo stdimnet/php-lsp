@@ -11,8 +11,30 @@ use serde_json::Value;
 /// Sections the server reads settings from, in increasing priority.
 pub const SECTIONS: &[&str] = &["intelephense", "php-lsp"];
 
+/// External tool configuration (`php-lsp.tools.*`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ToolsConfig {
+    pub phpstan: php_tools::ToolConfig,
+    pub psalm: php_tools::ToolConfig,
+    pub phpcs: php_tools::ToolConfig,
+    pub phpcbf: php_tools::ToolConfig,
+    pub php_cs_fixer: php_tools::ToolConfig,
+    pub phpunit: php_tools::ToolConfig,
+}
+
+/// Which formatter handles formatting requests (`php-lsp.format.provider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FormatProvider {
+    #[default]
+    Builtin,
+    PhpCsFixer,
+    Phpcbf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
+    pub tools: ToolsConfig,
+    pub format_provider: FormatProvider,
     pub php_version: PhpVersion,
     pub diagnostics_enabled: bool,
     pub diagnostics: php_ide::DiagnosticsConfig,
@@ -37,6 +59,8 @@ impl Default for ServerConfig {
         let scan = php_ide::ScanConfig::default();
         let ide = php_ide::Config::default();
         ServerConfig {
+            tools: ToolsConfig::default(),
+            format_provider: FormatProvider::Builtin,
             php_version: PhpVersion::default(),
             diagnostics_enabled: true,
             diagnostics: php_ide::DiagnosticsConfig::default(),
@@ -138,6 +162,31 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "completion.insertUseDeclaration").and_then(Value::as_bool) {
                 self.insert_use_declaration = v;
+            }
+            for (name, tool) in [
+                ("phpstan", &mut self.tools.phpstan),
+                ("psalm", &mut self.tools.psalm),
+                ("phpcs", &mut self.tools.phpcs),
+                ("phpcbf", &mut self.tools.phpcbf),
+                ("phpCsFixer", &mut self.tools.php_cs_fixer),
+                ("phpunit", &mut self.tools.phpunit),
+            ] {
+                if let Some(v) = get(&root, &format!("tools.{name}.enable")).and_then(Value::as_bool) {
+                    tool.enabled = v;
+                }
+                if let Some(v) = get(&root, &format!("tools.{name}.path")).and_then(Value::as_str) {
+                    tool.path = if v.is_empty() { None } else { Some(v.to_string()) };
+                }
+                if let Some(v) = get(&root, &format!("tools.{name}.args")).and_then(string_list) {
+                    tool.args = v;
+                }
+            }
+            if let Some(v) = get(&root, "format.provider").and_then(Value::as_str) {
+                self.format_provider = match v.to_ascii_lowercase().as_str() {
+                    "php-cs-fixer" | "phpcsfixer" => FormatProvider::PhpCsFixer,
+                    "phpcbf" => FormatProvider::Phpcbf,
+                    _ => FormatProvider::Builtin,
+                };
             }
             if let Some(v) = get(&root, "diagnostics.run").and_then(Value::as_str) {
                 self.diagnostics_on_save = v.eq_ignore_ascii_case("onSave");

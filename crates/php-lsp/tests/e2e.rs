@@ -311,3 +311,46 @@ fn editing_features_over_lsp() {
     assert!(!toks["data"].as_array().unwrap().is_empty());
     c.shutdown();
 }
+
+/// Needs `PHP_LSP_TOOLS_DIR` with phpstan.phar and php-cs-fixer.phar.
+#[test]
+#[ignore]
+fn external_tools() {
+    let tools = std::env::var("PHP_LSP_TOOLS_DIR").expect("PHP_LSP_TOOLS_DIR");
+    let dir = std::env::temp_dir().join(format!("php-lsp-tools-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let file = dir.join("src/a.php");
+    let text = "<?php\nnamespace App;\nclass A {\n  public function f(int $x): string { return $x; }\n}\n";
+    std::fs::write(&file, text).unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {},
+        "initializationOptions": {"php-lsp": {
+            "tools": {
+                "phpstan": {"enable": true, "path": format!("{tools}/phpstan.phar"), "args": ["--level=5"]},
+                "phpCsFixer": {"path": format!("{tools}/php-cs-fixer.phar")}
+            },
+            "format": {"provider": "php-cs-fixer"}
+        }},
+    }));
+    let uri = format!("{root_uri}/src/a.php");
+    c.open(&uri, text);
+    let d = loop {
+        let d = c.wait_notification("textDocument/publishDiagnostics");
+        if d["diagnostics"].as_array().unwrap().iter().any(|x| x["source"] == "phpstan") {
+            break d;
+        }
+    };
+    let stan =
+        d["diagnostics"].as_array().unwrap().iter().find(|x| x["source"] == "phpstan").unwrap().clone();
+    assert!(stan["message"].as_str().unwrap().contains("should return string"), "{stan}");
+    assert_eq!(stan["range"]["start"]["line"], 3);
+    let edits = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(edits[0]["newText"].as_str().unwrap().contains("class A\n{"), "{edits}");
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -14,6 +14,10 @@ use crate::config::{ServerConfig, SECTIONS};
 use crate::{convert, uri};
 
 pub const SERVER_NAME: &str = "php-lsp";
+/// `workspace/executeCommand`: run PHPUnit (`[uri, filter]`).
+pub const CMD_RUN_TEST: &str = "php-lsp.runTest";
+/// `workspace/executeCommand`: re-index the workspace.
+pub const CMD_INDEX: &str = "php-lsp.indexWorkspace";
 const PROGRESS_TOKEN: &str = "php-lsp/indexing";
 
 /// Result type of the server functions.
@@ -21,8 +25,22 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 /// Messages from background threads to the main loop.
 pub(crate) enum Task {
-    Indexed { generation: u32, files: Vec<IndexedFile>, stubs: bool },
-    IndexingDone { generation: u32, count: usize, millis: u128 },
+    Indexed {
+        generation: u32,
+        files: Vec<IndexedFile>,
+        stubs: bool,
+    },
+    IndexingDone {
+        generation: u32,
+        count: usize,
+        millis: u128,
+    },
+    ToolDiagnostics {
+        file: FileId,
+        tool: php_tools::Tool,
+        run: u32,
+        result: std::result::Result<Vec<php_tools::ToolDiagnostic>, String>,
+    },
 }
 
 /// What the client supports.
@@ -58,6 +76,9 @@ pub struct Server {
     indexing: bool,
     cancel_indexing: Arc<std::sync::atomic::AtomicBool>,
     loaded_stubs: Vec<String>,
+    tool_runs: HashMap<(FileId, php_tools::Tool), u32>,
+    tool_diags: HashMap<FileId, HashMap<php_tools::Tool, Vec<php_tools::ToolDiagnostic>>>,
+    reported_tool_errors: std::collections::HashSet<php_tools::Tool>,
 }
 
 impl Server {
@@ -112,6 +133,9 @@ impl Server {
             indexing: false,
             cancel_indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             loaded_stubs: Vec::new(),
+            tool_runs: HashMap::new(),
+            tool_diags: HashMap::new(),
+            reported_tool_errors: std::collections::HashSet::new(),
         })
     }
 
@@ -205,6 +229,123 @@ impl Server {
         });
     }
 
+    /// The project root of a file: the workspace folder containing it, else
+    /// the nearest directory with a composer.json.
+    pub(crate) fn root_for(&self, path: &std::path::Path) -> PathBuf {
+        if let Some(r) = self.roots.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len())
+        {
+            return r.clone();
+        }
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d.join("composer.json").exists() {
+                return d.to_path_buf();
+            }
+            dir = d.parent();
+        }
+        path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    }
+
+    /// Runs the enabled external analysers for a file in the background.
+    fn run_tools(&mut self, id: FileId) {
+        let Some(uri) = self.client_uris.get(&id) else { return };
+        let Some(path) = uri::path_from_uri(uri.as_str()) else { return };
+        let Some(file) = self.workspace.file(id) else { return };
+        let text = file.text.to_string();
+        let root = self.root_for(&path);
+        for (tool, cfg) in [
+            (php_tools::Tool::PhpStan, &self.config.tools.phpstan),
+            (php_tools::Tool::Psalm, &self.config.tools.psalm),
+            (php_tools::Tool::Phpcs, &self.config.tools.phpcs),
+        ] {
+            if !cfg.enabled {
+                continue;
+            }
+            let run = self.tool_runs.entry((id, tool)).or_insert(0);
+            *run += 1;
+            let run = *run;
+            let (cfg, root, path, text, tx) =
+                (cfg.clone(), root.clone(), path.clone(), text.clone(), self.task_tx.clone());
+            std::thread::spawn(move || {
+                let result = php_tools::diagnostics(tool, &root, &path, &text, &cfg);
+                let _ = tx.send(Task::ToolDiagnostics { file: id, tool, run, result });
+            });
+        }
+    }
+
+    /// Formats with php-cs-fixer / phpcbf on a background thread and
+    /// answers the request when done.
+    pub(crate) fn external_format(&mut self, request: RequestId, uri: lsp::Uri) {
+        let (Some(id), Some(path)) = (self.file_for(&uri), uri::path_from_uri(uri.as_str())) else {
+            self.respond(request, Value::Null);
+            return;
+        };
+        let Some(file) = self.workspace.file(id) else { return };
+        let text = file.text.to_string();
+        let index = file.line_index.clone();
+        let root = self.root_for(&path);
+        let (formatter, cfg) = match self.config.format_provider {
+            crate::config::FormatProvider::Phpcbf => {
+                (php_tools::Formatter::Phpcbf, self.config.tools.phpcbf.clone())
+            }
+            _ => (php_tools::Formatter::PhpCsFixer, self.config.tools.php_cs_fixer.clone()),
+        };
+        let encoding = self.encoding;
+        let sender = self.connection.sender.clone();
+        std::thread::spawn(move || {
+            let response = match php_tools::format(formatter, &root, &path, &text, &cfg) {
+                Ok(new_text) if new_text != text => {
+                    let end = convert::position(&index, encoding, php_ide::TextSize::from(text.len() as u32));
+                    let edit =
+                        lsp::TextEdit { range: lsp::Range::new(lsp::Position::new(0, 0), end), new_text };
+                    Response {
+                        id: request,
+                        response_result: Ok(serde_json::to_value(vec![edit]).unwrap_or(Value::Null)),
+                    }
+                }
+                Ok(_) => Response { id: request, response_result: Ok(Value::Array(Vec::new())) },
+                Err(e) => Response::new_err(request, ErrorCode::RequestFailed as i32, e),
+            };
+            let _ = sender.send(Message::Response(response));
+        });
+    }
+
+    pub(crate) fn execute_command(&mut self, p: lsp::ExecuteCommandParams) {
+        match p.command.as_str() {
+            CMD_RUN_TEST => {
+                let uri = p.arguments.first().and_then(Value::as_str).map(str::to_string);
+                let filter =
+                    p.arguments.get(1).and_then(Value::as_str).filter(|f| !f.is_empty()).map(str::to_string);
+                let Some(path) = uri.as_deref().and_then(uri::path_from_uri) else { return };
+                let root = self.root_for(&path);
+                let cfg = self.config.tools.phpunit.clone();
+                let sender = self.connection.sender.clone();
+                self.show_message(&format!("Running {}…", filter.as_deref().unwrap_or("tests")));
+                std::thread::spawn(move || {
+                    let (typ, message, log) =
+                        match php_tools::run_phpunit(&root, &path, filter.as_deref(), &cfg) {
+                            Ok(run) => (
+                                if run.success { lsp::MessageType::INFO } else { lsp::MessageType::ERROR },
+                                format!("PHPUnit: {}", run.summary),
+                                run.output,
+                            ),
+                            Err(e) => (lsp::MessageType::ERROR, format!("PHPUnit: {e}"), String::new()),
+                        };
+                    let send = |method: &str, params: Value| {
+                        let _ = sender
+                            .send(Message::Notification(Notification { method: method.into(), params }));
+                    };
+                    if !log.is_empty() {
+                        send("window/logMessage", serde_json::json!({"type": 4, "message": log}));
+                    }
+                    send("window/showMessage", serde_json::json!({"type": typ, "message": message}));
+                });
+            }
+            CMD_INDEX => self.start_indexing(),
+            _ => self.log(&format!("unknown command {}", p.command)),
+        }
+    }
+
     /// `cancelIndexing` (Intelephense): stops the running indexing job.
     pub(crate) fn cancel_indexing(&mut self) {
         self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -238,10 +379,11 @@ impl Server {
                 DidCloseTextDocument::METHOD => self.did_close(serde_json::from_value(not.params)?),
                 DidSaveTextDocument::METHOD => {
                     let p: lsp::DidSaveTextDocumentParams = serde_json::from_value(not.params)?;
-                    if self.config.diagnostics_on_save {
-                        if let Some(id) = self.file_for(&p.text_document.uri) {
+                    if let Some(id) = self.file_for(&p.text_document.uri) {
+                        if self.config.diagnostics_on_save {
                             self.publish_now(id);
                         }
+                        self.run_tools(id);
                     }
                 }
                 DidChangeWatchedFiles::METHOD => {
@@ -450,6 +592,23 @@ impl Server {
 
     fn on_task(&mut self, task: Task) {
         match task {
+            Task::ToolDiagnostics { file, tool, run, result } => {
+                if self.tool_runs.get(&(file, tool)) != Some(&run) {
+                    return;
+                }
+                match result {
+                    Ok(diags) => {
+                        self.tool_diags.entry(file).or_default().insert(tool, diags);
+                        self.publish_now(file);
+                    }
+                    Err(e) => {
+                        self.log(&format!("{}: {e}", tool.name()));
+                        if self.reported_tool_errors.insert(tool) {
+                            self.show_message(&format!("{} could not be run: {e}", tool.name()));
+                        }
+                    }
+                }
+            }
             Task::Indexed { generation, files, stubs } => {
                 if generation != self.generation {
                     return;
@@ -521,6 +680,7 @@ impl Server {
         self.client_uris.insert(id, p.text_document.uri);
         self.versions.insert(id, p.text_document.version);
         self.publish_diagnostics(id);
+        self.run_tools(id);
     }
 
     fn did_change(&mut self, p: lsp::DidChangeTextDocumentParams) {
@@ -551,6 +711,7 @@ impl Server {
         let Some(id) = self.workspace.file_id(&key) else { return };
         self.client_uris.remove(&id);
         self.versions.remove(&id);
+        self.tool_diags.remove(&id);
         // keep files that exist on disk indexed; forget untitled buffers
         let on_disk = uri::path_from_uri(p.text_document.uri.as_str()).is_some_and(|p| p.exists());
         if on_disk {
@@ -603,6 +764,13 @@ impl Server {
                 })
                 .collect()
         };
+        let mut diagnostics = diagnostics;
+        if let Some(tools) = self.tool_diags.get(&id) {
+            let text = &file.text;
+            for d in tools.values().flatten() {
+                diagnostics.push(tool_diagnostic(&index, text, self.encoding, d));
+            }
+        }
         let version = self.versions.get(&id).copied();
         self.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
             uri,
@@ -643,6 +811,47 @@ impl Server {
     pub(crate) fn location(&self, id: FileId, range: php_ide::TextRange) -> Option<lsp::Location> {
         let index = self.workspace.line_index(id)?;
         Some(lsp::Location { uri: self.uri_for(id)?, range: convert::range(&index, self.encoding, range) })
+    }
+}
+
+fn tool_diagnostic(
+    index: &php_ide::LineIndex,
+    text: &str,
+    enc: PositionEncoding,
+    d: &php_tools::ToolDiagnostic,
+) -> lsp::Diagnostic {
+    // tools report lines (and sometimes columns); without columns the whole
+    // line (without indentation) is marked
+    let line_start = index.offset(php_ide::LineCol { line: d.line, col: 0 });
+    let line_end = index.offset(php_ide::LineCol { line: d.line + 1, col: 0 });
+    let line_text = &text[usize::from(line_start)..usize::from(line_end).min(text.len())];
+    let indent = (line_text.len() - line_text.trim_start().len()) as u32;
+    let content_end = line_text.trim_end().len() as u32;
+    let start = match d.column {
+        Some(c) => convert::position(index, enc, line_start + php_ide::TextSize::from(c.min(content_end))),
+        None => convert::position(index, enc, line_start + php_ide::TextSize::from(indent.min(content_end))),
+    };
+    let end = match (d.end_line, d.end_column) {
+        (Some(l), Some(c)) => {
+            let o = index.offset(php_ide::LineCol { line: l, col: c });
+            convert::position(index, enc, o)
+        }
+        _ => convert::position(index, enc, line_start + php_ide::TextSize::from(content_end)),
+    };
+    lsp::Diagnostic {
+        range: lsp::Range::new(start, end),
+        severity: Some(match d.severity {
+            php_tools::ToolSeverity::Error => lsp::DiagnosticSeverity::ERROR,
+            php_tools::ToolSeverity::Warning => lsp::DiagnosticSeverity::WARNING,
+            php_tools::ToolSeverity::Information => lsp::DiagnosticSeverity::INFORMATION,
+        }),
+        code: d.code.clone().map(lsp::NumberOrString::String),
+        code_description: None,
+        source: Some(d.source.to_string()),
+        message: d.message.clone(),
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
@@ -750,6 +959,10 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
         })),
         call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
+        execute_command_provider: Some(lsp::ExecuteCommandOptions {
+            commands: vec![CMD_RUN_TEST.into(), CMD_INDEX.into()],
+            work_done_progress_options: Default::default(),
+        }),
         document_range_formatting_provider: Some(lsp::OneOf::Left(true)),
         code_lens_provider: Some(lsp::CodeLensOptions { resolve_provider: Some(true) }),
         semantic_tokens_provider: Some(lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(

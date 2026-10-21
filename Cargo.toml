@@ -16,6 +16,7 @@ php-hir = { path = "crates/php-hir" }
 php-index = { path = "crates/php-index" }
 php-stubs = { path = "crates/php-stubs" }
 php-fmt = { path = "crates/php-fmt" }
+php-tools = { path = "crates/php-tools" }
 rayon = "1"
 walkdir = "2"
 globset = "0.4"

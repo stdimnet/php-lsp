@@ -189,12 +189,41 @@ pub enum CodeLensKind {
     Implementations,
     /// The method overrides / implements a parent method.
     Parent,
+    /// Run a PHPUnit test class or method; see [`CodeLens::test_filter`].
+    RunTest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeLens {
     pub range: TextRange,
     pub kind: CodeLensKind,
+    /// For [`CodeLensKind::RunTest`]: the PHPUnit `--filter` value
+    /// (`Class` or `Class::method`).
+    pub test_filter: Option<String>,
+}
+
+/// Whether the class is a PHPUnit test case.
+fn is_test_class(sema: &Sema, node: &SyntaxNode) -> Option<php_hir::Fqn> {
+    let fqn = sema.class_fqn(node)?;
+    let index = sema.index();
+    let (_, def) = index.class(&fqn)?;
+    if def.is_abstract || def.kind != ClassLikeKind::Class {
+        return None;
+    }
+    let extends_test_case = index.ancestors(&fqn).iter().any(|(_, a)| a.fqn.short() == "TestCase")
+        || def.parent.as_ref().is_some_and(|p| p.short().ends_with("TestCase"));
+    extends_test_case.then_some(fqn)
+}
+
+fn is_test_method(sema: &Sema, class: &php_hir::Fqn, name: &str) -> bool {
+    let Some(m) = sema.index().find_method(class, name) else { return false };
+    if m.def.visibility != php_hir::Visibility::Public || m.def.is_static {
+        return false;
+    }
+    name.starts_with("test")
+        || m.def.doc.as_ref().is_some_and(|d| d.has_tag("test"))
+        || sema.text[m.def.range].contains("#[Test]")
+        || sema.text[m.def.range].contains("PHPUnit\\Framework\\Attributes\\Test]")
 }
 
 /// The resolved title and targets of a lens.
@@ -214,17 +243,39 @@ pub(crate) fn code_lenses(sema: &Sema) -> Vec<CodeLens> {
         }
         let Some(name) = node.children().find(|c| matches!(c.kind(), NAME | MEMBER_NAME)) else { continue };
         let range = name.text_range();
-        out.push(CodeLens { range, kind: CodeLensKind::References });
+        if kind == CLASS_DECL {
+            if let Some(fqn) = is_test_class(sema, &node) {
+                out.push(CodeLens {
+                    range,
+                    kind: CodeLensKind::RunTest,
+                    test_filter: Some(fqn.short().to_string()),
+                });
+            }
+        }
+        if kind == METHOD_DECL {
+            let class = node.ancestors().find(|a| a.kind() == CLASS_DECL);
+            if let Some(fqn) = class.as_ref().and_then(|c| is_test_class(sema, c)) {
+                let mname = php_syntax::ast::text_without_trivia(&name);
+                if is_test_method(sema, &fqn, &mname) {
+                    out.push(CodeLens {
+                        range,
+                        kind: CodeLensKind::RunTest,
+                        test_filter: Some(format!("{}::{}", fqn.short(), mname)),
+                    });
+                }
+            }
+        }
+        out.push(CodeLens { range, kind: CodeLensKind::References, test_filter: None });
         if matches!(kind, INTERFACE_DECL)
             || kind == CLASS_DECL
                 && node.children().any(|c| {
                     c.kind() == MODIFIER_LIST && c.children_with_tokens().any(|t| t.kind() == ABSTRACT_KW)
                 })
         {
-            out.push(CodeLens { range, kind: CodeLensKind::Implementations });
+            out.push(CodeLens { range, kind: CodeLensKind::Implementations, test_filter: None });
         }
         if kind == METHOD_DECL {
-            out.push(CodeLens { range, kind: CodeLensKind::Parent });
+            out.push(CodeLens { range, kind: CodeLensKind::Parent, test_filter: None });
         }
     }
     out
@@ -233,6 +284,14 @@ pub(crate) fn code_lenses(sema: &Sema) -> Vec<CodeLens> {
 pub(crate) fn resolve_code_lens(sema: &Sema, lens: &CodeLens) -> Option<ResolvedCodeLens> {
     let offset = lens.range.start();
     match lens.kind {
+        CodeLensKind::RunTest => Some(ResolvedCodeLens {
+            title: if lens.test_filter.as_deref().is_some_and(|f| f.contains("::")) {
+                "▶ Run test".into()
+            } else {
+                "▶ Run tests".into()
+            },
+            targets: Vec::new(),
+        }),
         CodeLensKind::References => {
             let refs = references(sema, offset, false);
             let n = refs.len();

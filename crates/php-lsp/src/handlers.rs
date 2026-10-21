@@ -36,7 +36,23 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         TypeHierarchySubtypes::METHOD => handle(s, req, subtypes),
         CodeLensRequest::METHOD => handle(s, req, code_lens),
         CodeLensResolve::METHOD => handle(s, req, code_lens_resolve),
+        Formatting::METHOD if s.config.format_provider != crate::config::FormatProvider::Builtin => {
+            let p: lsp::DocumentFormattingParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e.into())),
+            };
+            s.external_format(req.id, p.text_document.uri);
+            return None;
+        }
         Formatting::METHOD => handle(s, req, formatting),
+        ExecuteCommand::METHOD => {
+            let p: lsp::ExecuteCommandParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e.into())),
+            };
+            s.execute_command(p);
+            Ok(Value::Null)
+        }
         RangeFormatting::METHOD => handle(s, req, range_formatting),
         SemanticTokensFullRequest::METHOD => handle(s, req, semantic_tokens_full),
         SemanticTokensRangeRequest::METHOD => handle(s, req, semantic_tokens_range),
@@ -698,19 +714,38 @@ fn code_lens(s: &mut Server, p: lsp::CodeLensParams) -> Option<Vec<lsp::CodeLens
         s.workspace
             .code_lenses(id)
             .into_iter()
-            .map(|l| lsp::CodeLens {
-                range: convert::range(&index, s.encoding, l.range),
-                command: None,
-                data: Some(serde_json::json!({
-                    "uri": p.text_document.uri.as_str(),
-                    "start": u32::from(l.range.start()),
-                    "end": u32::from(l.range.end()),
-                    "kind": match l.kind {
-                        php_ide::CodeLensKind::References => "references",
-                        php_ide::CodeLensKind::Implementations => "implementations",
-                        php_ide::CodeLensKind::Parent => "parent",
-                    },
-                })),
+            .map(|l| {
+                let range = convert::range(&index, s.encoding, l.range);
+                if l.kind == php_ide::CodeLensKind::RunTest {
+                    let filter = l.test_filter.clone().unwrap_or_default();
+                    let title = if filter.contains("::") { "▶ Run test" } else { "▶ Run tests" };
+                    return lsp::CodeLens {
+                        range,
+                        command: Some(lsp::Command {
+                            title: title.into(),
+                            command: crate::server::CMD_RUN_TEST.into(),
+                            arguments: Some(vec![
+                                serde_json::json!(p.text_document.uri.as_str()),
+                                serde_json::json!(filter),
+                            ]),
+                        }),
+                        data: None,
+                    };
+                }
+                lsp::CodeLens {
+                    range,
+                    command: None,
+                    data: Some(serde_json::json!({
+                        "uri": p.text_document.uri.as_str(),
+                        "start": u32::from(l.range.start()),
+                        "end": u32::from(l.range.end()),
+                        "kind": match l.kind {
+                            php_ide::CodeLensKind::References => "references",
+                            php_ide::CodeLensKind::Implementations => "implementations",
+                            _ => "parent",
+                        },
+                    })),
+                }
             })
             .collect(),
     )
@@ -728,9 +763,10 @@ fn code_lens_resolve(s: &mut Server, mut lens: lsp::CodeLens) -> lsp::CodeLens {
             "implementations" => php_ide::CodeLensKind::Implementations,
             _ => php_ide::CodeLensKind::Parent,
         };
-        let r = s
-            .workspace
-            .resolve_code_lens(id, &php_ide::CodeLens { range: php_ide::TextRange::new(start, end), kind })?;
+        let r = s.workspace.resolve_code_lens(
+            id,
+            &php_ide::CodeLens { range: php_ide::TextRange::new(start, end), kind, test_filter: None },
+        )?;
         let locations: Vec<lsp::Location> =
             r.targets.iter().filter_map(|t| s.location(t.file, t.focus)).collect();
         let command = if s.caps.vscode {

@@ -560,3 +560,21 @@ fn refactorings() {
         "<?php\nfunction g(): array { return [1, 2]; }\n"
     );
 }
+
+#[test]
+fn phpunit_lenses() {
+    let text = "<?php\nnamespace Tests;\nuse PHPUnit\\Framework\\TestCase;\nclass UserTest extends TestCase\n{\n    public function testName(): void {}\n    /** @test */\n    public function itWorks(): void {}\n    private function helper() {}\n}\n";
+    let mut ws = Workspace::new(Config::default());
+    ws.set_file(
+        "file:///stub.php",
+        "<?php\nnamespace PHPUnit\\Framework;\nabstract class TestCase {}\n".into(),
+    );
+    let id = ws.set_file("file:///UserTest.php", text.to_string());
+    let filters: Vec<String> = ws
+        .code_lenses(id)
+        .into_iter()
+        .filter(|l| l.kind == php_ide::CodeLensKind::RunTest)
+        .filter_map(|l| l.test_filter)
+        .collect();
+    assert_eq!(filters, vec!["UserTest", "UserTest::testName", "UserTest::itWorks"]);
+}

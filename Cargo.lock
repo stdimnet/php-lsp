@@ -243,6 +243,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "php-ide",
+ "php-tools",
  "serde",
  "serde_json",
 ]
@@ -260,6 +261,13 @@ version = "0.1.0"
 dependencies = [
  "expect-test",
  "rowan",
+]
+
+[[package]]
+name = "php-tools"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

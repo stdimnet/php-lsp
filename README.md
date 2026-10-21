@@ -20,6 +20,7 @@ It can be used in three ways:
 | `php-index`  | Global symbol index with inheritance aware member lookup (traits, parents, interfaces, mixins) |
 | `php-stubs`  | JetBrains phpstorm-stubs (Apache-2.0) embedded in compressed form |
 | `php-fmt`    | Whitespace-only formatter (PSR-12 / PER), never changes tokens, idempotent |
+| `php-tools`  | External tools: PHPStan, Psalm, PHP_CodeSniffer, php-cs-fixer, phpcbf, PHPUnit |
 | `php-ide`    | IDE features as a Rust API (`Workspace`): completion, hover, navigation, references, symbols, ... |
 | `php-lsp`    | LSP server and `php-lsp` binary |
 
@@ -77,6 +78,19 @@ when both set the same key, `php-lsp` wins.
 | `diagnostics.run`         | `onType` (`onSave`) |
 | `environment.includePaths`| `[]` (extra directories indexed like `vendor/`) |
 
+php-lsp specific settings (`php-lsp` section only):
+
+| Setting                                   | Default |
+|-------------------------------------------|---------|
+| `tools.phpstan.enable` / `.path` / `.args`| `false` / `vendor/bin/phpstan` or `$PATH` / `[]` |
+| `tools.psalm.*`, `tools.phpcs.*`          | same as above |
+| `tools.phpCsFixer.*`, `tools.phpcbf.*`, `tools.phpunit.*` | path / args |
+| `format.provider`                         | `builtin` (`php-cs-fixer`, `phpcbf`) |
+
+PHPStan / Psalm / PHPCS run in the background when a file is opened or saved and their
+results are merged with php-lsp's own diagnostics. Test classes get "▶ Run test" code lenses
+(command `php-lsp.runTest`).
+
 Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `clearCache`,
 `licenceKey`, `isVscode`) are accepted; a licence key is not needed for any feature. The
 `cancelIndexing` request is supported.
@@ -98,8 +112,10 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   hierarchy, code lens, PHPDoc completion
 - [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
   `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher
-- [ ] **Phase 6, extras:** refactorings, dead code / unused detection, PHPStan / Psalm /
-  PHPCS / php-cs-fixer / PHPUnit integration
+- [x] **Phase 6, extras:** extract variable / method / constant, inline variable,
+  constructor promotion, generate constructor, add return type, PSR-4 namespace fix,
+  unused detection, PHPStan / Psalm / PHPCS diagnostics, php-cs-fixer / phpcbf formatting,
+  PHPUnit code lenses
 - [ ] **Phase 7, frameworks:** plugin API, Laravel, Symfony, WordPress
 
 ## Development
