@@ -71,7 +71,7 @@ when both set the same key, `php-lsp` wins.
 | `stubs`                   | Intelephense default stub list |
 | `completion.insertUseDeclaration` | `true` |
 | `completion.maxItems`     | `100` |
-| `diagnostics.*`           | `undefinedTypes`, `undefinedFunctions`, `undefinedConstants`, `undefinedClassConstants`, `undefinedMethods`, `undefinedProperties`, `undefinedVariables`, `unusedSymbols`, `deprecated`, `argumentCount`, `implementationErrors` (all `true`) |
+| `diagnostics.*`           | `undefinedTypes`, `undefinedFunctions`, `undefinedConstants`, `undefinedClassConstants`, `undefinedMethods`, `undefinedProperties`, `undefinedVariables`, `unusedSymbols`, `deprecated`, `argumentCount`, `implementationErrors`, `typeErrors`, `unreachableCode`, `languageConstraints`, `memberAccess`, `suspectCode`, `duplicateSymbols` (all `true`; `"on"` / `"off"` also accepted) |
 | `inlayHint.*`             | `parameterNames`, `returnTypes`, `parameterTypes` (all `true`) |
 | `format.enable`           | `true` |
 | `format.braces`           | `psr12` (`allman`, `k&r`) |
@@ -106,8 +106,12 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   signature help, file watching, Composer/PSR-4 (12.5k files index in ~1.3 s, so there is
   no on-disk cache)
 - [x] **Phase 3, types & diagnostics:** type inference (generics via `@template`, array
-  shapes, narrowing), undefined symbol / argument count / implementation / deprecation /
-  unused diagnostics, inlay hints, semantic tokens, highlights
+  shapes, narrowing), inlay hints, semantic tokens, highlights. Diagnostics use
+  Intelephense's codes, messages and severities: undefined symbols, argument count and
+  types (P1006), implementations, deprecations, unused symbols and parameters, missing
+  returns, possibly undefined variables, unreachable code, member visibility, modifier /
+  method body / readonly / named argument rules, duplicate keys and declarations and more
+  (compared with the real Intelephense with `editors/compare`)
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
   hierarchy, code lens, PHPDoc completion, document links (`include`/`require`, URLs),

@@ -1032,6 +1032,35 @@ nums([], new Other());
     );
 }
 
+/// False positives found in the third comparison run.
+#[test]
+fn comparison_regressions() {
+    let src = r#"<?php
+declare(strict_types=1);
+class Node {}
+class Expression {}
+/** @template TMin */
+function f1(array $conds, ?array $data, $v): string {
+    for ($i = 0; $i + 1 < count($conds); $i++) {}
+    echo $conds[$i];
+    if (!(is_array($data) && is_string($id = $data['id'] ?? null))) { return ''; }
+    echo $id;
+    $m = array_map(floatval(...), [1]);
+    $t = $data + [1];
+    if (is_array($v)) { $q = http_build_query($v); }
+    if ($v instanceof Expression) { $v = 'x'; echo strlen($v); }
+    echo str_repeat(Node::class, 1);
+    set_error_handler(function ($errno, $errstr) { return $errstr !== ''; });
+    foreach ($conds as $k => $unusedValue) { echo $k; }
+    return implode(',', [$m, $t, $q ?? '']);
+}
+function f2(int $a, string $optional = ''): int { return $a; }
+function f3(): int { while (true) { switch (rand()) { case 1: break; default: return 1; } } }
+"#;
+    let d = diags(src);
+    assert_eq!(d, vec!["P1132 Parameter $v has no type information available."]);
+}
+
 /// Differences found by comparing with Intelephense (editors/compare).
 #[test]
 fn intelephense_parity() {

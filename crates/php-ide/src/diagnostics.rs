@@ -340,17 +340,18 @@ fn def_reaches(sema: &Sema, scope: &SyntaxNode, def: TextSize, read: TextSize, d
             // decided at the `if` (with the else clause as branch)
             ELSE_CLAUSE => false,
             CASE_CLAUSE | DEFAULT_CLAUSE | CATCH_CLAUSE | MATCH_ARM => true,
-            WHILE_STMT | FOR_STMT | FOREACH_STMT => {
+            // the body only (`for` initializers and the first condition always run)
+            WHILE_STMT | FOREACH_STMT => {
                 !cond_child() && child.kind() != FOREACH_VALUE && child.kind() != FOREACH_KEY
             }
+            FOR_STMT => is_statement(child.kind()) || child.kind() == STMT_LIST,
             BIN_EXPR => {
                 let short_circuit = anc
                     .children_with_tokens()
                     .any(|e| matches!(e.kind(), AMP2 | PIPE2 | QUESTION2 | AND_KW | OR_KW));
                 short_circuit
                     && anc.first_child().as_ref() != Some(&child)
-                    && !and_condition_guards(&anc, read)
-                    && !or_condition_exits(sema, &anc, read)
+                    && !short_circuit_reaches(sema, &anc, read)
             }
             TERNARY_EXPR => anc.first_child().as_ref() != Some(&child),
             _ => false,
@@ -392,62 +393,73 @@ fn isset_guarded(scope: &SyntaxNode, read: TextRange, name: &str) -> bool {
 }
 
 /// `if (a && $x = f()) { ...$x... }`: in the "then" branch every operand
-/// of the `&&` chain in the condition was evaluated.
-fn and_condition_guards(bin: &SyntaxNode, read: TextSize) -> bool {
-    let mut cur = bin.clone();
-    loop {
-        let is_and = cur.kind() == PAREN_EXPR
-            || cur.kind() == BIN_EXPR
-                && cur.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW));
-        if !is_and {
-            return false;
-        }
-        let Some(parent) = cur.parent() else { return false };
-        // `a && ($x = f()) && g($x)`: later operands of the chain
-        if parent.kind() == BIN_EXPR
-            && parent.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW))
-            && parent.first_child().as_ref() == Some(&cur)
-            && parent.text_range().contains(read)
-            && !cur.text_range().contains(read)
-        {
-            return true;
-        }
-        if matches!(parent.kind(), IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT) {
-            let cond = parent.children().find(|c| crate::infer::is_expr(c.kind()));
-            if cond.as_ref() != Some(&cur) {
-                return false;
-            }
-            // the body right after the condition (not elseif / else)
-            let body =
-                parent.children().find(|c| c != &cur && (is_statement(c.kind()) || c.kind() == STMT_LIST));
-            return body.is_some_and(|b| b.text_range().contains(read));
-        }
-        cur = parent;
-    }
+fn is_and_op(n: &SyntaxNode) -> bool {
+    n.kind() == BIN_EXPR && n.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW))
 }
 
-/// `if (a || is_null($x = f())) { return; } ...$x...`: after an `if` whose
-/// body always exits, every operand of its `||` condition was evaluated.
-fn or_condition_exits(sema: &Sema, bin: &SyntaxNode, read: TextSize) -> bool {
+fn is_or_op(n: &SyntaxNode) -> bool {
+    n.kind() == BIN_EXPR && n.children_with_tokens().any(|e| matches!(e.kind(), PIPE2 | OR_KW))
+}
+
+/// The right operand of `bin` (`&&` / `||`, containing a definition) is
+/// evaluated whenever `read` executes. The value `bin` must have for that
+/// (true for `&&`, false for `||`) is followed through `!`, parentheses and
+/// enclosing `&&` / `||` up to an `if` / `while` / `?:` condition:
+/// `if (a && $x = f()) { $x }`, `if (!(a && is_string($x = f()))) { return; } $x`,
+/// `a && ($x = f()) && g($x)`.
+fn short_circuit_reaches(sema: &Sema, bin: &SyntaxNode, read: TextSize) -> bool {
+    let mut need = is_and_op(bin);
     let mut cur = bin.clone();
     loop {
-        let is_or = cur.kind() == PAREN_EXPR
-            || cur.kind() == BIN_EXPR
-                && cur.children_with_tokens().any(|e| matches!(e.kind(), PIPE2 | OR_KW));
-        if !is_or {
-            return false;
-        }
         let Some(parent) = cur.parent() else { return false };
-        if parent.kind() == IF_STMT {
-            let cond = parent.children().find(|c| crate::infer::is_expr(c.kind()));
-            if cond.as_ref() != Some(&cur)
-                || parent.children().any(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE))
-            {
-                return false;
+        let later_operand = parent.first_child().as_ref() == Some(&cur)
+            && parent.text_range().contains(read)
+            && !cur.text_range().contains(read);
+        match parent.kind() {
+            PAREN_EXPR => {}
+            PREFIX_EXPR if parent.children_with_tokens().any(|e| e.kind() == BANG) => need = !need,
+            BIN_EXPR if is_and_op(&parent) => {
+                if later_operand && need {
+                    return true;
+                }
+                if !need {
+                    return false;
+                }
             }
-            let body =
-                parent.children().find(|c| c != &cur && (is_statement(c.kind()) || c.kind() == STMT_LIST));
-            return read >= parent.text_range().end() && body.is_some_and(|b| always_exits(sema, &b));
+            BIN_EXPR if is_or_op(&parent) => {
+                if later_operand && !need {
+                    return true;
+                }
+                if need {
+                    return false;
+                }
+            }
+            IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT => {
+                let cond = parent.children().find(|c| crate::infer::is_expr(c.kind()));
+                if cond.as_ref() != Some(&cur) {
+                    return false;
+                }
+                let body = parent
+                    .children()
+                    .find(|c| c != &cur && (is_statement(c.kind()) || c.kind() == STMT_LIST));
+                if need {
+                    return body.is_some_and(|b| b.text_range().contains(read));
+                }
+                // condition false: after an `if` whose body never completes
+                return parent.kind() == IF_STMT
+                    && !parent.children().any(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE))
+                    && read >= parent.text_range().end()
+                    && body.is_some_and(|b| always_exits(sema, &b));
+            }
+            TERNARY_EXPR => {
+                let parts: Vec<SyntaxNode> =
+                    parent.children().filter(|c| crate::infer::is_expr(c.kind())).collect();
+                if parts.len() != 3 || parts[0] != cur {
+                    return false;
+                }
+                return parts[if need { 1 } else { 2 }].text_range().contains(read);
+            }
+            _ => return false,
         }
         cur = parent;
     }
@@ -600,7 +612,21 @@ fn always_exits(sema: &Sema, stmt: &SyntaxNode) -> bool {
                     })
                 }
             };
-            infinite && !stmt.descendants().any(|n| n.kind() == BREAK_STMT)
+            // a `break` of this loop (not of a nested loop / switch)
+            infinite
+                && !stmt.descendants().filter(|n| n.kind() == BREAK_STMT).any(|b| {
+                    b.children().any(|c| crate::infer::is_expr(c.kind()))
+                        || b.ancestors()
+                            .skip(1)
+                            .find(|a| {
+                                matches!(
+                                    a.kind(),
+                                    WHILE_STMT | DO_WHILE_STMT | FOR_STMT | FOREACH_STMT | SWITCH_STMT
+                                )
+                            })
+                            .as_ref()
+                            == Some(stmt)
+                })
         }
         _ => false,
     }
@@ -1638,7 +1664,14 @@ impl Checker<'_, '_> {
             match self.occurrence(&tok, &parent, scope) {
                 Occ::Def => {
                     v.defs.push(tok.text_range().start());
-                    v.def_ranges.push(tok.text_range());
+                    // `foreach ($a as $k => $v)` with only `$k` used: `$v` cannot be left out
+                    let value_with_key =
+                        parent.ancestors().find(|a| a.kind() == FOREACH_VALUE).is_some_and(|fv| {
+                            fv.parent().is_some_and(|f| f.children().any(|c| c.kind() == FOREACH_KEY))
+                        });
+                    if !value_with_key {
+                        v.def_ranges.push(tok.text_range());
+                    }
                 }
                 Occ::Param => {
                     v.defs.push(scope.text_range().start());
@@ -1648,10 +1681,15 @@ impl Checker<'_, '_> {
                         .ancestors()
                         .find(|a| a.kind() == PARAM)
                         .is_some_and(|p| p.children_with_tokens().any(|e| e.kind() == AMP));
+                    // optional parameters are kept for compatibility
+                    let optional = parent
+                        .ancestors()
+                        .find(|a| a.kind() == PARAM)
+                        .is_some_and(|p| p.children_with_tokens().any(|e| e.kind() == EQ));
                     if by_ref {
                         // written for the caller
                         v.reads.push((tok.text_range(), true));
-                    } else {
+                    } else if !optional {
                         v.def_ranges.push(tok.text_range());
                     }
                 }
@@ -1707,7 +1745,9 @@ impl Checker<'_, '_> {
             // template variables are often only used by included views
             let template = self.blade.is_some() && scope.kind() == SOURCE_FILE;
             // unused parameters, except where a signature is given by an ancestor
-            let reportable = !v.param || !self.signature_fixed(scope);
+            let reportable = (!v.param || !self.signature_fixed(scope))
+                // closures (callbacks): only parameters after the last used one
+                && !(v.param && scope.kind() == CLOSURE_EXPR && followed_by_used_param(scope, name, &vars));
             if self.config.unused_symbols && v.reads.is_empty() && reportable && !template {
                 for r in &v.def_ranges {
                     let mut d = Diagnostic::new(
@@ -1802,6 +1842,14 @@ impl Checker<'_, '_> {
             None => true,
         }
     }
+}
+
+/// Whether a parameter after `name` (in the closure's parameter list) is used.
+fn followed_by_used_param(scope: &SyntaxNode, name: &str, vars: &HashMap<String, VarInfo>) -> bool {
+    let Some(list) = scope.children().find_map(ast::ParamList::cast) else { return false };
+    let names: Vec<String> = list.params().filter_map(|p| p.name()).collect();
+    let Some(pos) = names.iter().position(|n| n == name) else { return false };
+    names[pos + 1..].iter().any(|n| vars.get(n).is_some_and(|v| !v.reads.is_empty()))
 }
 
 #[derive(Default)]

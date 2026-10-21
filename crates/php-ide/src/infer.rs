@@ -206,6 +206,10 @@ impl<'s, 'a> Infer<'s, 'a> {
                     },
                 }
             }
+            // first-class callable syntax: `strlen(...)`, `$o->m(...)`
+            CALL_EXPR | METHOD_CALL_EXPR | STATIC_CALL_EXPR if is_first_class_callable(node) => {
+                Type::Named(Fqn::new("Closure"), Vec::new())
+            }
             CALL_EXPR => self.call_type(node),
             METHOD_CALL_EXPR | STATIC_CALL_EXPR => self.method_call_type(node),
             PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR => self.property_type(node),
@@ -270,6 +274,15 @@ impl<'s, 'a> Infer<'s, 'a> {
                             Type::Float
                         } else if op == Some(PLUS) && tys.iter().all(|t| t.iterable_value().is_some()) {
                             tys[0].clone()
+                        } else if op == Some(PLUS)
+                            && tys
+                                .iter()
+                                .any(|t| matches!(t, Type::Array(..) | Type::List(_) | Type::Shape(_)))
+                        {
+                            // array union with an operand of unknown type
+                            Type::Array(None, None)
+                        } else if tys.iter().any(|t| t.is_mixed()) {
+                            Type::Mixed
                         } else {
                             Type::union(vec![Type::Int, Type::Float])
                         }
@@ -666,9 +679,8 @@ impl<'s, 'a> Infer<'s, 'a> {
     fn variable_type_inner(&self, name: &str, at: &SyntaxNode) -> Type {
         let offset = at.text_range().start();
         let scope = self.sema.variable_scope(at);
-        if let Some(t) = self.narrowed(name, at, &scope) {
-            return t;
-        }
+        // a narrowing condition wins unless the variable is reassigned after it
+        let narrowed = self.narrowed(name, at, &scope);
         let mut best: Option<(TextSize, Type)> = None;
         let consider =
             |pos: TextSize, ty: Box<dyn FnOnce() -> Type + '_>, best: &mut Option<(TextSize, Type)>| {
@@ -854,6 +866,11 @@ impl<'s, 'a> Infer<'s, 'a> {
                 }
             }
         }
+        if let Some((t, anchor)) = narrowed {
+            if best.as_ref().is_none_or(|(p, _)| *p <= anchor) {
+                return t;
+            }
+        }
         if best.is_none() && scope.kind() == SOURCE_FILE {
             if let Some(t) = self.template_variable(name) {
                 return t;
@@ -1012,7 +1029,7 @@ impl<'s, 'a> Infer<'s, 'a> {
     }
 
     /// `if ($x instanceof Foo) { ... $x ... }`
-    fn narrowed(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<Type> {
+    fn narrowed(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<(Type, TextSize)> {
         for anc in at.ancestors() {
             if &anc == scope {
                 break;
@@ -1023,7 +1040,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 let lhs = expr_children(&anc).next()?;
                 if !lhs.text_range().contains_range(at.text_range()) {
                     if let Some(t) = self.instanceof_condition(&lhs, name) {
-                        return Some(t);
+                        return Some((t, anc.text_range().start()));
                     }
                 }
                 continue;
@@ -1035,7 +1052,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 if !lhs.text_range().contains_range(at.text_range()) {
                     if let Some(inner) = negated(&lhs) {
                         if let Some(t) = self.instanceof_condition(&inner, name) {
-                            return Some(t);
+                            return Some((t, anc.text_range().start()));
                         }
                     }
                 }
@@ -1046,7 +1063,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 let parts: Vec<SyntaxNode> = expr_children(&anc).collect();
                 if parts.len() == 3 && parts[1].text_range().contains_range(at.text_range()) {
                     if let Some(t) = self.instanceof_condition(&parts[0], name) {
-                        return Some(t);
+                        return Some((t, anc.text_range().start()));
                     }
                 }
                 continue;
@@ -1067,7 +1084,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 continue;
             }
             if let Some(t) = self.instanceof_condition(&cond, name) {
-                return Some(t);
+                return Some((t, anc.text_range().start()));
             }
         }
         None
@@ -1091,6 +1108,28 @@ impl<'s, 'a> Infer<'s, 'a> {
                 None
             }
             PAREN_EXPR => self.instanceof_condition(&expr_children(cond).next()?, name),
+            // `is_array($x)`, `is_string($x)`, ...
+            CALL_EXPR => {
+                let callee = cond.first_child().filter(|c| c.kind() == NAME_EXPR)?;
+                let f = ast::text_without_trivia(&callee).trim_start_matches('\\').to_ascii_lowercase();
+                let arg =
+                    cond.children().find(|c| c.kind() == ARG_LIST)?.children().find(|c| c.kind() == ARG)?;
+                let e = expr_children(&arg).next()?;
+                if e.kind() != VARIABLE_EXPR
+                    || ast::VariableExpr::cast(e).and_then(|v| v.name()).as_deref() != Some(name)
+                {
+                    return None;
+                }
+                Some(match f.as_str() {
+                    "is_array" => Type::Array(None, None),
+                    "is_string" => Type::String,
+                    "is_int" | "is_integer" | "is_long" => Type::Int,
+                    "is_float" | "is_double" => Type::Float,
+                    "is_bool" => Type::Bool,
+                    "is_numeric" => Type::union(vec![Type::Int, Type::Float, Type::String]),
+                    _ => return None,
+                })
+            }
             BIN_EXPR => {
                 let is_and = cond.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW));
                 if !is_and {
@@ -1113,6 +1152,20 @@ impl<'s, 'a> Infer<'s, 'a> {
         let e = expr_children(&arg).next()?;
         self.instanceof_condition(&e, name)
     }
+}
+
+fn is_first_class_callable(call: &SyntaxNode) -> bool {
+    call.children().find(|c| c.kind() == ARG_LIST).is_some_and(|l| {
+        let args: Vec<SyntaxNode> = l.children().filter(|c| c.kind() == ARG).collect();
+        args.len() == 1
+            && args[0].children_with_tokens().any(|e| e.kind() == DOT3)
+            && !args[0].children().any(|c| is_expr(c.kind()))
+    }) || call.children().find(|c| c.kind() == ARG_LIST).is_some_and(|l| {
+        // the parser may keep `...` as a bare token of the argument list
+        let toks: Vec<_> =
+            l.children_with_tokens().filter(|e| !e.kind().is_trivia()).map(|e| e.kind()).collect();
+        toks == [L_PAREN, DOT3, R_PAREN]
+    })
 }
 
 /// `!expr` -> `expr` (also `!(expr)`).

@@ -31,6 +31,13 @@ impl Checker<'_, '_> {
     /// it cannot be decided.
     fn accepts(&self, param: &Type, arg: &Type, strict: bool) -> bool {
         let index = self.sema.index();
+        // names we do not know (template parameters of functions, pseudo
+        // types like `uppercase-string`, missing dependencies)
+        if let Type::Named(c, _) = arg {
+            if index.class(c).is_none() {
+                return true;
+            }
+        }
         match (param, arg) {
             (_, Type::Mixed | Type::Template(_) | Type::Never) => true,
             (Type::Mixed | Type::Template(_) | Type::SelfType | Type::Static | Type::Parent, _) => true,
@@ -48,7 +55,7 @@ impl Checker<'_, '_> {
                 }
                 match (param, a) {
                     (Type::Float, Type::Int | Type::Float) => true,
-                    (Type::Int, Type::Int) | (Type::String, Type::String) => true,
+                    (Type::Int, Type::Int) | (Type::String, Type::String | Type::ClassString(_)) => true,
                     (_, Type::Literal(l)) => match param {
                         Type::String => l.starts_with(['\'', '"']),
                         _ => !l.starts_with(['\'', '"']),
