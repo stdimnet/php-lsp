@@ -503,7 +503,7 @@ impl<'a> Formatter<'a> {
 
     fn push(&mut self, start: TextSize, end: TextSize, new_text: String) {
         let range = TextRange::new(start, end);
-        if &self.text[range] != new_text {
+        if self.text[range] != new_text {
             self.edits.push(Edit { range, new_text });
         }
     }

@@ -740,6 +740,9 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             code_action_kinds: Some(vec![
                 lsp::CodeActionKind::QUICKFIX,
                 lsp::CodeActionKind::REFACTOR,
+                lsp::CodeActionKind::REFACTOR_EXTRACT,
+                lsp::CodeActionKind::REFACTOR_INLINE,
+                lsp::CodeActionKind::REFACTOR_REWRITE,
                 lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
             ]),
             work_done_progress_options: Default::default(),

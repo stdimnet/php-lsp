@@ -509,6 +509,8 @@ fn code_action(s: &mut Server, p: lsp::CodeActionParams) -> Option<Vec<lsp::Code
         let kind = match a.kind {
             php_ide::CodeActionKind::QuickFix => lsp::CodeActionKind::QUICKFIX,
             php_ide::CodeActionKind::Refactor => lsp::CodeActionKind::REFACTOR,
+            php_ide::CodeActionKind::RefactorExtract => lsp::CodeActionKind::REFACTOR_EXTRACT,
+            php_ide::CodeActionKind::RefactorInline => lsp::CodeActionKind::REFACTOR_INLINE,
             php_ide::CodeActionKind::RefactorRewrite => lsp::CodeActionKind::REFACTOR_REWRITE,
             php_ide::CodeActionKind::Source => lsp::CodeActionKind::SOURCE,
             php_ide::CodeActionKind::SourceOrganizeImports => lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,

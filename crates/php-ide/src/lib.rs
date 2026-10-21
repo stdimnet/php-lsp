@@ -17,6 +17,7 @@
 mod classify;
 mod code_actions;
 mod completion;
+pub mod composer;
 mod diagnostics;
 mod folding;
 mod hierarchy;
@@ -26,6 +27,7 @@ mod infer;
 mod inlay_hints;
 mod line_index;
 mod navigation;
+mod refactor;
 mod rename;
 mod render;
 mod selection;

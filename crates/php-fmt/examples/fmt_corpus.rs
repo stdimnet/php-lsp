@@ -69,7 +69,7 @@ fn main() {
         worst.push((n, f.clone()));
         ok += 1;
     }
-    worst.sort_by(|a, b| b.0.cmp(&a.0));
+    worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (n, f) in worst.iter().take(8) {
         println!("{n:6} changed lines: {}", f.display());
     }

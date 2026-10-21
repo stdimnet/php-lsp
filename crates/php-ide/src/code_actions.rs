@@ -14,6 +14,8 @@ use crate::{render, DiagnosticCode};
 pub enum CodeActionKind {
     QuickFix,
     Refactor,
+    RefactorExtract,
+    RefactorInline,
     RefactorRewrite,
     Source,
     SourceOrganizeImports,
@@ -39,22 +41,23 @@ pub(crate) fn code_actions(sema: &Sema, range: TextRange) -> Vec<CodeAction> {
     add_phpdoc(sema, &node, &mut out);
     getters_setters(sema, &node, &mut out);
     organize_imports(sema, range.start(), &mut out);
+    crate::refactor::refactorings(sema, range, &mut out);
     out
 }
 
-fn edit(sema: &Sema, range: TextRange, text: impl Into<String>) -> SourceChange {
+pub(crate) fn edit(sema: &Sema, range: TextRange, text: impl Into<String>) -> SourceChange {
     SourceChange::single(sema.file, TextEdit { range, new_text: text.into() })
 }
 
 /// Indentation (leading whitespace) of the line containing `offset`.
-fn line_indent(sema: &Sema, offset: TextSize) -> String {
+pub(crate) fn line_indent(sema: &Sema, offset: TextSize) -> String {
     let text = &sema.text;
     let o = usize::from(offset).min(text.len());
     let start = text[..o].rfind('\n').map_or(0, |i| i + 1);
     text[start..].chars().take_while(|c| *c == ' ' || *c == '\t').collect()
 }
 
-fn indent_unit(sema: &Sema) -> String {
+pub(crate) fn indent_unit(sema: &Sema) -> String {
     // detect from the file: first indented line
     for line in sema.text.lines() {
         if line.starts_with('\t') {

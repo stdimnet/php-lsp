@@ -505,3 +505,58 @@ fn docblock_completion() {
         "/**\n * ${1:}\n *\n * @param ${2:int} $a\n * @param ${3:mixed} $b\n * @return ${4:string}\n */"
     );
 }
+
+fn action(text: &str, sel: (&str, &str), title: &str) -> String {
+    let mut ws = Workspace::new(Config::default());
+    let id = ws.set_file("file:///ref.php", text.to_string());
+    let start = text.find(sel.0).unwrap();
+    let end = if sel.1.is_empty() { start } else { text.find(sel.1).unwrap() + sel.1.len() };
+    let range = php_ide::TextRange::new(TextSize::from(start as u32), TextSize::from(end as u32));
+    let acts = ws.code_actions(id, range);
+    let a = acts
+        .iter()
+        .find(|a| a.title == title)
+        .unwrap_or_else(|| panic!("no '{title}' in {:?}", acts.iter().map(|a| &a.title).collect::<Vec<_>>()));
+    apply(text, &a.change, id)
+}
+
+#[test]
+fn refactorings() {
+    let text = "<?php\nfunction f($user) {\n    echo strtoupper($user->getName());\n}\n";
+    assert_eq!(
+        action(text, ("$user->getName()", "$user->getName()"), "Extract variable"),
+        "<?php\nfunction f($user) {\n    $name = $user->getName();\n    echo strtoupper($name);\n}\n"
+    );
+
+    let text = "<?php\nclass A\n{\n    public function run($a)\n    {\n        $b = $a * 2;\n        $c = $b + 1;\n        echo $c;\n    }\n}\n";
+    let out = action(text, ("$b = $a", "$b + 1;"), "Extract method");
+    assert!(out.contains("        $c = $this->extracted($a);\n        echo $c;"), "{out}");
+    assert!(out.contains("    private function extracted($a)\n    {\n        $b = $a * 2;\n        $c = $b + 1;\n        return $c;\n    }"), "{out}");
+
+    let text = "<?php\nclass A\n{\n    function f() { return 'pending'; }\n}\n";
+    let out = action(text, ("'pending'", "'pending'"), "Extract constant");
+    assert!(
+        out.contains("private const PENDING = 'pending';") && out.contains("return self::PENDING;"),
+        "{out}"
+    );
+
+    let text = "<?php\nfunction f() {\n    $x = 1 + 2;\n    return $x * 3;\n}\n";
+    assert_eq!(
+        action(text, ("$x =", ""), "Inline variable $x"),
+        "<?php\nfunction f() {\n    return (1 + 2) * 3;\n}\n"
+    );
+
+    let text = "<?php\nclass P\n{\n    private int $a;\n    protected ?string $b;\n\n    public function __construct(int $a, ?string $b = null)\n    {\n        $this->a = $a;\n        $this->b = $b;\n    }\n}\n";
+    let out = action(text, ("__construct", ""), "Promote constructor properties");
+    assert_eq!(out, "<?php\nclass P\n{\n\n    public function __construct(private int $a, protected ?string $b = null)\n    {\n    }\n}\n");
+
+    let text = "<?php\nclass Q\n{\n    private string $name;\n    private int $age;\n}\n";
+    let out = action(text, ("class Q", ""), "Generate constructor");
+    assert!(out.contains("    public function __construct(string $name, int $age)\n    {\n        $this->name = $name;\n        $this->age = $age;\n    }"), "{out}");
+
+    let text = "<?php\nfunction g() { return [1, 2]; }\n";
+    assert_eq!(
+        action(text, ("g()", ""), "Add return type 'array'"),
+        "<?php\nfunction g(): array { return [1, 2]; }\n"
+    );
+}
