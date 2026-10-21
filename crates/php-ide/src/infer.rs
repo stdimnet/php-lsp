@@ -98,14 +98,14 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
         let depth = &self.sema.infer_depth;
         if depth.get() > MAX_DEPTH {
-            self.sema.infer_truncated.set(self.sema.infer_truncated.get() + 1);
             return Type::Mixed;
         }
-        let truncated = self.sema.infer_truncated.get();
         depth.set(depth.get() + 1);
         let t = self.expr_type_inner(node);
         depth.set(depth.get() - 1);
-        if self.sema.infer_truncated.get() == truncated && !self.sema.in_loop_carried.get() {
+        // results below the depth limit are cached too (they are less precise,
+        // `mixed`, but recomputing them is exponential for long call chains)
+        if !self.sema.in_loop_carried.get() {
             self.sema.expr_cache.borrow_mut().insert(key, t.clone());
         }
         t
@@ -683,14 +683,14 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
         let depth = &self.sema.infer_depth;
         if depth.get() > MAX_DEPTH {
-            self.sema.infer_truncated.set(self.sema.infer_truncated.get() + 1);
             return Type::Mixed;
         }
-        let truncated = self.sema.infer_truncated.get();
         depth.set(depth.get() + 1);
         let t = self.variable_type_inner(name, at);
         depth.set(depth.get() - 1);
-        if self.sema.infer_truncated.get() == truncated && !self.sema.in_loop_carried.get() {
+        // results below the depth limit are cached too (they are less precise,
+        // `mixed`, but recomputing them is exponential for long call chains)
+        if !self.sema.in_loop_carried.get() {
             self.sema.var_cache.borrow_mut().insert(key, t.clone());
         }
         t

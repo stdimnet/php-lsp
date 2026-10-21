@@ -19,9 +19,6 @@ pub(crate) struct Sema<'a> {
     pub text: Arc<str>,
     /// Recursion depth of type inference (shared by all `Infer` instances).
     pub infer_depth: std::cell::Cell<u32>,
-    /// How often inference stopped at the depth limit (results computed
-    /// meanwhile are incomplete and not cached).
-    pub infer_truncated: std::cell::Cell<u32>,
     /// Set while loop-carried assignments are evaluated (they are not
     /// followed again from there).
     pub in_loop_carried: std::cell::Cell<bool>,
@@ -45,7 +42,6 @@ impl<'a> Sema<'a> {
             scopes,
             text,
             infer_depth: std::cell::Cell::new(0),
-            infer_truncated: std::cell::Cell::new(0),
             in_loop_carried: std::cell::Cell::new(false),
             expr_cache: Default::default(),
             var_cache: Default::default(),
