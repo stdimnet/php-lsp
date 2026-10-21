@@ -32,6 +32,33 @@ pub struct Reference {
     pub kind: ReferenceKind,
 }
 
+/// `$_GET` etc.: their declaration in the superglobals stub.
+fn superglobal_declaration(sema: &Sema, name: &str) -> Option<Location> {
+    let (id, _) = sema.ws.files().find(|(_, f)| f.path.ends_with("superglobals/_superglobals.php"))?;
+    let root = sema.ws.parse(id)?.syntax_node();
+    let tok = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == VARIABLE && &t.text()[1..] == name)?;
+    let stmt =
+        tok.parent_ancestors().find(|n| n.kind() == EXPR_STMT).map_or(tok.text_range(), |n| n.text_range());
+    Some(Location { file: id, range: stmt, focus: tok.text_range() })
+}
+
+/// A variable token that (re)defines the variable: assignment target,
+/// parameter, `foreach` / `catch` / `global` / `static` binding.
+fn is_definition_token(t: &php_syntax::SyntaxToken) -> bool {
+    let Some(var) = t.parent() else { return false };
+    let Some(p) = var.parent() else { return false };
+    match p.kind() {
+        ASSIGN_EXPR => p.first_child().as_ref() == Some(&var),
+        PARAM | FOREACH_VALUE | FOREACH_KEY | CATCH_CLAUSE | GLOBAL_STMT | STATIC_VAR | CLOSURE_USE_VAR => {
+            true
+        }
+        _ => matches!(var.kind(), PARAM | CATCH_CLAUSE | STATIC_VAR),
+    }
+}
+
 pub(crate) fn declarations(sema: &Sema, def: &Definition, at: Option<TextSize>) -> Vec<Location> {
     let index = sema.index();
     let loc = |file, range, focus| Location { file, range, focus };
@@ -67,10 +94,22 @@ pub(crate) fn declarations(sema: &Sema, def: &Definition, at: Option<TextSize>) 
             .collect(),
         Definition::Variable { name, scope } => {
             let Some(scope_node) = node_with_range(&sema.root, *scope) else { return Vec::new() };
-            let first = variable_tokens(&scope_node, name)
+            if crate::infer::is_superglobal(name) {
+                return superglobal_declaration(sema, name).into_iter().collect();
+            }
+            // the closest definition before the use (as Intelephense), else the first
+            let candidates = variable_tokens(&scope_node, name)
                 .into_iter()
                 .filter(|t| at.is_none_or(|a| t.text_range().start() <= a))
-                .find(|t| classify_token(sema, t).is_some_and(|d| d.same_as(def)));
+                .filter(|t| classify_token(sema, t).is_some_and(|d| d.same_as(def)))
+                .filter(|t| at.is_none() || is_definition_token(t));
+            let first = if at.is_some() { candidates.last() } else { candidates.into_iter().next() };
+            let first = first.or_else(|| {
+                variable_tokens(&scope_node, name)
+                    .into_iter()
+                    .filter(|t| at.is_none_or(|a| t.text_range().start() <= a))
+                    .find(|t| classify_token(sema, t).is_some_and(|d| d.same_as(def)))
+            });
             first
                 .map(|t| {
                     let range = t

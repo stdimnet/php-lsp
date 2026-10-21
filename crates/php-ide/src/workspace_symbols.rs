@@ -51,7 +51,7 @@ pub(crate) fn workspace_symbols(ws: &Workspace, query: &str, limit: usize) -> Ve
         if kind == FileKind::Stub && query.len() < 3 {
             continue;
         }
-        for c in &symbols.classes {
+        for c in symbols.classes.iter().filter(|c| !php_hir::symbols::is_anon_class(&c.fqn)) {
             let class_score = score(c.fqn.short(), class_query);
             if member_query.is_none() {
                 if let Some(s) = class_score {

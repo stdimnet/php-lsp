@@ -221,10 +221,31 @@ fn prefer_doc(declared: Option<&Type>, doc: Option<&Type>) -> Option<Type> {
     }
 }
 
+/// Name of an anonymous class in the index (unique per declaration).
+pub fn anon_class_fqn(node: &SyntaxNode) -> Fqn {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    node.text().to_string().hash(&mut h);
+    Fqn::new(&format!(
+        "class@anonymous@{}-{:x}",
+        u32::from(node.text_range().start()),
+        h.finish() & 0xffff_ffff
+    ))
+}
+
+pub fn is_anon_class(fqn: &Fqn) -> bool {
+    fqn.as_str().starts_with("class@anonymous")
+}
+
 pub fn extract(file: &ast::SourceFile, scopes: &FileScopes, opts: ExtractOptions) -> FileSymbols {
     let mut out = FileSymbols::default();
     let mut cx = Cx { scopes, opts, out: &mut out };
     cx.walk(file.syntax());
+    for anon in file.syntax().descendants().filter(|n| n.kind() == ANON_CLASS) {
+        if let Some(c) = ClassLike::anon(anon).and_then(|c| cx.class(&c)) {
+            cx.out.classes.push(c);
+        }
+    }
     out
 }
 
@@ -365,10 +386,15 @@ impl Cx<'_> {
     }
 
     fn class(&self, c: &ClassLike) -> Option<ClassDef> {
-        let name = c.name()?;
         let node = c.syntax();
         let scope = self.scope(node);
-        let fqn = Fqn::join(scope.namespace.as_ref(), &name.text());
+        let (fqn, name_range) = match c {
+            ClassLike::Anon(_) => (anon_class_fqn(node), node.first_token()?.text_range()),
+            _ => {
+                let name = c.name()?;
+                (Fqn::join(scope.namespace.as_ref(), &name.text()), name.syntax().text_range())
+            }
+        };
         let doc = doc_of(node);
         let templates = doc.as_ref().map(|d| d.templates()).unwrap_or_default();
         let tr = TypeResolver { scope, templates: &[], class_templates: &templates };
@@ -398,7 +424,7 @@ impl Cx<'_> {
             fqn,
             kind: c.kind(),
             range: node.text_range(),
-            name_range: name.syntax().text_range(),
+            name_range,
             is_abstract: has(ABSTRACT_KW),
             is_final: has(FINAL_KW),
             is_readonly: has(READONLY_KW),

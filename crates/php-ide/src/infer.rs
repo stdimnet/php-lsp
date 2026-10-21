@@ -154,6 +154,10 @@ impl<'s, 'a> Infer<'s, 'a> {
             }
             NEW_EXPR => {
                 if let Some(anon) = node.children().find(|c| c.kind() == ANON_CLASS) {
+                    let fqn = php_hir::symbols::anon_class_fqn(&anon);
+                    if self.sema.index().class(&fqn).is_some() {
+                        return Type::Named(fqn, Vec::new());
+                    }
                     let ext =
                         anon.children().find_map(ast::ExtendsClause::cast).and_then(|e| e.names().next());
                     return match ext {
@@ -1024,6 +1028,19 @@ impl<'s, 'a> Infer<'s, 'a> {
                 }
                 continue;
             }
+            // `!$x instanceof A || $x->...`
+            if anc.kind() == BIN_EXPR && anc.children_with_tokens().any(|e| matches!(e.kind(), PIPE2 | OR_KW))
+            {
+                let lhs = expr_children(&anc).next()?;
+                if !lhs.text_range().contains_range(at.text_range()) {
+                    if let Some(inner) = negated(&lhs) {
+                        if let Some(t) = self.instanceof_condition(&inner, name) {
+                            return Some(t);
+                        }
+                    }
+                }
+                continue;
+            }
             // `$x instanceof A ? $x->... : ...`
             if anc.kind() == TERNARY_EXPR {
                 let parts: Vec<SyntaxNode> = expr_children(&anc).collect();
@@ -1098,6 +1115,18 @@ impl<'s, 'a> Infer<'s, 'a> {
     }
 }
 
+/// `!expr` -> `expr` (also `!(expr)`).
+fn negated(node: &SyntaxNode) -> Option<SyntaxNode> {
+    if node.kind() != PREFIX_EXPR || !node.children_with_tokens().any(|e| e.kind() == BANG) {
+        return None;
+    }
+    let inner = expr_children(node).next()?;
+    if inner.kind() == PAREN_EXPR {
+        return expr_children(&inner).next();
+    }
+    Some(inner)
+}
+
 /// A node in the outer scope positioned at the closure (for looking up
 /// `use` variables).
 fn parent_expr_anchor(closure: &SyntaxNode, _parent: &SyntaxNode) -> SyntaxNode {
@@ -1122,7 +1151,7 @@ fn statement_doc_var(node: &SyntaxNode, name: &str) -> Option<String> {
     }
 }
 
-fn is_superglobal(name: &str) -> bool {
+pub(crate) fn is_superglobal(name: &str) -> bool {
     matches!(
         name,
         "_GET" | "_POST" | "_SERVER" | "_REQUEST" | "_COOKIE" | "_FILES" | "_ENV" | "_SESSION" | "GLOBALS"

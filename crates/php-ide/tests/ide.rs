@@ -1028,6 +1028,17 @@ fn intelephense_parity() {
             "P1003 Symbol 'strlen' is declared but not used."
         ]
     );
+    // negated instanceof on the left of ||
+    assert_eq!(
+        type_at(&format!(
+            "<?php\n{classes}function o(Stmt $t) {{ return !$t instanceof ClassMethod || $t<|>; }}\n"
+        )),
+        "ClassMethod"
+    );
+    // members of anonymous classes
+    let d = diags(&format!("<?php\n{classes}function a() {{ $p = new class extends Stmt {{ public int $actual = 1; function run(): int {{ return $this->actual; }} }}; return $p->actual + $p->run(); }}\n"));
+    assert!(d.is_empty(), "{d:?}");
+    assert_eq!(type_at(&format!("<?php\n{classes}function a() {{ $p = new class extends Stmt {{ public int $actual = 1; }}; $p->actual<|>; }}\n")), "int");
     // attribute classes
     let d = diags(
         "<?php\nnamespace A;\nuse Sym\\AsCommand;\n#[AsCommand('x'), \\Attribute, \\Override]\nclass C {}\n",

@@ -69,7 +69,8 @@ impl<'a> Sema<'a> {
 
     pub fn class_fqn(&self, class_node: &SyntaxNode) -> Option<Fqn> {
         if class_node.kind() == ANON_CLASS {
-            return None;
+            let fqn = php_hir::symbols::anon_class_fqn(class_node);
+            return self.index().class(&fqn).is_some().then_some(fqn);
         }
         let name = class_node.children().find_map(ast::Name::cast)?;
         let scope = self.scope_at(class_node.text_range().start());

@@ -136,6 +136,9 @@ pub enum ClassLike {
     Interface(InterfaceDecl),
     Trait(TraitDecl),
     Enum(EnumDecl),
+    /// `new class(...) extends ... { }` (not produced by `cast`, see
+    /// [`ClassLike::anon`]).
+    Anon(AnonClass),
 }
 
 impl AstNode for ClassLike {
@@ -157,14 +160,18 @@ impl AstNode for ClassLike {
             ClassLike::Interface(n) => &n.0,
             ClassLike::Trait(n) => &n.0,
             ClassLike::Enum(n) => &n.0,
+            ClassLike::Anon(n) => &n.0,
         }
     }
 }
 
 impl ClassLike {
+    pub fn anon(node: SyntaxNode) -> Option<Self> {
+        (node.kind() == ANON_CLASS).then(|| ClassLike::Anon(AnonClass(node)))
+    }
     pub fn kind(&self) -> ClassLikeKind {
         match self {
-            ClassLike::Class(_) => ClassLikeKind::Class,
+            ClassLike::Class(_) | ClassLike::Anon(_) => ClassLikeKind::Class,
             ClassLike::Interface(_) => ClassLikeKind::Interface,
             ClassLike::Trait(_) => ClassLikeKind::Trait,
             ClassLike::Enum(_) => ClassLikeKind::Enum,

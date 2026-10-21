@@ -223,20 +223,24 @@ const hoverText = (h) => {
 };
 
 /** First definition target: file name (stubs live at different places) and ranges. */
-const defTarget = (d) => {
+const defTarget = (d, project) => {
   if (!d) return null;
   const list = Array.isArray(d) ? d : [d];
   if (!list.length) return null;
   const l = list[0];
-  const file = decodeURIComponent(l.targetUri || l.uri).split('/').pop();
+  const uri = decodeURIComponent(l.targetUri || l.uri);
+  const file = uri.split('/').pop();
+  const external = !uri.startsWith(`file://${project}/`);
   const range = l.targetRange || l.range;
   const sel = l.targetSelectionRange || l.range;
-  return { file, start: range.start.line, end: range.end.line, line: sel.start.line, key: `${file}:${sel.start.line + 1}` };
+  return { file, external, start: range.start.line, end: range.end.line, line: sel.start.line, key: `${file}:${sel.start.line + 1}` };
 };
 
 /** Same target: same file and one position inside the other's declaration range. */
 const sameTarget = (a, b) =>
-  a.file === b.file && ((b.line >= a.start && b.line <= a.end) || (a.line >= b.start && a.line <= b.end));
+  a.file === b.file &&
+  // stubs: both servers ship different stub versions
+  ((a.external && b.external) || (b.line >= a.start && b.line <= a.end) || (a.line >= b.start && a.line <= b.end));
 
 // ------------------------------------------------------------------ main
 
@@ -312,7 +316,7 @@ async function main() {
         report.hover.onlyTheirs++;
         example(report.hover.examples, `- ${at}`);
       } else if (b) report.hover.onlyOurs++;
-      const [ka, kb] = [defTarget(gt), defTarget(gy)];
+      const [ka, kb] = [defTarget(gt, opts.project), defTarget(gy, opts.project)];
       const d = report.definition;
       if (ka && kb) {
         if (sameTarget(ka, kb)) d.same++;
