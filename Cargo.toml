@@ -12,6 +12,13 @@ rust-version = "1.80"
 [workspace.dependencies]
 php-syntax = { path = "crates/php-syntax" }
 php-ide = { path = "crates/php-ide" }
+php-hir = { path = "crates/php-hir" }
+php-index = { path = "crates/php-index" }
+php-stubs = { path = "crates/php-stubs" }
+rayon = "1"
+walkdir = "2"
+globset = "0.4"
+miniz_oxide = "0.8"
 rowan = "0.17"
 lsp-server = "0.10"
 lsp-types = "0.97"
