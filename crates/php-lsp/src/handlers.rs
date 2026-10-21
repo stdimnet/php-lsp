@@ -27,6 +27,8 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         InlayHintRequest::METHOD => handle(s, req, inlay_hints),
         PrepareRenameRequest::METHOD => handle(s, req, prepare_rename),
         Rename::METHOD => handle(s, req, rename),
+        DocumentLinkRequest::METHOD => handle(s, req, document_links),
+        WillRenameFiles::METHOD => handle(s, req, will_rename_files),
         CodeActionRequest::METHOD => handle(s, req, code_action),
         CallHierarchyPrepare::METHOD => handle(s, req, call_hierarchy_prepare),
         CallHierarchyIncomingCalls::METHOD => handle(s, req, incoming_calls),
@@ -529,6 +531,50 @@ fn rename(s: &mut Server, p: lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
             None
         }
     }
+}
+
+fn document_links(s: &mut Server, p: lsp::DocumentLinkParams) -> Option<Vec<lsp::DocumentLink>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    let links = s.workspace.document_links(id);
+    Some(
+        links
+            .into_iter()
+            .filter_map(|l| {
+                let target = if l.target.starts_with("file://") {
+                    crate::uri::uri_from_key(&l.target)
+                } else {
+                    l.target
+                };
+                Some(lsp::DocumentLink {
+                    range: convert::range(&index, s.encoding, l.range),
+                    target: Some(target.parse().ok()?),
+                    tooltip: None,
+                    data: None,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Renaming a file renames the class it declares and fixes its namespace.
+#[allow(clippy::mutable_key_type)]
+fn will_rename_files(s: &mut Server, p: lsp::RenameFilesParams) -> Option<lsp::WorkspaceEdit> {
+    let mut merged = php_ide::SourceChange::default();
+    for f in &p.files {
+        let Some(id) = s.workspace.file_id(&crate::uri::key_from_uri(&f.old_uri)) else { continue };
+        let change = s.workspace.file_rename_edits(id, &crate::uri::key_from_uri(&f.new_uri));
+        for (file, edits) in change.edits {
+            match merged.edits.iter_mut().find(|(f, _)| *f == file) {
+                Some((_, existing)) => existing.extend(edits),
+                None => merged.edits.push((file, edits)),
+            }
+        }
+    }
+    if merged.edits.is_empty() {
+        return None;
+    }
+    workspace_edit(s, merged)
 }
 
 // ---------------------------------------------------------------------- code actions

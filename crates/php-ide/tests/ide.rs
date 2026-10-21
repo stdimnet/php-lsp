@@ -785,3 +785,42 @@ fn phpdoc_type_references() {
     let d: Vec<String> = ws.diagnostics(id).into_iter().map(|d| d.message).collect();
     assert_eq!(d, vec!["Undefined type 'App\\Nope'."]);
 }
+
+#[test]
+fn document_links_and_file_rename() {
+    let (mut ws, dir) = project(
+        "links",
+        &[
+            ("composer.json", r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#),
+            ("lib/helpers.php", "<?php\nfunction helper() {}\n"),
+            ("src/Models/User.php", "<?php\nnamespace App\\Models;\n\nclass User {}\n"),
+            ("src/Http/Controller.php", "<?php\nnamespace App\\Http;\n\nuse App\\Models\\User;\n\nclass Controller { public function f(User $u): \\App\\Models\\User { return $u; } }\n"),
+        ],
+    );
+    let main = "<?php\nrequire __DIR__ . '/lib/helpers.php';\ninclude 'missing.php';\n// see https://php.net/manual.\n";
+    let id = ws.set_file(&format!("file://{}", dir.join("index.php").display()), main.into());
+    let links = ws.document_links(id);
+    let targets: Vec<_> = links.iter().map(|l| l.target.clone()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            format!("file://{}", dir.join("lib/helpers.php").display()),
+            "https://php.net/manual".to_string()
+        ]
+    );
+
+    // move src/Models/User.php -> src/Entities/Account.php
+    let user_key = format!("file://{}", dir.join("src/Models/User.php").display());
+    let user = ws.file_id(&user_key).unwrap();
+    let new_key = format!("file://{}", dir.join("src/Entities/Account.php").display());
+    let change = ws.file_rename_edits(user, &new_key);
+    let user_text = ws.file(user).unwrap().text.to_string();
+    assert_eq!(apply(&user_text, &change, user), "<?php\nnamespace App\\Entities;\n\nclass Account {}\n");
+    let ctrl = ws.file_id(&format!("file://{}", dir.join("src/Http/Controller.php").display())).unwrap();
+    let ctrl_text = ws.file(ctrl).unwrap().text.to_string();
+    assert_eq!(
+        apply(&ctrl_text, &change, ctrl),
+        "<?php\nnamespace App\\Http;\n\nuse App\\Entities\\Account;\n\nclass Controller { public function f(Account $u): \\App\\Entities\\Account { return $u; } }\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

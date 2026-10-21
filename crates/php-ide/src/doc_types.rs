@@ -247,7 +247,7 @@ mod tests {
             .find(|t| t.kind() == php_syntax::SyntaxKind::DOC_COMMENT)
             .unwrap();
         let names: Vec<(String, &str)> =
-            doc_type_refs(&tok).into_iter().map(|r| (r.name, &text[r.range])).map(|(n, t)| (n, t)).collect();
+            doc_type_refs(&tok).into_iter().map(|r| (r.name, &text[r.range])).collect();
         let names: Vec<&str> = names.iter().map(|(_, t)| *t).collect();
         assert_eq!(names, vec!["User", "Collection", "Post", "\\App\\NotFound", "Name", "Builder", "Model"]);
     }

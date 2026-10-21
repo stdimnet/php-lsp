@@ -625,7 +625,7 @@ impl Checker<'_, '_> {
             .collect();
         for tok in docs {
             for r in crate::doc_types::doc_type_refs(&tok) {
-                if templates.iter().any(|t| *t == r.name) {
+                if templates.contains(&r.name) {
                     continue;
                 }
                 let Some(anchor) = tok.parent() else { continue };

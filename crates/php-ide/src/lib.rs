@@ -27,6 +27,7 @@ mod indexer;
 mod infer;
 mod inlay_hints;
 mod line_index;
+mod links;
 mod navigation;
 pub mod plugins;
 mod refactor;
@@ -52,6 +53,7 @@ pub use hover::Hover;
 pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
 pub use inlay_hints::{InlayHint, InlayHintKind, InlayHintsConfig};
 pub use line_index::{LineCol, LineIndex, PositionEncoding};
+pub use links::DocumentLink;
 pub use navigation::{Location, Reference, ReferenceKind};
 pub use php_fmt::{BraceStyle, FormatOptions};
 pub use php_hir as hir;
@@ -485,6 +487,16 @@ impl Workspace {
         }
         .ok()?;
         Some(edits.into_iter().map(|e| TextEdit { range: e.range, new_text: e.new_text }).collect())
+    }
+
+    pub fn document_links(&self, id: FileId) -> Vec<DocumentLink> {
+        sema::Sema::new(self, id).map(|s| links::document_links(&s)).unwrap_or_default()
+    }
+
+    /// Edits to apply when the file `id` is renamed / moved to `new_path`
+    /// (a `file://` key): class name and PSR-4 namespace follow the file.
+    pub fn file_rename_edits(&self, id: FileId, new_path: &str) -> SourceChange {
+        sema::Sema::new(self, id).map(|s| links::file_rename_edits(&s, new_path)).unwrap_or_default()
     }
 
     pub fn inlay_hints(&self, id: FileId, range: TextRange) -> Vec<InlayHint> {

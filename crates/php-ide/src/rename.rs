@@ -71,7 +71,7 @@ fn check_renamable(sema: &Sema, def: &Definition) -> Result<(), RenameError> {
     Ok(())
 }
 
-fn valid_identifier(name: &str) -> bool {
+pub(crate) fn valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_' || c as u32 >= 0x80)
         && chars.all(|c| c.is_alphanumeric() || c == '_' || c as u32 >= 0x80)

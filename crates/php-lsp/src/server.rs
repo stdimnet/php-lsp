@@ -957,6 +957,10 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             work_done_progress_options: Default::default(),
             resolve_provider: Some(false),
         })),
+        document_link_provider: Some(lsp::DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
         call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
         document_formatting_provider: Some(lsp::OneOf::Left(true)),
         execute_command_provider: Some(lsp::ExecuteCommandOptions {
@@ -990,7 +994,19 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
                 supported: Some(true),
                 change_notifications: Some(lsp::OneOf::Left(true)),
             }),
-            file_operations: None,
+            file_operations: Some(lsp::WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(lsp::FileOperationRegistrationOptions {
+                    filters: vec![lsp::FileOperationFilter {
+                        scheme: Some("file".into()),
+                        pattern: lsp::FileOperationPattern {
+                            glob: "**/*.php".into(),
+                            matches: Some(lsp::FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..Default::default()
+            }),
         }),
         ..Default::default()
     }
