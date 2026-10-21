@@ -913,3 +913,37 @@ fn blade_templates() {
     assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn blade_structure() {
+    let mut ws = Workspace::new(Config::default());
+    ws.load_stubs();
+    let text = "@extends('layouts.app')\n@section('title', 'Users')\n@section('content')\n  @foreach($users as $u)\n    {{ $loop->index }} {{ $u }}\n  @endforeach\n  @php\n    $x = 1;\n  @endphp\n  @push('scripts')\n    <script></script>\n  @endpush\n@endsection\n";
+    let id = ws.set_file("file:///p/resources/views/users.blade.php", text.into());
+    let at = |needle: &str, delta: usize| TextSize::from((text.find(needle).unwrap() + delta) as u32);
+    // $loop
+    assert_eq!(ws.type_at(id, at("$loop", 1)).unwrap(), "PhpLsp\\Blade\\Loop");
+    let l: Vec<String> = ws.completions(id, at("$loop->", 7)).items.into_iter().map(|i| i.label).collect();
+    assert!(l.contains(&"index".to_string()) && l.contains(&"first".to_string()), "{l:?}");
+    // folding: section, foreach, php, push
+    let folds: Vec<&str> =
+        ws.folding_ranges(id).iter().map(|f| text[f.range].split(['(', '\n']).next().unwrap()).collect();
+    assert_eq!(folds, vec!["@section", "@foreach", "@php", "@push"]);
+    // outline
+    let syms = ws.document_symbols(id);
+    let names: Vec<(&str, Vec<&str>)> = syms
+        .iter()
+        .map(|s| (s.name.as_str(), s.children.iter().map(|c| c.name.as_str()).collect()))
+        .collect();
+    assert_eq!(names, vec![("title", vec![]), ("content", vec!["scripts"])]);
+    // directives are highlighted
+    let kw: Vec<&str> = ws
+        .semantic_tokens(id, None)
+        .into_iter()
+        .filter(|t| t.token_type == php_ide::SemanticTokenType::Keyword)
+        .map(|t| &text[t.range])
+        .collect();
+    assert_eq!(&kw[..5], &["@extends", "@section", "@section", "@foreach", "{{"]);
+    let tokens = ws.semantic_tokens(id, None);
+    assert!(tokens.windows(2).all(|w| w[0].range.start() <= w[1].range.start()));
+}

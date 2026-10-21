@@ -128,8 +128,10 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   - **Blade:** templates are analysed as PHP (echoes, directives, `@php`, `@use`, component
     attributes): hover, completion, definition, references, rename and diagnostics in
     `{{ }}` / `@if(...)` / `@foreach(...)`; variable types come from the controllers' `view()`
-    / `->with()` / `compact()` calls; directive snippets, HTML completion, view names in
-    `@include` / `@extends`
+    / `->with()` / `compact()` calls, `$loop` is typed; directive snippets, HTML completion,
+    view names in `@include` / `@extends`; folding of directive blocks, outline of sections /
+    stacks / slots, highlighted directives (semantic tokens). Twig is not supported: VS Code
+    sends `.twig` files (language `twig`) to no PHP server
   - **Symfony:** typed `$container->get(Foo::class)` and Doctrine `getRepository()`, route
     names (`#[Route(name: ...)]`, YAML) and Twig templates for `redirectToRoute()`,
     `generateUrl()`, `render()`

@@ -23,6 +23,7 @@ pub enum SemanticTokenType {
     Variable,
     Parameter,
     Decorator,
+    Keyword,
 }
 
 /// LSP names of the token types.
@@ -39,6 +40,7 @@ pub const TOKEN_TYPES: &[&str] = &[
     "variable",
     "parameter",
     "decorator",
+    "keyword",
 ];
 
 /// LSP names of the modifiers (bit index = position).

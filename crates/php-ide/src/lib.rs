@@ -298,6 +298,11 @@ impl Workspace {
         }
         php_stubs::files_for(&self.config.stubs)
             .map(|f| (format!("{STUB_SCHEME}{}", f.path), Arc::<str>::from(f.text), FileKind::Stub))
+            .chain(std::iter::once((
+                format!("{STUB_SCHEME}php-lsp/blade.php"),
+                Arc::<str>::from(blade::STUB),
+                FileKind::Stub,
+            )))
             .collect()
     }
 
@@ -363,11 +368,17 @@ impl Workspace {
     }
 
     pub fn document_symbols(&self, id: FileId) -> Vec<Symbol> {
+        if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
+            return blade::symbols(&f.text, &blade::virtual_php(&f.text));
+        }
         self.parse(id).map(|p| symbols::document_symbols(&p.tree())).unwrap_or_default()
     }
 
     pub fn folding_ranges(&self, id: FileId) -> Vec<Fold> {
         let (Some(p), Some(f)) = (self.parse(id), self.file(id)) else { return Vec::new() };
+        if blade::is_blade(&f.path) {
+            return blade::folds(&f.text, &blade::virtual_php(&f.text));
+        }
         folding::folding_ranges(&p.syntax_node(), &f.text)
     }
 
@@ -535,7 +546,17 @@ impl Workspace {
 
     /// Semantic tokens of a file (optionally limited to `range`).
     pub fn semantic_tokens(&self, id: FileId, range: Option<TextRange>) -> Vec<SemanticToken> {
-        sema::Sema::new(self, id).map(|s| semantic_tokens::semantic_tokens(&s, range)).unwrap_or_default()
+        let mut tokens = sema::Sema::new(self, id)
+            .map(|s| semantic_tokens::semantic_tokens(&s, range))
+            .unwrap_or_default();
+        if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
+            let b = blade::virtual_php(&f.text);
+            tokens.extend(
+                blade::tokens(&b).into_iter().filter(|t| range.is_none_or(|r| r.contains_range(t.range))),
+            );
+            tokens.sort_by_key(|t| t.range.start());
+        }
+        tokens
     }
 
     /// Definition targets of the string literal at `offset` contributed by

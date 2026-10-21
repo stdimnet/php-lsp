@@ -471,6 +471,9 @@ impl Plugin for Laravel {
     }
 
     fn template_variable_type(&self, cx: &PluginCx, name: &str) -> Option<Type> {
+        if name == "loop" {
+            return Some(Type::Named(Fqn::new(crate::blade::LOOP_CLASS), Vec::new()));
+        }
         if let Some((_, class)) = TEMPLATE_GLOBALS.iter().find(|(n, _)| *n == name) {
             return Some(Type::Named(Fqn::new(class), Vec::new()));
         }

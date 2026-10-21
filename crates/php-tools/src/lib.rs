@@ -156,9 +156,12 @@ pub fn diagnostics(
 }
 
 fn json_start(out: &str) -> Option<Value> {
-    // tools may print notices before the JSON document
-    let i = out.find(['{', '['])?;
-    serde_json::from_str(&out[i..]).ok()
+    // tools may print notices / PHP warnings before (and after) the JSON
+    // document, possibly containing brackets themselves
+    out.match_indices(['{', '[']).find_map(|(i, _)| {
+        let v = serde_json::Deserializer::from_str(&out[i..]).into_iter::<Value>().next()?.ok()?;
+        matches!(v, Value::Object(_) | Value::Array(_)).then_some(v)
+    })
 }
 
 fn same_file(a: &str, b: &Path) -> bool {
@@ -376,13 +379,18 @@ mod tests {
         let d = parse_phpcs(cs);
         assert_eq!((d[0].line, d[0].column), (1, Some(13)));
         assert_eq!(d[0].code.as_deref(), Some("PSR12.Files.FileHeader"));
+        // PHP warnings with brackets before the document
+        let noisy = format!("Warning: Failed loading [opcache] (x) in Unknown on line 0\n{psalm}\n");
+        assert_eq!(parse_psalm(&noisy, f).len(), 1);
     }
 }
 
 #[cfg(test)]
 mod real_tools {
     //! Runs the real tools when `PHP_LSP_TOOLS_DIR` points to a directory with
-    //! `phpstan.phar`, `phpcs.phar`, `phpcbf.phar` and `php-cs-fixer.phar`.
+    //! `phpstan.phar`, `phpcs.phar`, `phpcbf.phar` and `php-cs-fixer.phar`
+    //! (optionally `psalm.phar`, `phpunit.phar`). `PHP_BINARY` selects the PHP
+    //! that runs them (the Psalm 6.20 phar did not start on PHP 8.3.6, it runs on 8.4).
     use super::*;
 
     #[test]
@@ -412,6 +420,21 @@ mod real_tools {
         let fixed =
             format(Formatter::PhpCsFixer, &root, &file, text, &cfg("php-cs-fixer.phar", &[])).unwrap();
         assert!(fixed.contains("class A\n{"), "{fixed}");
+        if dir.join("psalm.phar").exists() {
+            // Psalm needs a config and a Composer autoloader
+            std::fs::write(
+                root.join("psalm.xml"),
+                "<?xml version=\"1.0\"?>\n<psalm errorLevel=\"1\"><projectFiles><directory name=\"src\"/></projectFiles></psalm>\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("vendor")).unwrap();
+            std::fs::write(root.join("vendor/autoload.php"), "<?php\n").unwrap();
+            let psalm = diagnostics(Tool::Psalm, &root, &file, text, &cfg("psalm.phar", &[])).unwrap();
+            let ret =
+                psalm.iter().find(|d| d.code.as_deref() == Some("InvalidReturnStatement")).expect("psalm");
+            assert_eq!((ret.line, ret.column, ret.end_column), (3, Some(45), Some(47)), "{psalm:?}");
+            assert_eq!(ret.severity, ToolSeverity::Error);
+        }
         if dir.join("phpunit.phar").exists() {
             std::fs::create_dir_all(root.join("tests")).unwrap();
             let test = root.join("tests/ATest.php");

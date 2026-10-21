@@ -17,7 +17,42 @@ pub(crate) struct Blade {
     pub regions: Vec<TextRange>,
     /// Directive names (without `@`) and their ranges.
     pub directives: Vec<(TextRange, String)>,
+    /// `{{` / `}}` / `{!!` / `!!}` of echoes.
+    pub delimiters: Vec<TextRange>,
 }
+
+/// Types of variables Blade defines itself (loaded with the stubs).
+pub(crate) const STUB: &str = r#"<?php
+namespace PhpLsp\Blade;
+
+/** The `$loop` variable inside `@foreach` / `@forelse`. */
+final class Loop
+{
+    /** Index of the current iteration (starts at 0). */
+    public int $index;
+    /** The current iteration (starts at 1). */
+    public int $iteration;
+    /** Iterations remaining. */
+    public int $remaining;
+    /** Number of items in the array being iterated. */
+    public int $count;
+    /** Whether this is the first iteration. */
+    public bool $first;
+    /** Whether this is the last iteration. */
+    public bool $last;
+    /** Whether this is an even iteration. */
+    public bool $even;
+    /** Whether this is an odd iteration. */
+    public bool $odd;
+    /** Nesting level of the current loop. */
+    public int $depth;
+    /** The parent loop's variable when in a nested loop. */
+    public ?Loop $parent;
+}
+"#;
+
+/// Class of `$loop` (see [`STUB`]).
+pub(crate) const LOOP_CLASS: &str = "PhpLsp\\Blade\\Loop";
 
 pub(crate) fn is_blade(path: &str) -> bool {
     path.ends_with(".blade.php")
@@ -290,6 +325,11 @@ struct Builder<'a> {
     out: Vec<u8>,
     regions: Vec<TextRange>,
     directives: Vec<(TextRange, String)>,
+    delimiters: Vec<TextRange>,
+}
+
+fn range(from: usize, to: usize) -> TextRange {
+    TextRange::new(TextSize::from(from as u32), TextSize::from(to as u32))
 }
 
 impl Builder<'_> {
@@ -307,7 +347,7 @@ impl Builder<'_> {
 pub(crate) fn virtual_php(text: &str) -> Blade {
     let src = text.as_bytes();
     let out = src.iter().map(|&b| if b == b'\n' || b == b'\r' { b } else { b' ' }).collect();
-    let mut b = Builder { src, out, regions: Vec::new(), directives: Vec::new() };
+    let mut b = Builder { src, out, regions: Vec::new(), directives: Vec::new(), delimiters: Vec::new() };
     let mut i = 0;
     let mut in_component = false;
     while i < src.len() {
@@ -338,6 +378,8 @@ pub(crate) fn virtual_php(text: &str) -> Blade {
                     b.put(i, b";(");
                     b.copy(i + open, end);
                     b.put(end, b");");
+                    b.delimiters.push(range(i, i + open));
+                    b.delimiters.push(range(end, end + close.len()));
                     b.region(i, end + close.len());
                     i = end + close.len();
                 }
@@ -398,7 +440,7 @@ pub(crate) fn virtual_php(text: &str) -> Blade {
     let mut text =
         String::from_utf8(b.out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     text.push(';');
-    Blade { text, regions: b.regions, directives: b.directives }
+    Blade { text, regions: b.regions, directives: b.directives, delimiters: b.delimiters }
 }
 
 /// Handles the directive at `i` (`src[i] == '@'`); returns the next offset.
@@ -435,6 +477,7 @@ fn directive(b: &mut Builder, i: usize) -> usize {
         b.copy(name_end, end);
         if end < src.len() {
             b.put(end, b";");
+            b.directives.push((range(end + 1, end + "@endphp".len()), "endphp".to_string()));
         }
         b.region(name_end, end);
         return end + "@endphp".len();
@@ -580,6 +623,217 @@ pub(crate) fn directive_completions(
         items.push(item);
     }
     Some(items)
+}
+
+/// Directives opening a block closed by `@end<name>`.
+const BLOCKS: &[&str] = &[
+    "if",
+    "unless",
+    "isset",
+    "empty",
+    "foreach",
+    "forelse",
+    "for",
+    "while",
+    "switch",
+    "section",
+    "push",
+    "pushOnce",
+    "pushIf",
+    "prepend",
+    "prependOnce",
+    "once",
+    "auth",
+    "guest",
+    "can",
+    "cannot",
+    "canany",
+    "env",
+    "production",
+    "error",
+    "component",
+    "slot",
+    "fragment",
+    "session",
+    "context",
+    "php",
+    "teleport",
+    "persist",
+];
+
+/// A `@name ... @endname` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Block {
+    pub name: String,
+    /// The opening directive (`@` included) with its arguments.
+    pub open: TextRange,
+    /// The closing directive (`@` included).
+    pub close: TextRange,
+    /// First string argument (`@section('content')` -> `content`).
+    pub label: Option<String>,
+}
+
+/// Arguments `(...)` following a directive name ending at `name_end`.
+fn directive_args(src: &[u8], name_end: usize) -> Option<TextRange> {
+    let ws = src[name_end..].iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+    (src.get(name_end + ws) == Some(&b'('))
+        .then(|| matching_paren(src, name_end + ws))
+        .flatten()
+        .map(|e| range(name_end + ws, e))
+}
+
+/// Number of top-level commas in an argument list `(...)`.
+fn top_level_commas(args: &str) -> usize {
+    let (mut depth, mut quote, mut n) = (0i32, None, 0);
+    for c in args.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 1 => n += 1,
+                _ => {}
+            },
+        }
+    }
+    n
+}
+
+fn first_string(args: &str) -> Option<String> {
+    let start = args.find(['\'', '"'])?;
+    let q = args[start..].chars().next()?;
+    let end = args[start + 1..].find(q)? + start + 1;
+    Some(args[start + 1..end].to_string())
+}
+
+/// Pairs block directives.
+pub(crate) fn blocks(text: &str, blade: &Blade) -> Vec<Block> {
+    let src = text.as_bytes();
+    let mut stack: Vec<(String, TextRange, Option<String>)> = Vec::new();
+    let mut out = Vec::new();
+    for (name_range, name) in &blade.directives {
+        let at = name_range.start() - TextSize::from(1);
+        let args = directive_args(src, usize::from(name_range.end()));
+        let args_text = args.map(|r| &text[r]);
+        let open_end = args.map_or(name_range.end(), |r| r.end());
+        let closes = match name.as_str() {
+            "show" | "stop" | "append" | "overwrite" => Some("section".to_string()),
+            n => n.strip_prefix("end").filter(|r| !r.is_empty()).map(|r| r.to_string()),
+        };
+        if let Some(target) = closes {
+            if let Some(pos) = stack.iter().rposition(|(n, _, _)| n.eq_ignore_ascii_case(&target)) {
+                let (name, open, label) = stack.remove(pos);
+                stack.truncate(pos);
+                out.push(Block { name, open, close: TextRange::new(at, name_range.end()), label });
+            }
+            continue;
+        }
+        let opens = BLOCKS.contains(&name.as_str())
+            // `@empty` without arguments separates `@forelse`; inline `@php(...)`
+            && !(matches!(name.as_str(), "empty" | "php") && args.is_some() != (name == "empty"))
+            // `@section('title', 'value')` / `@push('x', 'y')` have no body
+            && !(matches!(name.as_str(), "section" | "push" | "prepend" | "slot") && args_text.is_some_and(|a| top_level_commas(a) > 0));
+        if opens {
+            stack.push((name.clone(), TextRange::new(at, open_end), args_text.and_then(first_string)));
+        }
+    }
+    out.sort_by_key(|b| b.open.start());
+    out
+}
+
+/// Folding ranges of a template: directive blocks and multi-line HTML elements.
+pub(crate) fn folds(text: &str, blade: &Blade) -> Vec<crate::folding::Fold> {
+    use crate::folding::{Fold, FoldKind};
+    let mut out: Vec<Fold> = blocks(text, blade)
+        .into_iter()
+        .filter(|b| text[TextRange::new(b.open.start(), b.close.start())].contains('\n'))
+        .map(|b| Fold { range: TextRange::new(b.open.start(), b.close.start()), kind: FoldKind::Block })
+        .collect();
+    for m in text.match_indices("{{--") {
+        let start = m.0;
+        if let Some(end) = find(text.as_bytes(), start, b"--}}") {
+            if text[start..end].contains('\n') {
+                out.push(Fold { range: range(start, end + 4), kind: FoldKind::Comment });
+            }
+        }
+    }
+    out.sort_by_key(|f| f.range.start());
+    out
+}
+
+/// Outline of a template: sections, stacks, slots, fragments and components.
+pub(crate) fn symbols(text: &str, blade: &Blade) -> Vec<crate::symbols::Symbol> {
+    use crate::symbols::{Symbol, SymbolKind};
+    const NAMED: &[&str] = &[
+        "section",
+        "push",
+        "pushOnce",
+        "prepend",
+        "prependOnce",
+        "slot",
+        "fragment",
+        "component",
+        "yield",
+        "stack",
+    ];
+    let blocks = blocks(text, blade);
+    let mut flat: Vec<Symbol> = Vec::new();
+    for (name_range, name) in &blade.directives {
+        if !NAMED.contains(&name.as_str()) {
+            continue;
+        }
+        let at = name_range.start() - TextSize::from(1);
+        let args = directive_args(text.as_bytes(), usize::from(name_range.end()));
+        let Some(label) = args.and_then(|r| first_string(&text[r])) else { continue };
+        let full = blocks
+            .iter()
+            .find(|b| b.open.start() == at)
+            .map_or(TextRange::new(at, args.map_or(name_range.end(), |r| r.end())), |b| {
+                TextRange::new(at, b.close.end())
+            });
+        flat.push(Symbol {
+            name: label,
+            detail: Some(format!("@{name}")),
+            kind: if matches!(name.as_str(), "section" | "yield") {
+                SymbolKind::Namespace
+            } else {
+                SymbolKind::Property
+            },
+            deprecated: false,
+            range: full,
+            selection_range: TextRange::new(at, name_range.end()),
+            children: Vec::new(),
+        });
+    }
+    // nest by range
+    fn insert(into: &mut Vec<Symbol>, sym: Symbol) {
+        if let Some(parent) =
+            into.iter_mut().rev().find(|p| p.range.contains_range(sym.range) && p.range != sym.range)
+        {
+            insert(&mut parent.children, sym);
+        } else {
+            into.push(sym);
+        }
+    }
+    let mut out = Vec::new();
+    for s in flat {
+        insert(&mut out, s);
+    }
+    out
+}
+
+/// Semantic tokens for directive names (with `@`) and echo delimiters.
+pub(crate) fn tokens(blade: &Blade) -> Vec<crate::semantic_tokens::SemanticToken> {
+    use crate::semantic_tokens::{SemanticToken, SemanticTokenType};
+    blade
+        .directives
+        .iter()
+        .map(|(r, _)| TextRange::new(r.start() - TextSize::from(1), r.end()))
+        .chain(blade.delimiters.iter().copied())
+        .map(|range| SemanticToken { range, token_type: SemanticTokenType::Keyword, modifiers: 0 })
+        .collect()
 }
 
 /// Whether `offset` is inside PHP code of the template.

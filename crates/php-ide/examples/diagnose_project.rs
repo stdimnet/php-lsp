@@ -36,7 +36,11 @@ fn main() {
     let t = std::time::Instant::now();
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut shown = 0;
+    let mut structure = 0;
     for id in &ids {
+        // also exercise the structural features (panic check)
+        structure += ws.folding_ranges(*id).len() + ws.document_symbols(*id).len();
+        structure += ws.semantic_tokens(*id, None).len();
         for d in ws.diagnostics(*id) {
             *counts.entry(d.code.as_str()).or_default() += 1;
             if show.as_deref() == Some(d.code.as_str()) && shown < n {
@@ -53,7 +57,7 @@ fn main() {
             }
         }
     }
-    println!("{} files in {:?}", ids.len(), t.elapsed());
+    println!("{} files in {:?} ({structure} folds / symbols / tokens)", ids.len(), t.elapsed());
     for (code, n) in counts {
         println!("{code}: {n}");
     }

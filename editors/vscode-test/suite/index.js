@@ -74,6 +74,12 @@ const checks = [
     assert.match(hoverText(h), /Returns the display name/);
     const list = await exec('vscode.executeCompletionItemProvider', doc.uri, pos(doc, '@foreach', 4));
     assert.ok(labels(list).includes('@foreach'), labels(list).slice(0, 20).join(','));
+    const loop = await exec('vscode.executeCompletionItemProvider', doc.uri, pos(doc, '$loop->', 7));
+    assert.ok(labels(loop).includes('index'), labels(loop).slice(0, 20).join(','));
+    const syms = await exec('vscode.executeDocumentSymbolProvider', doc.uri);
+    assert.deepStrictEqual(syms.map((s) => s.name), ['content']);
+    const folds = await exec('vscode.executeFoldingRangeProvider', doc.uri);
+    assert.ok(folds.length >= 2, JSON.stringify(folds));
   }],
   ['references', async () => {
     const doc = await open('src/Models/User.php');
