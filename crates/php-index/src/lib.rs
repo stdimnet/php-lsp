@@ -6,7 +6,7 @@ use std::sync::Arc;
 use php_hir::symbols::{
     ClassConstDef, ClassDef, ConstDef, EnumCaseDef, FileSymbols, FunctionDef, PropertyDef,
 };
-use php_hir::Fqn;
+use php_hir::{Fqn, Type};
 
 /// Identifies a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -262,6 +262,69 @@ impl Index {
             return true;
         }
         ancestors.iter().any(|(_, c)| c.supertypes().chain(c.mixins.iter()).any(|s| self.class(s).is_none()))
+    }
+
+    /// Concrete template arguments of ancestor `target` when looking at
+    /// `class<args>`, following `@extends` / `@implements` / `@use` generics:
+    /// for `class UserList extends Collection` with
+    /// `@extends Collection<int, User>`, `ancestor_args(UserList, [], Collection)`
+    /// is `[int, User]`.
+    pub fn ancestor_args(&self, class: &Fqn, args: &[Type], target: &Fqn) -> Option<Vec<Type>> {
+        let mut seen = HashSet::new();
+        self.ancestor_args_inner(class, args, target, &mut seen)
+    }
+
+    fn ancestor_args_inner(
+        &self,
+        class: &Fqn,
+        args: &[Type],
+        target: &Fqn,
+        seen: &mut HashSet<String>,
+    ) -> Option<Vec<Type>> {
+        if class.eq_ignore_case(target) {
+            return Some(args.to_vec());
+        }
+        if !seen.insert(class.key()) {
+            return None;
+        }
+        let (_, def) = self.class(class)?;
+        let subst = |t: &Type| -> Type {
+            t.substitute(&|name| {
+                def.templates.iter().position(|tp| tp.name == name).and_then(|i| args.get(i).cloned())
+            })
+        };
+        // generic supertypes first, they carry the arguments
+        for g in &def.generic_supertypes {
+            if let Type::Named(sup, sargs) = g {
+                let sargs: Vec<Type> = sargs.iter().map(subst).collect();
+                if let Some(found) = self.ancestor_args_inner(sup, &sargs, target, seen) {
+                    return Some(found);
+                }
+            }
+        }
+        for sup in def.supertypes() {
+            if def.generic_supertypes.iter().any(|g| matches!(g, Type::Named(n, _) if n.eq_ignore_case(sup)))
+            {
+                continue;
+            }
+            if let Some(found) = self.ancestor_args_inner(sup, &[], target, seen) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Substitutes the templates of `owner` (an ancestor of `class<args>`)
+    /// in `ty`.
+    pub fn substitute_templates(&self, ty: &Type, class: &Fqn, args: &[Type], owner: &Fqn) -> Type {
+        let Some((_, owner_def)) = self.class(owner) else { return ty.clone() };
+        if owner_def.templates.is_empty() {
+            return ty.clone();
+        }
+        let owner_args = self.ancestor_args(class, args, owner).unwrap_or_default();
+        ty.substitute(&|name| {
+            owner_def.templates.iter().position(|tp| tp.name == name).and_then(|i| owner_args.get(i).cloned())
+        })
     }
 
     /// Whether `sub` is `sup` or extends / implements it.

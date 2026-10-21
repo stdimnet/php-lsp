@@ -80,8 +80,33 @@ const BUILTIN_TYPES: &[&str] = &[
 /// Returns the definition and the range of the identifier at `offset`.
 pub(crate) fn classify(sema: &Sema, offset: TextSize) -> Option<(Definition, TextRange)> {
     let token = sema.token_at(offset)?;
+    if token.kind() == DOC_COMMENT {
+        return classify_doc(sema, &token, offset);
+    }
     let def = classify_token(sema, &token)?;
     Some((def, token.text_range()))
+}
+
+/// A class name inside a doc comment.
+pub(crate) fn classify_doc(
+    sema: &Sema,
+    token: &SyntaxToken,
+    offset: TextSize,
+) -> Option<(Definition, TextRange)> {
+    let r =
+        crate::doc_types::doc_type_refs(token).into_iter().find(|r| r.range.contains_inclusive(offset))?;
+    let fqn = resolve_doc_name(sema, token, &r.name)?;
+    Some((Definition::Class(fqn), r.range))
+}
+
+/// Resolves a doc comment class name (`None` for template parameters).
+pub(crate) fn resolve_doc_name(sema: &Sema, token: &SyntaxToken, name: &str) -> Option<Fqn> {
+    if crate::doc_types::template_names(&sema.root).iter().any(|t| t == name) {
+        return None;
+    }
+    let anchor = token.parent()?;
+    let fqn = sema.resolve_class_name(name, &anchor)?;
+    Some(fqn)
 }
 
 pub(crate) fn classify_token(sema: &Sema, token: &SyntaxToken) -> Option<Definition> {

@@ -555,22 +555,9 @@ impl<'s, 'a> Infer<'s, 'a> {
             }
             let Some(m) = self.sema.index().find_method(&class, &name) else { continue };
             let mut t = self.function_return(m.def, args.as_ref());
-            // class level generics: `Collection<User>` with `@template T`
-            if let Some(Type::Named(_, targs)) = receiver_ty.as_ref().and_then(|r| {
-                r.members()
-                    .into_iter()
-                    .find(|t| matches!(t, Type::Named(n, _) if n.eq_ignore_case(&class)))
-                    .cloned()
-            }) {
-                if !targs.is_empty() {
-                    if let Some((_, cdef)) = self.sema.index().class(&class) {
-                        let templates = cdef.templates.clone();
-                        t = t.substitute(&|n| {
-                            templates.iter().position(|tp| tp.name == n).and_then(|i| targs.get(i).cloned())
-                        });
-                    }
-                }
-            }
+            // class level generics, also through `@extends Base<T>` chains
+            let targs = self.receiver_args(receiver_ty.as_ref(), &class);
+            t = self.sema.index().substitute_templates(&t, &class, &targs, &m.owner.fqn);
             out.push(self.resolve_rel(&t, Some(&m.owner.fqn), Some(&class)));
         }
         if out.is_empty() {
@@ -580,12 +567,28 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
     }
 
+    /// Generic arguments of `class` in the receiver type (`Collection<User>`).
+    fn receiver_args(&self, receiver: Option<&Type>, class: &Fqn) -> Vec<Type> {
+        receiver
+            .and_then(|r| {
+                r.members().into_iter().find_map(|t| match t {
+                    Type::Named(n, args) if n.eq_ignore_case(class) => Some(args.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default()
+    }
+
     fn property_type(&self, node: &SyntaxNode) -> Type {
         let Some(name) = Self::member_name(node) else { return Type::Mixed };
         let mut out = Vec::new();
+        let receiver_ty =
+            node.first_child().filter(|_| node.kind() == PROPERTY_FETCH_EXPR).map(|r| self.expr_type(&r));
         for class in self.receiver_classes(node) {
             if let Some(p) = self.sema.index().find_property(&class, &name) {
                 if let Some(t) = p.def.effective_type() {
+                    let targs = self.receiver_args(receiver_ty.as_ref(), &class);
+                    let t = self.sema.index().substitute_templates(&t, &class, &targs, &p.owner.fqn);
                     out.push(self.resolve_rel(&t, Some(&p.owner.fqn), Some(&class)));
                     continue;
                 }
@@ -859,6 +862,17 @@ impl<'s, 'a> Infer<'s, 'a> {
         let mut out = Vec::new();
         for m in t.members() {
             if let Type::Named(c, args) = m {
+                // `Traversable<K, V>` reached through @extends / @implements
+                let index = self.sema.index();
+                let traversable = ["Traversable", "IteratorAggregate", "Iterator"]
+                    .iter()
+                    .find_map(|t| index.ancestor_args(c, args, &Fqn::new(t)).filter(|a| !a.is_empty()));
+                if let Some(v) =
+                    traversable.and_then(|a| a.last().cloned()).filter(|v| !matches!(v, Type::Template(_)))
+                {
+                    out.push(v);
+                    continue;
+                }
                 if let Some(last) = args.last() {
                     out.push(last.clone());
                     continue;
@@ -866,6 +880,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 for method in ["current", "getIterator"] {
                     if let Some(found) = self.sema.index().find_method(c, method) {
                         if let Some(rt) = found.def.effective_return_type() {
+                            let rt = index.substitute_templates(&rt, c, args, &found.owner.fqn);
                             let rt = self.resolve_rel(&rt, Some(&found.owner.fqn), Some(c));
                             if method == "current" {
                                 out.push(rt);

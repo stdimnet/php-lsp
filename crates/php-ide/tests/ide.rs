@@ -714,3 +714,74 @@ fn symfony_and_wordpress_plugins() {
     assert!(targets[0].0.ends_with("wp/plugin.php") && targets[0].1 == 2, "{targets:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn generics_through_inheritance() {
+    let lib = r#"<?php
+/**
+ * @template TKey
+ * @template TValue
+ * @implements IteratorAggregate<TKey, TValue>
+ */
+class Collection implements IteratorAggregate {
+    /** @return TValue|null */
+    public function first() {}
+    /** @return static<TKey, TValue> */
+    public function filter() {}
+    /** @var array<TKey, TValue> */
+    public array $items = [];
+    public function getIterator(): Traversable {}
+}
+class User { public function name(): string {} }
+/** @extends Collection<int, User> */
+class UserList extends Collection {}
+/**
+ * @template T
+ */
+class Repo {
+    /** @return Collection<int, T> */
+    public function all() {}
+}
+/** @extends Repo<User> */
+class UserRepo extends Repo {}
+"#;
+    let check = |code: &str, expected: &str| {
+        let text = format!("//- lib.php\n{lib}//- main.php\n<?php\n{code}\n");
+        assert_eq!(type_at(&text), expected, "{code}");
+    };
+    check("function f(UserList $l) { $u = $l->first(); $u<|>; }", "?User");
+    check("function f(UserList $l) { foreach ($l as $u) { $u<|>; } }", "User");
+    check("function f(UserRepo $r) { $x = $r->all()->first(); $x<|>; }", "?User");
+    check("function f(UserRepo $r) { foreach ($r->all() as $u) { $u<|>; } }", "User");
+    check(
+        "/** @param Collection<string, User> $c */ function f($c) { $x = $c->items; $x<|>; }",
+        "array<string, User>",
+    );
+}
+
+#[test]
+fn phpdoc_type_references() {
+    let text = "<?php\nnamespace App;\nclass User {}\n/**\n * @param User $u\n * @return array<int, User>\n */\nfunction f($u) { return [$u]; }\n/** @var Nope $x */\n$x = 1;\n";
+    let mut ws = Workspace::new(Config::default());
+    let id = ws.set_file("file:///d.php", text.to_string());
+    // hover / definition from the doc comment
+    let at = TextSize::from(text.find("User $u").unwrap() as u32 + 1);
+    assert_eq!(
+        ws.definition_at(id, at),
+        Some(php_ide::Definition::Class(php_ide::hir::Fqn::new("App\\User")))
+    );
+    // references include doc comments; rename changes them
+    let at = TextSize::from(text.find("class User").unwrap() as u32 + 7);
+    assert_eq!(ws.references(id, at, true).len(), 3);
+    let change = ws.rename(id, at, "Member").unwrap();
+    let out = apply(text, &change, id);
+    assert!(
+        out.contains("@param Member $u")
+            && out.contains("array<int, Member>")
+            && out.contains("class Member"),
+        "{out}"
+    );
+    // undefined types in docs
+    let d: Vec<String> = ws.diagnostics(id).into_iter().map(|d| d.message).collect();
+    assert_eq!(d, vec!["Undefined type 'App\\Nope'."]);
+}

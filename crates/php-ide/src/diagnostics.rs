@@ -199,6 +199,9 @@ impl Checker<'_, '_> {
                 self.check_variables(&node);
             }
         }
+        if index_ready && self.config.undefined_types {
+            self.check_doc_types();
+        }
         if self.config.unused_symbols {
             self.check_unused_imports();
         }
@@ -609,6 +612,34 @@ impl Checker<'_, '_> {
             DiagnosticCode::MissingImplementation,
             format!("'{}' does not implement methods {}{}.", fqn, shown.join(", "), more),
         ));
+    }
+
+    fn check_doc_types(&mut self) {
+        let templates = crate::doc_types::template_names(&self.sema.root);
+        let docs: Vec<SyntaxToken> = self
+            .sema
+            .root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == DOC_COMMENT && t.text().contains('@'))
+            .collect();
+        for tok in docs {
+            for r in crate::doc_types::doc_type_refs(&tok) {
+                if templates.iter().any(|t| *t == r.name) {
+                    continue;
+                }
+                let Some(anchor) = tok.parent() else { continue };
+                let Some(fqn) = self.sema.resolve_class_name(&r.name, &anchor) else { continue };
+                if self.sema.index().class(&fqn).is_none() {
+                    self.push(Diagnostic::new(
+                        r.range,
+                        Severity::Error,
+                        DiagnosticCode::UndefinedType,
+                        format!("Undefined type '{fqn}'."),
+                    ));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ imports

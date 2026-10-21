@@ -19,6 +19,7 @@ mod code_actions;
 mod completion;
 pub mod composer;
 mod diagnostics;
+mod doc_types;
 mod folding;
 mod hierarchy;
 mod hover;

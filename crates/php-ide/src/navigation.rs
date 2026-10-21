@@ -239,7 +239,31 @@ fn file_references(sema: &Sema, def: &Definition, name: &str, include_declaratio
         _ => sema.root.clone(),
     };
     let mut out = Vec::new();
+    let is_class = matches!(def, Definition::Class(_));
     for token in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
+        // class names in doc comments
+        if is_class
+            && token.kind() == DOC_COMMENT
+            && token.text().to_ascii_lowercase().contains(&name.to_ascii_lowercase())
+        {
+            for r in crate::doc_types::doc_type_refs(&token) {
+                let last = r.name.rsplit('\\').next().unwrap_or(&r.name);
+                if !last.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let Some(fqn) = crate::classify::resolve_doc_name(sema, &token, &r.name) else { continue };
+                if Definition::Class(fqn).same_as(def) {
+                    // only the last segment is the name itself
+                    let len = php_syntax::TextSize::from(last.len() as u32);
+                    out.push(Reference {
+                        file: sema.file,
+                        range: TextRange::new(r.range.end() - len, r.range.end()),
+                        kind: ReferenceKind::Read,
+                    });
+                }
+            }
+            continue;
+        }
         if !token_matches(&token, name, ci) {
             continue;
         }
