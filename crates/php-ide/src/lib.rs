@@ -205,7 +205,7 @@ impl Workspace {
     }
 
     fn opts(&self) -> ExtractOptions {
-        ExtractOptions { php_version: self.config.php_version }
+        ExtractOptions::new(self.config.php_version)
     }
 
     // ----------------------------------------------------------- files

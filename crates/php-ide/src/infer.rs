@@ -962,6 +962,17 @@ impl<'s, 'a> Infer<'s, 'a> {
             .and_then(|d| d.param(&name))
             .filter(|t| !t.type_text.is_empty())
             .map(|t| self.doc_type(&t.type_text, func));
+        // no own `@param`: inherit the documented type of the overridden method
+        let doc_ty = doc_ty.or_else(|| {
+            let vague = declared.as_ref().is_none_or(|d| {
+                matches!(d, Type::Array(None, None) | Type::Iterable(None, None) | Type::Mixed)
+            });
+            if vague {
+                self.inherited_param_doc(func, &name)
+            } else {
+                None
+            }
+        });
         let t = match (declared, doc_ty) {
             (_, Some(d)) if !d.is_mixed() => d,
             (Some(d), _) => d,
@@ -974,11 +985,54 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
     }
 
+    /// `@param` type of parameter `name` in a method overridden by `func`.
+    fn inherited_param_doc(&self, func: &SyntaxNode, name: &str) -> Option<Type> {
+        if func.kind() != METHOD_DECL {
+            return None;
+        }
+        let class = func
+            .ancestors()
+            .find(|n| matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL))?;
+        let fqn = self.sema.class_fqn(&class)?;
+        let method = func
+            .children()
+            .find_map(ast::MemberName::cast)
+            .and_then(|m| m.text())
+            .or_else(|| func.children().find_map(ast::Name::cast).map(|n| n.text()))?;
+        self.sema
+            .index()
+            .ancestors(&fqn)
+            .into_iter()
+            .filter(|(_, c)| c.fqn != fqn)
+            .find_map(|(_, c)| c.method(&method)?.params.iter().find(|p| p.name == name)?.doc_ty.clone())
+    }
+
     /// `if ($x instanceof Foo) { ... $x ... }`
     fn narrowed(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<Type> {
         for anc in at.ancestors() {
             if &anc == scope {
                 break;
+            }
+            // `$x instanceof A && $x->...`
+            if anc.kind() == BIN_EXPR && anc.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW))
+            {
+                let lhs = expr_children(&anc).next()?;
+                if !lhs.text_range().contains_range(at.text_range()) {
+                    if let Some(t) = self.instanceof_condition(&lhs, name) {
+                        return Some(t);
+                    }
+                }
+                continue;
+            }
+            // `$x instanceof A ? $x->... : ...`
+            if anc.kind() == TERNARY_EXPR {
+                let parts: Vec<SyntaxNode> = expr_children(&anc).collect();
+                if parts.len() == 3 && parts[1].text_range().contains_range(at.text_range()) {
+                    if let Some(t) = self.instanceof_condition(&parts[0], name) {
+                        return Some(t);
+                    }
+                }
+                continue;
             }
             if !matches!(anc.kind(), IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT) {
                 continue;

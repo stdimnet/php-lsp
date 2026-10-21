@@ -198,7 +198,10 @@ fn scan_names(ty: &str, base: usize, out: &mut Vec<DocTypeRef>) {
             // shape keys (`name: type`, `name?: type`) and constants (`Foo::BAR` keeps Foo)
             let after = ty[i..].trim_start();
             let is_key = (after.starts_with(':') && !after.starts_with("::")) || after.starts_with("?:");
+            // `Foo::BAR` / `Foo::TYPE_*`: the part after `::` is a constant
+            let is_const = ty[..start].trim_end().ends_with("::");
             if !is_key
+                && !is_const
                 && !word.is_empty()
                 && !NOT_CLASSES.contains(&word.to_ascii_lowercase().as_str())
                 && !word.chars().all(|c| c.is_ascii_digit())
@@ -228,6 +231,38 @@ pub(crate) fn template_names(root: &SyntaxNode) -> Vec<String> {
         }
         let doc = php_hir::DocBlock::parse(t.text());
         out.extend(doc.templates().into_iter().map(|t| t.name));
+    }
+    out.extend(type_aliases(root));
+    out
+}
+
+/// Local type aliases: `@phpstan-type Name ...`, `@psalm-type Name = ...`,
+/// `@phpstan-import-type Name from Class [as Alias]`.
+fn type_aliases(root: &SyntaxNode) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
+        if t.kind() != php_syntax::SyntaxKind::DOC_COMMENT || !t.text().contains("-type") {
+            continue;
+        }
+        for line in t.text().lines() {
+            let line = line.trim_start_matches([' ', '\t', '*', '/']);
+            let Some((tag, rest)) = line.split_once(char::is_whitespace) else { continue };
+            let import = matches!(tag, "@phpstan-import-type" | "@psalm-import-type");
+            if !import && !matches!(tag, "@phpstan-type" | "@psalm-type") {
+                continue;
+            }
+            let mut words = rest.split_whitespace();
+            let Some(name) = words.next() else { continue };
+            let name = name.trim_end_matches('=');
+            // `... as Alias`
+            let alias = if import {
+                let w: Vec<&str> = rest.split_whitespace().collect();
+                w.iter().position(|x| *x == "as").and_then(|i| w.get(i + 1)).copied()
+            } else {
+                None
+            };
+            out.push(alias.unwrap_or(name).to_string());
+        }
     }
     out
 }

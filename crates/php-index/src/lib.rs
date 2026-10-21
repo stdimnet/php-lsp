@@ -339,6 +339,18 @@ impl Index {
     pub fn find_method(&self, class: &Fqn, name: &str) -> Option<Found<'_, FunctionDef>> {
         let mut magic = None;
         for (file, owner) in self.ancestors(class) {
+            // `use T { method as alias; }`
+            if let Some((method, tr, _)) =
+                owner.trait_aliases.iter().find(|(_, _, a)| a.eq_ignore_ascii_case(name))
+            {
+                let from: Vec<&Fqn> = match tr {
+                    Some(t) => vec![t],
+                    None => owner.traits.iter().collect(),
+                };
+                if let Some(found) = from.into_iter().find_map(|t| self.find_method(t, method)) {
+                    return Some(found);
+                }
+            }
             if let Some(def) = owner.method(name) {
                 // real methods win over `@method` tags of subclasses only if
                 // the tag is not more specific; prefer the first non-abstract
@@ -435,8 +447,7 @@ mod tests {
 
     fn symbols(text: &str) -> Arc<FileSymbols> {
         let parse = php_syntax::parse(text, php_syntax::PhpVersion::LATEST);
-        let (_, s) =
-            analyze_file(&parse.tree(), ExtractOptions { php_version: php_syntax::PhpVersion::LATEST });
+        let (_, s) = analyze_file(&parse.tree(), ExtractOptions::new(php_syntax::PhpVersion::LATEST));
         Arc::new(s)
     }
 

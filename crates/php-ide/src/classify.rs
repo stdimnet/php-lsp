@@ -93,10 +93,51 @@ pub(crate) fn classify_doc(
     token: &SyntaxToken,
     offset: TextSize,
 ) -> Option<(Definition, TextRange)> {
+    if let Some(v) = doc_variable(sema, token, offset) {
+        return Some(v);
+    }
     let r =
         crate::doc_types::doc_type_refs(token).into_iter().find(|r| r.range.contains_inclusive(offset))?;
     let fqn = resolve_doc_name(sema, token, &r.name)?;
     Some((Definition::Class(fqn), r.range))
+}
+
+/// `$name` in a doc comment (`@param T $name`, `@var T $name`): the
+/// parameter / variable of the documented function or statement.
+fn doc_variable(sema: &Sema, token: &SyntaxToken, offset: TextSize) -> Option<(Definition, TextRange)> {
+    let text = token.text();
+    let rel = usize::from(offset - token.text_range().start());
+    let start = text[..rel].rfind('$')?;
+    if !text[start + 1..rel].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    let len = text[start + 1..].bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+    if len == 0 {
+        return None;
+    }
+    let name = text[start + 1..start + 1 + len].to_string();
+    let range = TextRange::at(
+        token.text_range().start() + TextSize::from(start as u32),
+        TextSize::from(len as u32 + 1),
+    );
+    let parent = token.parent()?;
+    // the doc comment of a function precedes its declaration
+    let mut next = token.next_sibling_or_token();
+    while let Some(php_syntax::NodeOrToken::Token(t)) = &next {
+        if t.kind() != WHITESPACE {
+            break;
+        }
+        next = t.next_sibling_or_token();
+    }
+    let func = next.and_then(|e| e.into_node()).filter(|n| matches!(n.kind(), FUNCTION_DECL | METHOD_DECL));
+    let scope = match func {
+        Some(f) => f,
+        None => sema.variable_scope(&parent),
+    };
+    if name == "this" {
+        return None;
+    }
+    Some((Definition::Variable { name, scope: scope.text_range() }, range))
 }
 
 /// Resolves a doc comment class name (`None` for template parameters).

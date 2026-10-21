@@ -28,6 +28,9 @@ pub enum DiagnosticCode {
     Deprecated,
     UndefinedType,
     UndefinedFunction,
+    NoTypeInformation,
+    UndefinedDocType,
+    UnreachableCode,
     UndefinedConstant,
     UndefinedVariable,
     UndefinedMethod,
@@ -53,6 +56,9 @@ impl DiagnosticCode {
             DiagnosticCode::UndefinedClassConstant => "P1012",
             DiagnosticCode::AbstractInstantiation => "P1016",
             DiagnosticCode::MissingImplementation => "P1037",
+            DiagnosticCode::NoTypeInformation => "P1132",
+            DiagnosticCode::UndefinedDocType => "P1133",
+            DiagnosticCode::UnreachableCode => "P1108",
         }
     }
 }
@@ -97,6 +103,10 @@ pub struct DiagnosticsConfig {
     pub deprecated: bool,
     pub argument_count: bool,
     pub implementation_errors: bool,
+    /// `diagnostics.typeErrors` (also covers "no type information").
+    pub type_errors: bool,
+    /// `diagnostics.unreachableCode`.
+    pub unreachable_code: bool,
 }
 
 impl Default for DiagnosticsConfig {
@@ -115,6 +125,8 @@ impl Default for DiagnosticsConfig {
             deprecated: true,
             argument_count: true,
             implementation_errors: true,
+            type_errors: true,
+            unreachable_code: true,
         }
     }
 }
@@ -150,6 +162,89 @@ pub(crate) fn semantic_diagnostics(sema: &Sema) -> Vec<Diagnostic> {
     out.sort_by_key(|d| (d.range.start(), d.range.end()));
     out.dedup_by(|a, b| a.range == b.range && a.code == b.code);
     out
+}
+
+fn is_statement(kind: php_syntax::SyntaxKind) -> bool {
+    format!("{kind:?}").ends_with("_STMT")
+        || matches!(
+            kind,
+            BLOCK | FUNCTION_DECL | CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL | CONST_DECL
+        )
+}
+
+/// `return`, `throw`, `exit()`, `break`, `continue` (as a whole statement).
+fn terminates(stmt: &SyntaxNode) -> bool {
+    match stmt.kind() {
+        RETURN_STMT | BREAK_STMT | CONTINUE_STMT | THROW_STMT | GOTO_STMT => true,
+        EXPR_STMT => stmt.children().next().is_some_and(|e| matches!(e.kind(), THROW_EXPR | EXIT_EXPR)),
+        _ => false,
+    }
+}
+
+/// `$x->prop ?? default`: undefined properties are fine on the left of `??`.
+fn coalesced(node: &SyntaxNode) -> bool {
+    let mut cur = node.clone();
+    while let Some(p) = cur.parent() {
+        match p.kind() {
+            BIN_EXPR if p.children_with_tokens().any(|e| e.kind() == QUESTION2) => {
+                return p.first_child().as_ref() == Some(&cur);
+            }
+            PROPERTY_FETCH_EXPR | INDEX_EXPR | PAREN_EXPR => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A class reference only evaluated after `class_exists(Foo::class)` (or
+/// `interface_exists` / `enum_exists` / `trait_exists`).
+fn class_guarded(node: &SyntaxNode, fqn: &Fqn) -> bool {
+    const CHECKS: [&str; 4] = ["class_exists", "interface_exists", "enum_exists", "trait_exists"];
+    // the argument of the check itself
+    let in_check =
+        node.ancestors().find(|a| a.kind() == CALL_EXPR).and_then(|c| c.first_child()).is_some_and(
+            |callee| {
+                let name = ast::text_without_trivia(&callee);
+                CHECKS.iter().any(|c| name.trim_start_matches('\\').eq_ignore_ascii_case(c))
+            },
+        );
+    if in_check {
+        return true;
+    }
+    let short = fqn.short().to_string();
+    let names = [format!("{short}::class"), format!("'{}'", fqn.as_str()), format!("'{short}'")];
+    node.ancestors().skip(1).any(|anc| {
+        let cond = match anc.kind() {
+            IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT | BIN_EXPR | TERNARY_EXPR => {
+                anc.children().find(|c| crate::infer::is_expr(c.kind()))
+            }
+            _ => None,
+        };
+        cond.is_some_and(|c| {
+            let text = c.text().to_string();
+            !c.text_range().contains_range(node.text_range())
+                && CHECKS.iter().any(|f| text.contains(f))
+                && names.iter().any(|n| text.contains(n.as_str()))
+        })
+    })
+}
+
+/// Whether `node` is only evaluated after a check like
+/// `method_exists($x, 'name')` (in an `if` / `&&` / `?:` condition).
+fn guarded_by(node: &SyntaxNode, checks: &[&str], name: &str) -> bool {
+    let quoted = [format!("'{name}'"), format!("\"{name}\"")];
+    let mentions = |cond: &SyntaxNode| {
+        let text = cond.text().to_string();
+        checks.iter().any(|c| text.contains(c)) && quoted.iter().any(|q| text.contains(q.as_str()))
+    };
+    node.ancestors().skip(1).any(|anc| {
+        let cond = match anc.kind() {
+            IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT => anc.children().find(|c| crate::infer::is_expr(c.kind())),
+            BIN_EXPR | TERNARY_EXPR => anc.children().find(|c| crate::infer::is_expr(c.kind())),
+            _ => None,
+        };
+        cond.is_some_and(|c| !c.text_range().contains_range(node.text_range()) && mentions(&c))
+    })
 }
 
 const BUILTIN_TYPES: &[&str] = &[
@@ -205,6 +300,15 @@ impl Checker<'_, '_> {
             if matches!(node.kind(), FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR) {
                 self.check_variables(&node);
             }
+            if matches!(node.kind(), BLOCK | CASE_CLAUSE)
+                && self.config.unreachable_code
+                && self.blade.is_none()
+            {
+                self.check_unreachable(&node);
+            }
+            if index_ready && matches!(node.kind(), FUNCTION_DECL | METHOD_DECL | PROPERTY_DECL) {
+                self.check_type_information(&node);
+            }
         }
         if index_ready && self.config.undefined_types {
             self.check_doc_types();
@@ -216,10 +320,180 @@ impl Checker<'_, '_> {
 
     // ------------------------------------------------------------------ types
 
+    /// Parameters / properties without declared, documented or inferable
+    /// type (Intelephense P1132).
+    fn check_type_information(&mut self, node: &SyntaxNode) {
+        if !self.config.type_errors || self.blade.is_some() {
+            return;
+        }
+        // members of anonymous classes usually implement an interface
+        let class_like = node
+            .ancestors()
+            .find(|n| matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL | ANON_CLASS));
+        if class_like.is_some_and(|c| c.kind() == ANON_CLASS) {
+            return;
+        }
+        let doc = ast::doc_comment(node).map(|d| php_hir::DocBlock::parse(d.text()));
+        let documented = |name: &str| {
+            doc.as_ref().is_some_and(|d| {
+                d.param(name).is_some_and(|t| !t.type_text.is_empty())
+                    || d.var(Some(name)).or_else(|| d.var(None)).is_some_and(|t| !t.type_text.is_empty())
+            })
+        };
+        if node.kind() == PROPERTY_DECL {
+            let Some(decl) = ast::PropertyDecl::cast(node.clone()) else { return };
+            if decl.ty().is_some() {
+                return;
+            }
+            for el in decl.elements() {
+                let (Some(var), Some(name)) = (el.variable(), el.name()) else { continue };
+                let has_default = el.syntax().children_with_tokens().any(|e| e.kind() == EQ);
+                if has_default || documented(&name) || self.inherited_member_type(node, &name, None) {
+                    continue;
+                }
+                self.push(Diagnostic::new(
+                    var.text_range(),
+                    Severity::Information,
+                    DiagnosticCode::NoTypeInformation,
+                    format!("Property ${name} has no type information available."),
+                ));
+            }
+            return;
+        }
+        let Some(params) = node.children().find_map(ast::ParamList::cast) else { return };
+        for p in params.params() {
+            let (Some(var), Some(name)) = (p.variable(), p.name()) else { continue };
+            if p.ty().is_some() || p.default_value().is_some() || documented(&name) {
+                continue;
+            }
+            if node.kind() == METHOD_DECL && self.inherited_member_type(node, &name, Some(node)) {
+                continue;
+            }
+            self.push(Diagnostic::new(
+                var.text_range(),
+                Severity::Information,
+                DiagnosticCode::NoTypeInformation,
+                format!("Parameter ${name} has no type information available."),
+            ));
+        }
+    }
+
+    /// Statements after `return` / `throw` / `exit` / `break` / `continue`
+    /// in the same block.
+    fn check_unreachable(&mut self, block: &SyntaxNode) {
+        let stmts: Vec<SyntaxNode> = block.children().filter(|c| is_statement(c.kind())).collect();
+        let Some(pos) = stmts.iter().position(terminates) else { return };
+        // declarations are hoisted, labels can be jumped to
+        let rest: Vec<&SyntaxNode> = stmts[pos + 1..]
+            .iter()
+            .take_while(|s| s.kind() != LABEL_STMT)
+            .filter(|s| {
+                !matches!(s.kind(), FUNCTION_DECL | CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL)
+            })
+            .collect();
+        let (Some(first), Some(last)) = (rest.first(), rest.last()) else { return };
+        let mut d = Diagnostic::new(
+            TextRange::new(first.text_range().start(), last.text_range().end()),
+            Severity::Hint,
+            DiagnosticCode::UnreachableCode,
+            "Unreachable code detected.".to_string(),
+        );
+        d.unnecessary = true;
+        self.push(d);
+    }
+
+    /// Methods whose parameters are given by an ancestor (overrides,
+    /// implementations) or that have no body.
+    fn signature_fixed(&self, scope: &SyntaxNode) -> bool {
+        if scope.kind() != METHOD_DECL {
+            return false;
+        }
+        if !scope.children().any(|c| c.kind() == BLOCK) {
+            return true;
+        }
+        let Some(class) = scope
+            .ancestors()
+            .find(|n| matches!(n.kind(), CLASS_DECL | TRAIT_DECL | ENUM_DECL | ANON_CLASS | INTERFACE_DECL))
+        else {
+            return true;
+        };
+        if matches!(class.kind(), ANON_CLASS | TRAIT_DECL | INTERFACE_DECL) {
+            return true;
+        }
+        let Some(fqn) = self.sema.class_fqn(&class) else { return true };
+        let Some(name) = scope.children().find_map(ast::MemberName::cast).and_then(|m| m.text()) else {
+            return true;
+        };
+        if name.starts_with("__") {
+            return true;
+        }
+        let index = self.sema.index();
+        if index.has_unknown_ancestor(&fqn) {
+            return true;
+        }
+        index
+            .ancestors(&fqn)
+            .into_iter()
+            .filter(|(_, c)| c.fqn != fqn)
+            .any(|(_, c)| c.method(&name).is_some())
+    }
+
+    /// Whether an ancestor declares a type for property `name` or (with
+    /// `method`) for the parameter `name` of the overridden method.
+    fn inherited_member_type(&self, node: &SyntaxNode, name: &str, method: Option<&SyntaxNode>) -> bool {
+        let Some(class) = node
+            .ancestors()
+            .find(|n| matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL))
+        else {
+            return false;
+        };
+        let Some(fqn) = self.sema.class_fqn(&class) else { return false };
+        let method_name =
+            method.and_then(|m| m.children().find_map(ast::MemberName::cast)).and_then(|m| m.text());
+        let index = self.sema.index();
+        index.ancestors(&fqn).into_iter().filter(|(_, c)| c.fqn != fqn).any(|(_, c)| match &method_name {
+            Some(m) => c
+                .method(m)
+                .and_then(|f| f.params.iter().find(|p| p.name == name))
+                .is_some_and(|p| p.ty.is_some() || p.doc_ty.is_some()),
+            None => c.properties.iter().any(|p| p.name == name && p.effective_type().is_some()),
+        })
+    }
+
+    /// `use Deprecated\Class;` is reported like Intelephense.
+    fn check_import_deprecation(&mut self, qn: &SyntaxNode, clause: &SyntaxNode) {
+        let decl = clause.ancestors().find(|a| a.kind() == USE_DECL);
+        let non_class = decl
+            .is_some_and(|d| d.children_with_tokens().any(|e| matches!(e.kind(), FUNCTION_KW | CONST_KW)));
+        if non_class || clause.first_child().as_ref() != Some(qn) {
+            return;
+        }
+        let mut name = ast::text_without_trivia(qn).trim_start_matches('\\').to_string();
+        if let Some(group) = clause.parent().filter(|p| p.kind() == USE_GROUP) {
+            if let Some(prefix) =
+                group.parent().and_then(|g| g.children().find(|c| c.kind() == QUALIFIED_NAME))
+            {
+                name = format!(
+                    "{}\\{name}",
+                    ast::text_without_trivia(&prefix).trim_start_matches('\\').trim_end_matches('\\')
+                );
+            }
+        }
+        let fqn = Fqn::new(&name);
+        if let Some((_, c)) = self.sema.index().class(&fqn) {
+            let deprecated = c.deprecated.clone();
+            self.deprecated(qn.text_range(), fqn.as_str(), deprecated.as_ref());
+        }
+    }
+
     fn check_class_ref(&mut self, qn: &SyntaxNode) {
         let Some(ctx) = qn.parent() else { return };
+        if ctx.kind() == USE_CLAUSE {
+            self.check_import_deprecation(qn, &ctx);
+            return;
+        }
         let is_class_ref = match ctx.kind() {
-            NAMED_TYPE | EXTENDS_CLAUSE | IMPLEMENTS_CLAUSE | CATCH_TYPES | TRAIT_USE => true,
+            NAMED_TYPE | EXTENDS_CLAUSE | IMPLEMENTS_CLAUSE | CATCH_TYPES | TRAIT_USE | ATTRIBUTE => true,
             NAME_EXPR => {
                 let Some(grand) = ctx.parent() else { return };
                 let first = grand.first_child().as_ref() == Some(&ctx);
@@ -247,7 +521,7 @@ impl Checker<'_, '_> {
             None => {
                 // `catch (Throwable)` in a namespace etc. resolve fine; only
                 // report names that are not declared anywhere
-                if self.config.undefined_types {
+                if self.config.undefined_types && !class_guarded(qn, &fqn) {
                     self.push(Diagnostic::new(
                         qn.text_range(),
                         Severity::Error,
@@ -337,13 +611,13 @@ impl Checker<'_, '_> {
                     .as_ref()
                     .is_some_and(|b| b.directives.iter().any(|(r, _)| *r == callee.text_range()));
                 if self.config.undefined_functions && !directive {
+                    // as Intelephense: the namespaced name
                     let name = self.sema.scope_at(callee.text_range().start()).resolve_function(&text);
-                    let shown = name.fallback.unwrap_or(name.name);
                     self.push(Diagnostic::new(
                         callee.text_range(),
                         Severity::Error,
                         DiagnosticCode::UndefinedFunction,
-                        format!("Call to unknown function: '{shown}'"),
+                        format!("Undefined function '{}'.", name.name),
                     ));
                 }
             }
@@ -404,6 +678,11 @@ impl Checker<'_, '_> {
             }
             return None;
         }
+        // closures may be bound to other objects (`Closure::bind`, `->call()`)
+        let this = lhs.kind() == VARIABLE_EXPR && ast::text_without_trivia(&lhs) == "$this";
+        if this && node.ancestors().any(|a| matches!(a.kind(), CLOSURE_EXPR | ARROW_FN_EXPR)) {
+            return None;
+        }
         let ty = self.sema.infer().expr_type(&lhs);
         // only check when every union member is a known class (or null)
         let mut classes = Vec::new();
@@ -460,6 +739,9 @@ impl Checker<'_, '_> {
         if found || !self.config.undefined_methods {
             return;
         }
+        if guarded_by(node, &["method_exists", "is_callable"], &name) {
+            return;
+        }
         let magic = if node.kind() == STATIC_CALL_EXPR { "__callStatic" } else { "__call" };
         if self.has_magic(&classes, magic)
             || node.kind() == STATIC_CALL_EXPR && self.has_magic(&classes, "__call")
@@ -493,7 +775,11 @@ impl Checker<'_, '_> {
                 }
             }
         }
-        if !self.config.undefined_properties || self.has_magic(&classes, "__get") {
+        if !self.config.undefined_properties
+            || self.has_magic(&classes, "__get")
+            || guarded_by(node, &["property_exists"], &name)
+            || coalesced(node)
+        {
             return;
         }
         // classes allowing dynamic properties
@@ -506,7 +792,10 @@ impl Checker<'_, '_> {
                             .any(|at| at.short().eq_ignore_ascii_case("AllowDynamicProperties"))
                 })
         });
-        if dynamic {
+        // interfaces declare no properties; implementations may (as Intelephense)
+        let interface =
+            classes.iter().any(|c| index.class(c).is_some_and(|(_, d)| d.kind == ClassLikeKind::Interface));
+        if dynamic || interface {
             return;
         }
         self.push(Diagnostic::new(
@@ -645,8 +934,8 @@ impl Checker<'_, '_> {
                     self.push(Diagnostic::new(
                         r.range,
                         Severity::Error,
-                        DiagnosticCode::UndefinedType,
-                        format!("Undefined type '{fqn}'."),
+                        DiagnosticCode::UndefinedDocType,
+                        format!("PHPDoc undefined type '{fqn}'."),
                     ));
                 }
             }
@@ -789,6 +1078,14 @@ impl Checker<'_, '_> {
                 Occ::Param => {
                     v.defs.push(scope.text_range().start());
                     v.param = true;
+                    // by-reference parameters are outputs
+                    let by_ref = parent
+                        .ancestors()
+                        .find(|a| a.kind() == PARAM)
+                        .is_some_and(|p| p.children_with_tokens().any(|e| e.kind() == AMP));
+                    if !by_ref {
+                        v.def_ranges.push(tok.text_range());
+                    }
                 }
                 Occ::DefAndRead => {
                     v.defs.push(tok.text_range().start());
@@ -827,7 +1124,9 @@ impl Checker<'_, '_> {
             }
             // template variables are often only used by included views
             let template = self.blade.is_some() && scope.kind() == SOURCE_FILE;
-            if self.config.unused_symbols && v.reads.is_empty() && !v.param && !template {
+            // unused parameters, except where a signature is given by an ancestor
+            let reportable = !v.param || !self.signature_fixed(scope);
+            if self.config.unused_symbols && v.reads.is_empty() && reportable && !template {
                 for r in &v.def_ranges {
                     let mut d = Diagnostic::new(
                         *r,
@@ -870,7 +1169,9 @@ impl Checker<'_, '_> {
                             _ => Occ::DefAndRead,
                         }
                     }
-                    FOREACH_VALUE | FOREACH_KEY | GLOBAL_STMT | STATIC_VAR => Occ::Def,
+                    FOREACH_VALUE | FOREACH_KEY | STATIC_VAR => Occ::Def,
+                    // writes to globals are visible outside
+                    GLOBAL_STMT => Occ::DefAndRead,
                     ARRAY_ELEMENT if is_destructuring(&p) => Occ::Def,
                     INDEX_EXPR if is_write_target(&p) && p.first_child().as_ref() == Some(&expr) => {
                         Occ::DefAndRead

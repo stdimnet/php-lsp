@@ -36,6 +36,7 @@ pub fn index_files(files: Vec<(String, Arc<str>, FileKind)>, opts: ExtractOption
     files
         .into_par_iter()
         .map(|(path, text, kind)| {
+            let opts = php_hir::ExtractOptions { stub: kind == FileKind::Stub, ..opts };
             let symbols = Arc::new(extract_symbols(&path, &text, opts));
             IndexedFile { path: path.into(), text, kind, symbols }
         })

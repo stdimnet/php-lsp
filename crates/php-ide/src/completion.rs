@@ -449,9 +449,7 @@ impl Cx<'_, '_> {
                 self.items.push(item);
             }
             for m in &members.methods {
-                if !self.visible(&m.owner.fqn, m.def.visibility, caller.as_ref())
-                    || m.def.name.starts_with("__") && !prefix.starts_with("__")
-                {
+                if !self.visible(&m.owner.fqn, m.def.visibility, caller.as_ref()) {
                     continue;
                 }
                 if !matches_prefix(&m.def.name, prefix)
@@ -459,7 +457,11 @@ impl Cx<'_, '_> {
                 {
                     continue;
                 }
-                let item = self.method_item(m.def, &m.owner.fqn, range);
+                let mut item = self.method_item(m.def, &m.owner.fqn, range);
+                // magic methods (`__construct`, `__toString`, ...) last, as Intelephense
+                if m.def.name.starts_with("__") {
+                    item.sort_text = Some(format!("9{}", m.def.name.to_ascii_lowercase()));
+                }
                 self.items.push(item);
             }
             // enum instances

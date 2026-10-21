@@ -124,7 +124,9 @@ pub(crate) fn goto_definition(sema: &Sema, offset: TextSize) -> Vec<Location> {
     // `include 'file.php'` could be resolved here in the future
     match classify(sema, offset) {
         Some((def, _)) => {
-            let mut locs = declarations(sema, &def, Some(offset));
+            // `$x` in a doc comment documents a parameter declared after it
+            let in_doc = sema.token_at(offset).is_some_and(|t| t.kind() == DOC_COMMENT);
+            let mut locs = declarations(sema, &def, if in_doc { None } else { Some(offset) });
             // for variables at their own declaration, still return it
             locs.dedup();
             locs

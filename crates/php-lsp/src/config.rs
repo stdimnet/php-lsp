@@ -143,6 +143,8 @@ impl ServerConfig {
                 ("diagnostics.deprecated", &mut d.deprecated),
                 ("diagnostics.argumentCount", &mut d.argument_count),
                 ("diagnostics.implementationErrors", &mut d.implementation_errors),
+                ("diagnostics.typeErrors", &mut d.type_errors),
+                ("diagnostics.unreachableCode", &mut d.unreachable_code),
             ] {
                 if let Some(v) = get(&root, key).and_then(Value::as_bool) {
                     *flag = v;

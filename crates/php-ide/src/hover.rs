@@ -127,7 +127,20 @@ pub(crate) fn render_definition(sema: &Sema, def: &Definition, offset: TextSize)
             s
         }
         Definition::Variable { name, .. } => {
-            let token = sema.token_at(offset)?;
+            let mut token = sema.token_at(offset)?;
+            if token.kind() == DOC_COMMENT {
+                // `@param T $x`: the declared parameter
+                let loc = crate::navigation::declarations(sema, def, None)
+                    .into_iter()
+                    .find(|l| l.file == sema.file)?;
+                token = match sema.root.covering_element(loc.range) {
+                    php_syntax::NodeOrToken::Token(t) => t,
+                    php_syntax::NodeOrToken::Node(n) => n
+                        .descendants_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .find(|t| t.kind() == VARIABLE && &t.text()[1..] == name)?,
+                };
+            }
             let node = token.parent()?;
             let ty = if node.kind() == VARIABLE_EXPR {
                 sema.infer().expr_type(&node)

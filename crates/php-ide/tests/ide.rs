@@ -318,9 +318,12 @@ function f(Ok $ok) {
         "P1012 Undefined class constant 'NOPE'.",
         "P1016 Cannot instantiate interface 'App\\Shape'.",
         "P1009 Undefined type 'App\\Nope'.",
-        "P1010 Call to unknown function: 'undefined_fn'",
+        "P1010 Undefined function 'App\\undefined_fn'.",
         "P1008 Undefined variable '$undefinedVar'.",
         "P1003 Symbol '$unused' is declared but not used.",
+        // unused parameters of `two()`
+        "P1003 Symbol '$a' is declared but not used.",
+        "P1003 Symbol '$b' is declared but not used.",
     ];
     for e in expected {
         assert!(d.iter().any(|x| x == e), "missing `{e}` in {d:#?}");
@@ -349,6 +352,8 @@ function g(Magic $m, Dyn $d, \stdClass $s) {
 }
 "#,
     );
+    // untyped magic method parameters only get the P1132 hint
+    let d: Vec<_> = d.into_iter().filter(|d| !d.starts_with("P1132")).collect();
     assert!(d.is_empty(), "{d:#?}");
 }
 
@@ -783,7 +788,7 @@ fn phpdoc_type_references() {
     );
     // undefined types in docs
     let d: Vec<String> = ws.diagnostics(id).into_iter().map(|d| d.message).collect();
-    assert_eq!(d, vec!["Undefined type 'App\\Nope'."]);
+    assert_eq!(d, vec!["PHPDoc undefined type 'App\\Nope'."]);
 }
 
 #[test]
@@ -946,4 +951,91 @@ fn blade_structure() {
     assert_eq!(&kw[..5], &["@extends", "@section", "@section", "@foreach", "{{"]);
     let tokens = ws.semantic_tokens(id, None);
     assert!(tokens.windows(2).all(|w| w[0].range.start() <= w[1].range.start()));
+}
+
+/// Differences found by comparing with Intelephense (editors/compare).
+#[test]
+fn intelephense_parity() {
+    let classes = "class Token { public string $text = ''; }\nabstract class Stmt {}\nclass ClassMethod extends Stmt { public string $name = ''; }\ninterface Node {}\n";
+    // element of a typed array with an expression index
+    assert_eq!(
+        type_at(&format!("<?php\n{classes}/** @param Token[] $tokens */\nfunction f(array $tokens, int $i) {{ $tokens[$i + 1]<|>; }}\n")),
+        "Token"
+    );
+    // narrowing on the right of `&&` in a foreach over a typed property
+    let d = diags(&format!("<?php\n{classes}class C {{\n  /** @var Stmt[] */\n  public array $stmts = [];\n  function f() {{\n    foreach ($this->stmts as $stmt) {{\n      if ($stmt instanceof ClassMethod && $stmt->name === 'x') {{ return $stmt; }}\n    }}\n  }}\n}}\n"));
+    assert!(d.is_empty(), "{d:?}");
+    // properties on interfaces are not reported (implementations may declare them)
+    let d = diags(&format!("<?php\n{classes}function g(Node $n) {{ return $n->foo; }}\n"));
+    assert!(d.is_empty(), "{d:?}");
+    // parameter types documented on the overridden method
+    assert_eq!(
+        type_at(&format!("<?php\n{classes}abstract class E {{ /** @param Token[] $tokens */ abstract function emulate(array $tokens); }}\nclass F extends E {{ function emulate(array $tokens) {{ $tokens[0]<|>; }} }}\n")),
+        "Token"
+    );
+    // `$name` in `@param` refers to the parameter
+    let f = fixture("<?php\nclass Token {}\nclass K {\n  /** @param Token $to<|>ken the token */\n  function f($token) {}\n}\n");
+    let defs = f.ws.goto_definition(f.file, f.offset);
+    assert_eq!(defs.len(), 1);
+    assert!(f.ws.hover(f.file, f.offset).unwrap().markdown.contains("Token"));
+    // no type information (P1132): not for typed, documented, defaulted or inherited
+    let d = diags(&format!("<?php\n{classes}abstract class P {{ abstract function m(int $a); /** @var int */ public $p; }}\nclass Q extends P {{\n  public $p;\n  public $u;\n  public $w = 1;\n  /** @param int $b */\n  function m($a, $b = 1, $c = null) {{}}\n  function n($d) {{}}\n}}\n"));
+    assert_eq!(
+        d,
+        vec![
+            "P1132 Property $u has no type information available.",
+            "P1003 Symbol '$d' is declared but not used.",
+            "P1132 Parameter $d has no type information available."
+        ]
+    );
+    // stub functions documented `@since 8.5` do not exist for PHP 8.4
+    let mut ws = Workspace::new(Config { php_version: php_ide::PhpVersion::new(8, 4), ..Config::default() });
+    ws.load_stubs();
+    let id = ws.set_file("file:///v.php", "<?php\nget_exception_handler();\nstrlen('');\n".into());
+    let d: Vec<String> = ws.diagnostics(id).into_iter().map(|d| d.message).collect();
+    assert_eq!(d, vec!["Undefined function 'get_exception_handler'."]);
+    // trait method aliases
+    let d = diags("<?php\ntrait R { function many(): int { return 1; } }\nclass S { use R { many as private manyAlias; } function f() { return $this->manyAlias(); } }\n");
+    assert!(d.is_empty(), "{d:?}");
+    // guarded by method_exists / property_exists
+    let d = diags("<?php\nclass N {}\nfunction h(N $n) { if (method_exists($n, 'via')) { $n->via(); } return property_exists($n, 'p') ? $n->p : null; }\n");
+    assert!(d.is_empty(), "{d:?}");
+    // unused parameters (not of overriding methods, by-ref or promoted ones)
+    let d = diags("<?php\nfunction k(int $unused) { return array_map(function (int $a, int $b) { return $a; }, [1], [2]); }\nabstract class B0 { function o(int $x) { return $x; } }\nclass B1 extends B0 { function __construct(private int $p, int &$r) {} function o(int $x) { return 1; } }\n");
+    assert_eq!(
+        d,
+        vec![
+            "P1003 Symbol '$unused' is declared but not used.",
+            "P1003 Symbol '$b' is declared but not used."
+        ]
+    );
+    // imported functions that do not exist
+    let d = diags("<?php\nnamespace A;\nuse function Lib\\select;\nselect();\n");
+    assert_eq!(d, vec!["P1010 Undefined function 'Lib\\select'."]);
+    // unreachable code
+    let d = diags("<?php\nfunction u(int $x) { if ($x) { return 1; echo 2; echo 3; } switch ($x) { case 1: break; echo 4; } throw new \\Exception(); function later() {} }\n");
+    assert_eq!(d, vec!["P1108 Unreachable code detected."; 2]);
+    // optional dependencies, `??`, `$this` in (re-bindable) closures
+    let d = diags("<?php\nclass M { function f(M $m) {\n  if (class_exists(\\Opt\\Dep::class)) { \\Opt\\Dep::run(); }\n  $g = $m->group ?? null;\n  $c = fn () => $this->enabled;\n  return [$g, $c];\n} }\n");
+    assert!(d.is_empty(), "{d:?}");
+    // deprecated imports
+    let d = diags("<?php\nnamespace Old { /** @deprecated use New */ class Cache {} }\nnamespace App { use Old\\Cache; use function strlen; }\n");
+    assert_eq!(
+        d,
+        vec![
+            "P1007 'Old\\Cache' is deprecated. use New",
+            "P1003 Symbol 'Old\\Cache' is declared but not used.",
+            "P1003 Symbol 'strlen' is declared but not used."
+        ]
+    );
+    // attribute classes
+    let d = diags(
+        "<?php\nnamespace A;\nuse Sym\\AsCommand;\n#[AsCommand('x'), \\Attribute, \\Override]\nclass C {}\n",
+    );
+    assert_eq!(d, vec!["P1009 Undefined type 'Sym\\AsCommand'."]);
+    // `Foo::CONST_*` in PHPDoc is a constant pattern, not a class
+    let d = diags(&format!(
+        "<?php\n{classes}class U {{ const TYPE_A = 1; /** @var U::TYPE_* */ public int $t = 1; }}\n"
+    ));
+    assert!(d.is_empty(), "{d:?}");
 }

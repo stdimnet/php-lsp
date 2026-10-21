@@ -139,6 +139,8 @@ pub struct ClassDef {
     /// `implements` of a class/enum, `extends` of an interface.
     pub interfaces: Vec<Fqn>,
     pub traits: Vec<Fqn>,
+    /// `use T { method as alias; }`: (method, trait, alias).
+    pub trait_aliases: Vec<(String, Option<Fqn>, String)>,
     pub methods: Vec<FunctionDef>,
     pub properties: Vec<PropertyDef>,
     pub constants: Vec<ClassConstDef>,
@@ -193,6 +195,14 @@ pub struct FileSymbols {
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractOptions {
     pub php_version: PhpVersion,
+    /// The file is a phpstorm stub: `@since 8.x` limits availability.
+    pub stub: bool,
+}
+
+impl ExtractOptions {
+    pub fn new(php_version: PhpVersion) -> Self {
+        ExtractOptions { php_version, stub: false }
+    }
 }
 
 /// Prefer a PHPDoc type over the declared one when it is more precise.
@@ -229,19 +239,21 @@ impl Cx<'_> {
         for child in node.children() {
             match child.kind() {
                 FUNCTION_DECL => {
-                    if available(&child, self.opts.php_version) {
+                    if available_in(&child, self.opts) {
                         if let Some(f) = self.function(&child) {
                             self.out.functions.push(f);
                         }
                     }
+                    self.nested_defines(&child);
                 }
                 CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL => {
-                    if available(&child, self.opts.php_version) {
+                    if available_in(&child, self.opts) {
                         let c = ClassLike::cast(child.clone()).unwrap();
                         if let Some(c) = self.class(&c) {
                             self.out.classes.push(c);
                         }
                     }
+                    self.nested_defines(&child);
                 }
                 CONST_DECL => self.consts(&child),
                 CALL_EXPR => {
@@ -315,7 +327,7 @@ impl Cx<'_> {
     ) -> Vec<ParamDef> {
         let Some(list) = list else { return Vec::new() };
         list.params()
-            .filter(|p| available(p.syntax(), self.opts.php_version))
+            .filter(|p| available_in(p.syntax(), self.opts))
             .filter_map(|p| {
                 let name = p.name()?;
                 let mut ty = p.ty().map(|t| tr.syntax_type(&t));
@@ -393,6 +405,7 @@ impl Cx<'_> {
             parent,
             interfaces,
             traits: Vec::new(),
+            trait_aliases: Vec::new(),
             methods: Vec::new(),
             properties: Vec::new(),
             constants: Vec::new(),
@@ -422,7 +435,7 @@ impl Cx<'_> {
 
         if let Some(members) = c.member_list() {
             for m in members.members() {
-                if !available(m.syntax(), self.opts.php_version) {
+                if !available_in(m.syntax(), self.opts) {
                     continue;
                 }
                 self.member(&m, &mut def, &tr);
@@ -565,6 +578,21 @@ impl Cx<'_> {
             }
             Member::TraitUse(t) => {
                 def.traits.extend(t.names().map(|n| class_tr.scope.resolve_class(&n.text())));
+                let aliases = t.syntax().descendants().filter(|n| n.kind() == TRAIT_ALIAS);
+                for alias in aliases {
+                    let names: Vec<String> = alias
+                        .children()
+                        .filter(|c| c.kind() == MEMBER_NAME)
+                        .map(|c| ast::text_without_trivia(&c))
+                        .collect();
+                    if let [method, new_name] = names.as_slice() {
+                        let tr = alias
+                            .children()
+                            .find(|c| c.kind() == QUALIFIED_NAME)
+                            .map(|q| class_tr.scope.resolve_class(&ast::text_without_trivia(&q)));
+                        def.trait_aliases.push((method.clone(), tr, new_name.clone()));
+                    }
+                }
             }
         }
     }
@@ -650,6 +678,14 @@ impl Cx<'_> {
             });
         }
         self.out.constants.extend(defs);
+    }
+
+    /// `define()` calls inside function / method bodies (constants are global
+    /// however they are defined, e.g. WordPress' `wp_initial_constants()`).
+    fn nested_defines(&mut self, node: &SyntaxNode) {
+        for call in node.descendants().filter(|n| n.kind() == CALL_EXPR) {
+            self.define(&call);
+        }
     }
 
     /// `define('NAME', value)` – names are always global or fully qualified.
@@ -838,7 +874,28 @@ fn string_value(node: &SyntaxNode) -> Option<String> {
     Some(s[1..s.len().saturating_sub(1)].to_string())
 }
 
-/// Evaluates `#[PhpStormStubsElementAvailable(from: 'x', to: 'y')]`.
+/// Evaluates `#[PhpStormStubsElementAvailable(from: 'x', to: 'y')]` and, in
+/// stubs, `@since 8.5` doc tags.
+fn available_in(node: &SyntaxNode, opts: ExtractOptions) -> bool {
+    if opts.stub {
+        if let Some(doc) = ast::doc_comment(node) {
+            for line in doc.text().lines() {
+                let Some(rest) = line.split("@since").nth(1) else { continue };
+                let v = rest.split_whitespace().next().unwrap_or("");
+                // only PHP versions (extensions document their own versions)
+                if v.starts_with(['5', '7', '8']) && v.contains('.') && !rest.contains("PECL") {
+                    if let Ok(since) = v.parse::<PhpVersion>() {
+                        if opts.php_version < since {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    available(node, opts.php_version)
+}
+
 fn available(node: &SyntaxNode, version: PhpVersion) -> bool {
     for (name, attr) in attributes(node) {
         if name != "PhpStormStubsElementAvailable" {
@@ -932,7 +989,7 @@ mod tests {
     fn extract_text(text: &str, version: PhpVersion) -> FileSymbols {
         let file = parse(text, PhpVersion::LATEST).tree();
         let scopes = FileScopes::build(&file);
-        extract(&file, &scopes, ExtractOptions { php_version: version })
+        extract(&file, &scopes, ExtractOptions::new(version))
     }
 
     #[test]
