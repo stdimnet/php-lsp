@@ -441,11 +441,12 @@ pub(crate) fn virtual_php(text: &str) -> Blade {
         String::from_utf8(b.out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     // terminate the last statement without changing the length: on the final
     // whitespace character (offsets stay identical to the template)
-    if !text.trim_end().ends_with(';') && !text.trim_end().ends_with("*/") {
-        if text.ends_with(char::is_whitespace) {
-            let last = text.char_indices().last().map(|(i, _)| i).unwrap_or(0);
-            text.replace_range(last.., ";");
-        }
+    if !text.trim_end().ends_with(';')
+        && !text.trim_end().ends_with("*/")
+        && text.ends_with(char::is_whitespace)
+    {
+        let last = text.char_indices().last().map(|(i, _)| i).unwrap_or(0);
+        text.replace_range(last.., ";");
     }
     Blade { text, regions: b.regions, directives: b.directives, delimiters: b.delimiters }
 }
