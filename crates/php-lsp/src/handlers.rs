@@ -28,6 +28,7 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         PrepareRenameRequest::METHOD => handle(s, req, prepare_rename),
         Rename::METHOD => handle(s, req, rename),
         DocumentLinkRequest::METHOD => handle(s, req, document_links),
+        LinkedEditingRange::METHOD => handle(s, req, linked_editing_range),
         WillRenameFiles::METHOD => handle(s, req, will_rename_files),
         CodeActionRequest::METHOD => handle(s, req, code_action),
         CallHierarchyPrepare::METHOD => handle(s, req, call_hierarchy_prepare),
@@ -531,6 +532,19 @@ fn rename(s: &mut Server, p: lsp::RenameParams) -> Option<lsp::WorkspaceEdit> {
             None
         }
     }
+}
+
+fn linked_editing_range(
+    s: &mut Server,
+    p: lsp::LinkedEditingRangeParams,
+) -> Option<lsp::LinkedEditingRanges> {
+    let (id, offset) = position(s, &p.text_document_position_params)?;
+    let index = s.workspace.line_index(id)?;
+    let ranges = s.workspace.linked_editing_ranges(id, offset)?;
+    Some(lsp::LinkedEditingRanges {
+        ranges: ranges.into_iter().map(|r| convert::range(&index, s.encoding, r)).collect(),
+        word_pattern: Some("[A-Za-z][A-Za-z0-9:._-]*".into()),
+    })
 }
 
 fn document_links(s: &mut Server, p: lsp::DocumentLinkParams) -> Option<Vec<lsp::DocumentLink>> {

@@ -957,6 +957,7 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             work_done_progress_options: Default::default(),
             resolve_provider: Some(false),
         })),
+        linked_editing_range_provider: Some(lsp::LinkedEditingRangeServerCapabilities::Simple(true)),
         document_link_provider: Some(lsp::DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -979,7 +980,7 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
         )),
         completion_provider: Some(lsp::CompletionOptions {
             trigger_characters: Some(
-                ["$", ">", ":", "\\", "@", "#", "["].iter().map(|s| s.to_string()).collect(),
+                ["$", ">", ":", "\\", "@", "#", "[", "<", "/"].iter().map(|s| s.to_string()).collect(),
             ),
             resolve_provider: Some(false),
             ..Default::default()

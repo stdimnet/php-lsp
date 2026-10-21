@@ -23,6 +23,7 @@ mod doc_types;
 mod folding;
 mod hierarchy;
 mod hover;
+mod html;
 mod indexer;
 mod infer;
 mod inlay_hints;
@@ -404,6 +405,11 @@ impl Workspace {
         sema::Sema::new(self, id)
             .map(|s| navigation::references(&s, offset, include_declaration))
             .unwrap_or_default()
+    }
+
+    /// Opening and closing tag names of the HTML element at `offset`.
+    pub fn linked_editing_ranges(&self, id: FileId, offset: TextSize) -> Option<Vec<TextRange>> {
+        html::linked_editing_ranges(&self.parse(id)?.syntax_node(), offset)
     }
 
     /// Occurrences of the symbol at `offset` in the same file.

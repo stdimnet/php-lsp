@@ -824,3 +824,26 @@ fn document_links_and_file_rename() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn html_in_templates() {
+    let labels = |text: &str| completion_labels(text);
+    assert!(labels("<div><sp<|>").contains(&"span".to_string()));
+    let attrs = labels("<?php $x = 1; ?>\n<a class=\"<?= $x ?>\" hr<|>");
+    assert!(attrs.contains(&"href".to_string()) && attrs.contains(&"class".to_string()), "{attrs:?}");
+    assert_eq!(labels("<ul><li><?php echo 1; ?></li></<|>"), vec!["ul".to_string()]);
+    assert_eq!(labels("<script>if (a < b) {}</script><p></<|>"), vec!["p".to_string()]);
+    assert!(labels("<a href=\"x<|>\">").is_empty());
+
+    let Fixture { ws, file, offset } =
+        fixture("<div class=\"a\">\n  <br><di<|>v>x</div>\n<?php if ($a): ?></div><?php endif; ?>\n</div>\n");
+    let text = ws.file(file).unwrap().text.to_string();
+    let ranges = ws.linked_editing_ranges(file, offset).unwrap();
+    let names: Vec<_> = ranges
+        .iter()
+        .map(|r| (&text[usize::from(r.start())..usize::from(r.end())], usize::from(r.start())))
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert_eq!(names[0].0, "div");
+    assert_eq!(names[1], ("div", text.find("x</div>").unwrap() + 3));
+}

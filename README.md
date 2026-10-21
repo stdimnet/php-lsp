@@ -103,13 +103,16 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
 - [x] **Phase 2, semantics & index:** name resolution, PHPDoc, background workspace
   indexing, phpstorm-stubs, hover, definition / type definition / implementation,
   references, document highlights, workspace symbols, completion with auto import,
-  signature help, file watching (on-disk index cache and Composer/PSR-4 still open)
+  signature help, file watching, Composer/PSR-4 (12.5k files index in ~1.3 s, so there is
+  no on-disk cache)
 - [x] **Phase 3, types & diagnostics:** type inference (generics via `@template`, array
   shapes, narrowing), undefined symbol / argument count / implementation / deprecation /
   unused diagnostics, inlay hints, semantic tokens, highlights
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
-  hierarchy, code lens, PHPDoc completion
+  hierarchy, code lens, PHPDoc completion, document links (`include`/`require`, URLs),
+  file rename → class rename + PSR-4 namespace update (`workspace/willRenameFiles`),
+  HTML in templates (tag / attribute / closing tag completion, linked editing of tag names)
 - [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
   `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher
 - [x] **Phase 6, extras:** extract variable / method / constant, inline variable,

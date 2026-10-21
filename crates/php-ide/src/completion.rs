@@ -56,7 +56,7 @@ pub struct CompletionItem {
 }
 
 impl CompletionItem {
-    fn new(label: impl Into<String>, kind: CompletionKind, range: TextRange) -> CompletionItem {
+    pub(crate) fn new(label: impl Into<String>, kind: CompletionKind, range: TextRange) -> CompletionItem {
         let label = label.into();
         CompletionItem {
             insert_text: label.clone(),
@@ -275,7 +275,12 @@ impl Cx<'_, '_> {
                 self.string_values(&left);
                 return;
             }
-            ENCAPSED_TEXT | COMMENT | INLINE_HTML | HEREDOC_START => return,
+            INLINE_HTML => {
+                self.items = crate::html::completions(root, self.offset).unwrap_or_default();
+                return;
+            }
+            // `<` / `/` are trigger characters for HTML only
+            ENCAPSED_TEXT | COMMENT | HEREDOC_START | SLASH | LT => return,
             _ => {}
         }
         // the identifier being typed (prefix) and its range
