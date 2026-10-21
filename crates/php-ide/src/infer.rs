@@ -1,0 +1,967 @@
+//! Local type inference for expressions and variables.
+
+use std::cell::Cell;
+
+use php_hir::phpdoc::DocBlock;
+use php_hir::symbols::{FunctionDef, TypeResolver};
+use php_hir::{Fqn, Type};
+use php_syntax::ast::{self, AstNode};
+use php_syntax::{SyntaxKind, SyntaxKind::*, SyntaxNode, TextSize};
+
+use crate::sema::Sema;
+
+const MAX_DEPTH: u32 = 40;
+
+pub(crate) fn is_expr(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        LITERAL
+            | INTERPOLATED_STRING
+            | HEREDOC
+            | SHELL_EXEC
+            | VARIABLE_EXPR
+            | DYNAMIC_VARIABLE_EXPR
+            | NAME_EXPR
+            | ARRAY_EXPR
+            | LIST_EXPR
+            | CALL_EXPR
+            | NEW_EXPR
+            | PROPERTY_FETCH_EXPR
+            | METHOD_CALL_EXPR
+            | STATIC_PROPERTY_FETCH_EXPR
+            | STATIC_CALL_EXPR
+            | CLASS_CONST_FETCH_EXPR
+            | INDEX_EXPR
+            | BIN_EXPR
+            | PREFIX_EXPR
+            | POSTFIX_EXPR
+            | ASSIGN_EXPR
+            | TERNARY_EXPR
+            | CAST_EXPR
+            | PAREN_EXPR
+            | CLOSURE_EXPR
+            | ARROW_FN_EXPR
+            | MATCH_EXPR
+            | ISSET_EXPR
+            | EMPTY_EXPR
+            | EVAL_EXPR
+            | INCLUDE_EXPR
+            | EXIT_EXPR
+            | PRINT_EXPR
+            | CLONE_EXPR
+            | INSTANCEOF_EXPR
+            | YIELD_EXPR
+            | YIELD_FROM_EXPR
+            | THROW_EXPR
+            | MAGIC_CONST_EXPR
+    )
+}
+
+pub(crate) struct Infer<'s, 'a> {
+    sema: &'s Sema<'a>,
+    depth: Cell<u32>,
+}
+
+/// Child expression nodes of `node`.
+fn expr_children(node: &SyntaxNode) -> impl Iterator<Item = SyntaxNode> {
+    node.children().filter(|c| is_expr(c.kind()))
+}
+
+fn literal_type(text: &str) -> Type {
+    let t = text.trim();
+    if t.starts_with('\'') || t.starts_with('"') || t.starts_with("<<<") {
+        Type::String
+    } else if t.eq_ignore_ascii_case("true") {
+        Type::True
+    } else if t.eq_ignore_ascii_case("false") {
+        Type::False
+    } else if t.eq_ignore_ascii_case("null") {
+        Type::Null
+    } else if t.starts_with('[') || t.to_ascii_lowercase().starts_with("array(") {
+        Type::Array(None, None)
+    } else if t.parse::<i64>().is_ok() || t.starts_with("0x") || t.starts_with("0b") {
+        Type::Int
+    } else if t.parse::<f64>().is_ok() {
+        Type::Float
+    } else {
+        Type::Mixed
+    }
+}
+
+impl<'s, 'a> Infer<'s, 'a> {
+    pub fn new(sema: &'s Sema<'a>) -> Self {
+        Infer { sema, depth: Cell::new(0) }
+    }
+
+    /// Infers the type of an expression. `self`/`static`/`parent` are resolved.
+    pub fn expr_type(&self, node: &SyntaxNode) -> Type {
+        if self.depth.get() > MAX_DEPTH {
+            return Type::Mixed;
+        }
+        self.depth.set(self.depth.get() + 1);
+        let t = self.expr_type_inner(node);
+        self.depth.set(self.depth.get() - 1);
+        t
+    }
+
+    fn self_class(&self, node: &SyntaxNode) -> Option<Fqn> {
+        self.sema.enclosing_class(node)
+    }
+
+    fn resolve_rel(&self, t: &Type, owner: Option<&Fqn>, receiver: Option<&Fqn>) -> Type {
+        let parent = owner.and_then(|o| self.sema.index().parent_of(o));
+        t.resolve_relative(owner, receiver.or(owner), parent.as_ref())
+    }
+
+    fn expr_type_inner(&self, node: &SyntaxNode) -> Type {
+        match node.kind() {
+            LITERAL => match node.first_token().map(|t| t.kind()) {
+                Some(INT_NUMBER) => Type::Int,
+                Some(FLOAT_NUMBER) => Type::Float,
+                Some(STRING) | Some(IDENT) => Type::String,
+                _ => Type::Mixed,
+            },
+            INTERPOLATED_STRING | HEREDOC | SHELL_EXEC => Type::String,
+            MAGIC_CONST_EXPR => {
+                if node.first_token().is_some_and(|t| t.kind() == LINE_C_KW) {
+                    Type::Int
+                } else {
+                    Type::String
+                }
+            }
+            VARIABLE_EXPR => {
+                let Some(name) = ast::VariableExpr::cast(node.clone()).and_then(|v| v.name()) else {
+                    return Type::Mixed;
+                };
+                if name == "this" {
+                    return self.self_class(node).map(|c| Type::Named(c, Vec::new())).unwrap_or(Type::Object);
+                }
+                self.variable_type(&name, node)
+            }
+            PAREN_EXPR | CLONE_EXPR => {
+                expr_children(node).next().map(|e| self.expr_type(&e)).unwrap_or(Type::Mixed)
+            }
+            ASSIGN_EXPR => {
+                let op = node
+                    .children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .find(|t| t.kind().is_assign_op());
+                match op.map(|t| t.kind()) {
+                    Some(DOT_EQ) => Type::String,
+                    Some(EQ) | Some(QUESTION2_EQ) | None => {
+                        expr_children(node).nth(1).map(|e| self.expr_type(&e)).unwrap_or(Type::Mixed)
+                    }
+                    _ => Type::union(vec![Type::Int, Type::Float]),
+                }
+            }
+            NEW_EXPR => {
+                if let Some(anon) = node.children().find(|c| c.kind() == ANON_CLASS) {
+                    let ext =
+                        anon.children().find_map(ast::ExtendsClause::cast).and_then(|e| e.names().next());
+                    return match ext {
+                        Some(n) => Type::Named(
+                            self.sema.scope_at(n.syntax().text_range().start()).resolve_class(&n.text()),
+                            Vec::new(),
+                        ),
+                        None => Type::Object,
+                    };
+                }
+                let Some(class) = node.children().find(|c| c.kind() != ARG_LIST) else { return Type::Object };
+                if class.kind() == NAME_EXPR {
+                    let text = ast::text_without_trivia(&class);
+                    return self
+                        .sema
+                        .resolve_class_name(&text, &class)
+                        .map(|c| Type::Named(c, Vec::new()))
+                        .unwrap_or(Type::Object);
+                }
+                // `new $class` with `$class` a class-string
+                let t = self.expr_type(&class);
+                let mut out = Vec::new();
+                for m in t.members() {
+                    match m {
+                        Type::ClassString(Some(inner)) => out.push((**inner).clone()),
+                        Type::Named(..) => out.push(m.clone()),
+                        _ => {}
+                    }
+                }
+                if out.is_empty() {
+                    Type::Object
+                } else {
+                    Type::union(out)
+                }
+            }
+            ARRAY_EXPR => self.array_type(node),
+            NAME_EXPR => {
+                let text = ast::text_without_trivia(node);
+                match text.to_ascii_lowercase().trim_start_matches('\\') {
+                    "true" => Type::True,
+                    "false" => Type::False,
+                    "null" => Type::Null,
+                    _ => match self.sema.resolve_constant(&text, node.text_range().start()) {
+                        Some((_, c)) => c.value.as_deref().map(literal_type).unwrap_or(Type::Mixed),
+                        None => Type::Mixed,
+                    },
+                }
+            }
+            CALL_EXPR => self.call_type(node),
+            METHOD_CALL_EXPR | STATIC_CALL_EXPR => self.method_call_type(node),
+            PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR => self.property_type(node),
+            CLASS_CONST_FETCH_EXPR => self.class_const_type(node),
+            INDEX_EXPR => {
+                let mut children = expr_children(node);
+                let Some(base) = children.next() else { return Type::Mixed };
+                let key = children.next().and_then(|k| {
+                    let t = k.first_token()?;
+                    if k.kind() == LITERAL && t.kind() == STRING {
+                        let s = t.text();
+                        Some(s[1..s.len().saturating_sub(1)].to_string())
+                    } else if k.kind() == LITERAL {
+                        Some(t.text().to_string())
+                    } else {
+                        None
+                    }
+                });
+                let base_ty = self.expr_type(&base);
+                if base_ty == Type::String {
+                    return Type::String;
+                }
+                // ArrayAccess objects: offsetGet()
+                for c in base_ty.class_names() {
+                    if let Some(m) = self.sema.index().find_method(&c, "offsetGet") {
+                        if let Some(t) = m.def.effective_return_type() {
+                            if !t.is_mixed() {
+                                return self.resolve_rel(&t, Some(&m.owner.fqn), Some(&c));
+                            }
+                        }
+                    }
+                }
+                base_ty.index(key.as_deref()).unwrap_or(Type::Mixed)
+            }
+            TERNARY_EXPR => {
+                let parts: Vec<SyntaxNode> = expr_children(node).collect();
+                match parts.len() {
+                    3 => Type::union(vec![self.expr_type(&parts[1]), self.expr_type(&parts[2])]),
+                    2 => {
+                        Type::union(vec![self.expr_type(&parts[0]).without_null(), self.expr_type(&parts[1])])
+                    }
+                    _ => Type::Mixed,
+                }
+            }
+            BIN_EXPR => {
+                let op = node
+                    .children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .find(|t| !t.kind().is_trivia())
+                    .map(|t| t.kind());
+                let parts: Vec<SyntaxNode> = expr_children(node).collect();
+                match op {
+                    Some(QUESTION2) if parts.len() == 2 => {
+                        Type::union(vec![self.expr_type(&parts[0]).without_null(), self.expr_type(&parts[1])])
+                    }
+                    Some(DOT) => Type::String,
+                    Some(PLUS | MINUS | STAR | STAR2 | PERCENT) => {
+                        let tys: Vec<Type> = parts.iter().map(|p| self.expr_type(p)).collect();
+                        if tys.iter().all(|t| *t == Type::Int) {
+                            Type::Int
+                        } else if tys.contains(&Type::Float) {
+                            Type::Float
+                        } else if op == Some(PLUS) && tys.iter().all(|t| t.iterable_value().is_some()) {
+                            tys[0].clone()
+                        } else {
+                            Type::union(vec![Type::Int, Type::Float])
+                        }
+                    }
+                    Some(SLASH) => Type::union(vec![Type::Int, Type::Float]),
+                    Some(AMP | PIPE | CARET | SHL | SHR) => Type::Int,
+                    Some(SPACESHIP) => Type::Int,
+                    Some(PIPE_GT) => Type::Mixed,
+                    _ => Type::Bool,
+                }
+            }
+            INSTANCEOF_EXPR | ISSET_EXPR | EMPTY_EXPR => Type::Bool,
+            PREFIX_EXPR => {
+                let op = node.first_token().map(|t| t.kind());
+                let inner = expr_children(node).next();
+                match op {
+                    Some(BANG) => Type::Bool,
+                    Some(AT) | Some(AMP) => inner.map(|e| self.expr_type(&e)).unwrap_or(Type::Mixed),
+                    Some(TILDE) => Type::Int,
+                    _ => match inner.map(|e| self.expr_type(&e)) {
+                        Some(Type::Int) => Type::Int,
+                        Some(Type::Float) => Type::Float,
+                        _ => Type::union(vec![Type::Int, Type::Float]),
+                    },
+                }
+            }
+            POSTFIX_EXPR => expr_children(node).next().map(|e| self.expr_type(&e)).unwrap_or(Type::Int),
+            CAST_EXPR => {
+                let cast = node.first_token().map(|t| t.text().to_ascii_lowercase()).unwrap_or_default();
+                let cast: String = cast.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+                match cast.as_str() {
+                    "int" | "integer" => Type::Int,
+                    "bool" | "boolean" => Type::Bool,
+                    "float" | "double" | "real" => Type::Float,
+                    "string" | "binary" => Type::String,
+                    "array" => Type::Array(None, None),
+                    "object" => Type::named("stdClass"),
+                    "unset" => Type::Null,
+                    _ => Type::Mixed,
+                }
+            }
+            CLOSURE_EXPR | ARROW_FN_EXPR => {
+                let ret = node
+                    .children()
+                    .find_map(ast::ReturnType::cast)
+                    .and_then(|r| r.ty())
+                    .map(|t| self.syntax_type(&t, node));
+                let params = node
+                    .children()
+                    .find_map(ast::ParamList::cast)
+                    .map(|pl| {
+                        pl.params()
+                            .map(|p| p.ty().map(|t| self.syntax_type(&t, node)).unwrap_or(Type::Mixed))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ret = ret.or_else(|| {
+                    if node.kind() == ARROW_FN_EXPR {
+                        node.children().filter(|c| is_expr(c.kind())).last().map(|b| self.expr_type(&b))
+                    } else {
+                        None
+                    }
+                });
+                Type::Closure(params, ret.map(Box::new))
+            }
+            MATCH_EXPR => {
+                let arms: Vec<Type> = node
+                    .children()
+                    .filter(|c| c.kind() == MATCH_ARM)
+                    .filter_map(|arm| expr_children(&arm).last())
+                    .map(|e| self.expr_type(&e))
+                    .collect();
+                if arms.is_empty() {
+                    Type::Mixed
+                } else {
+                    Type::union(arms)
+                }
+            }
+            PRINT_EXPR => Type::Int,
+            EXIT_EXPR | THROW_EXPR => Type::Never,
+            _ => Type::Mixed,
+        }
+    }
+
+    fn array_type(&self, node: &SyntaxNode) -> Type {
+        let mut values = Vec::new();
+        let mut shape = Vec::new();
+        let mut all_string_keys = true;
+        let mut any = false;
+        for el in node.children().filter(|c| c.kind() == ARRAY_ELEMENT).take(50) {
+            any = true;
+            let parts: Vec<SyntaxNode> = expr_children(&el).collect();
+            let has_key = el.children_with_tokens().any(|e| e.kind() == FAT_ARROW);
+            match (has_key, parts.as_slice()) {
+                (true, [k, v]) => {
+                    let vt = self.expr_type(v);
+                    let key = (k.kind() == LITERAL)
+                        .then(|| k.first_token())
+                        .flatten()
+                        .filter(|t| t.kind() == STRING)
+                        .map(|t| t.text()[1..t.text().len().saturating_sub(1)].to_string());
+                    match key {
+                        Some(key) => {
+                            shape.push(php_hir::types::ShapeEntry { key, ty: vt.clone(), optional: false })
+                        }
+                        None => all_string_keys = false,
+                    }
+                    values.push(vt);
+                }
+                (false, [v]) => {
+                    all_string_keys = false;
+                    let is_spread = el.children_with_tokens().any(|e| e.kind() == DOT3);
+                    let vt = self.expr_type(v);
+                    values.push(if is_spread { vt.iterable_value().unwrap_or(Type::Mixed) } else { vt });
+                }
+                _ => all_string_keys = false,
+            }
+        }
+        if !any {
+            return Type::Array(None, None);
+        }
+        if all_string_keys && !shape.is_empty() {
+            let mut deduped: Vec<php_hir::types::ShapeEntry> = Vec::new();
+            for e in shape {
+                deduped.retain(|d| d.key != e.key);
+                deduped.push(e);
+            }
+            return Type::Shape(deduped);
+        }
+        let v = Type::union(values);
+        if v.is_mixed() {
+            Type::Array(None, None)
+        } else {
+            Type::Array(None, Some(Box::new(v)))
+        }
+    }
+
+    fn syntax_type(&self, ty: &SyntaxNode, at: &SyntaxNode) -> Type {
+        let scope = self.sema.scope_at(at.text_range().start());
+        let tr = TypeResolver { scope, templates: &[], class_templates: &[] };
+        let t = tr.syntax_type(ty);
+        let class = self.self_class(at);
+        self.resolve_rel(&t, class.as_ref(), class.as_ref())
+    }
+
+    fn doc_type(&self, text: &str, at: &SyntaxNode) -> Type {
+        let scope = self.sema.scope_at(at.text_range().start());
+        let tr = TypeResolver { scope, templates: &[], class_templates: &[] };
+        let t = tr.doc_type(text);
+        let class = self.self_class(at);
+        self.resolve_rel(&t, class.as_ref(), class.as_ref())
+    }
+
+    fn function_return(&self, f: &FunctionDef, args: Option<&SyntaxNode>) -> Type {
+        let Some(ret) = f.effective_return_type() else { return Type::Mixed };
+        // simple template inference: `@template T` + `@param T $x` / `class-string<T>`
+        if f.templates.is_empty() {
+            return ret;
+        }
+        let arg_nodes: Vec<SyntaxNode> =
+            args.map(|a| a.children().filter(|c| c.kind() == ARG).collect()).unwrap_or_default();
+        let subst = |name: &str| -> Option<Type> {
+            for (i, p) in f.params.iter().enumerate() {
+                let pt = p.effective_type()?;
+                let arg = arg_nodes.get(i)?.children().find(|c| is_expr(c.kind()))?;
+                match &pt {
+                    Type::Template(t) if &**t == name => return Some(self.expr_type(&arg)),
+                    Type::ClassString(Some(inner)) if matches!(&**inner, Type::Template(t) if &**t == name) =>
+                    {
+                        let at = self.expr_type(&arg);
+                        if let Type::ClassString(Some(c)) = at {
+                            return Some(*c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+        ret.substitute(&subst)
+    }
+
+    fn call_type(&self, node: &SyntaxNode) -> Type {
+        let Some(callee) = node.first_child() else { return Type::Mixed };
+        let args = node.children().find(|c| c.kind() == ARG_LIST);
+        if callee.kind() == NAME_EXPR {
+            let text = ast::text_without_trivia(&callee);
+            return match self.sema.resolve_function(&text, callee.text_range().start()) {
+                Some((_, f)) => self.function_return(f, args.as_ref()),
+                None => Type::Mixed,
+            };
+        }
+        match self.expr_type(&callee) {
+            Type::Closure(_, Some(ret)) => *ret,
+            t => {
+                // invokable objects
+                for c in t.class_names() {
+                    if let Some(m) = self.sema.index().find_method(&c, "__invoke") {
+                        return self.function_return(m.def, args.as_ref());
+                    }
+                }
+                Type::Mixed
+            }
+        }
+    }
+
+    fn receiver_classes(&self, node: &SyntaxNode) -> Vec<Fqn> {
+        let Some(lhs) = node.first_child() else { return Vec::new() };
+        if matches!(node.kind(), STATIC_CALL_EXPR | STATIC_PROPERTY_FETCH_EXPR | CLASS_CONST_FETCH_EXPR) {
+            return crate::classify::static_lhs_classes(self.sema, &lhs);
+        }
+        self.expr_type(&lhs).class_names()
+    }
+
+    fn member_name(node: &SyntaxNode) -> Option<String> {
+        node.children().find_map(ast::MemberName::cast).and_then(|m| m.text())
+    }
+
+    fn method_call_type(&self, node: &SyntaxNode) -> Type {
+        let Some(name) = Self::member_name(node) else { return Type::Mixed };
+        let args = node.children().find(|c| c.kind() == ARG_LIST);
+        let mut out = Vec::new();
+        let receiver_ty =
+            node.first_child().filter(|_| node.kind() == METHOD_CALL_EXPR).map(|r| self.expr_type(&r));
+        for class in self.receiver_classes(node) {
+            let Some(m) = self.sema.index().find_method(&class, &name) else { continue };
+            let mut t = self.function_return(m.def, args.as_ref());
+            // class level generics: `Collection<User>` with `@template T`
+            if let Some(Type::Named(_, targs)) = receiver_ty.as_ref().and_then(|r| {
+                r.members()
+                    .into_iter()
+                    .find(|t| matches!(t, Type::Named(n, _) if n.eq_ignore_case(&class)))
+                    .cloned()
+            }) {
+                if !targs.is_empty() {
+                    if let Some((_, cdef)) = self.sema.index().class(&class) {
+                        let templates = cdef.templates.clone();
+                        t = t.substitute(&|n| {
+                            templates.iter().position(|tp| tp.name == n).and_then(|i| targs.get(i).cloned())
+                        });
+                    }
+                }
+            }
+            out.push(self.resolve_rel(&t, Some(&m.owner.fqn), Some(&class)));
+        }
+        if out.is_empty() {
+            Type::Mixed
+        } else {
+            Type::union(out)
+        }
+    }
+
+    fn property_type(&self, node: &SyntaxNode) -> Type {
+        let Some(name) = Self::member_name(node) else { return Type::Mixed };
+        let mut out = Vec::new();
+        for class in self.receiver_classes(node) {
+            if let Some(p) = self.sema.index().find_property(&class, &name) {
+                if let Some(t) = p.def.effective_type() {
+                    out.push(self.resolve_rel(&t, Some(&p.owner.fqn), Some(&class)));
+                    continue;
+                }
+            }
+            // enum `->name` / `->value`
+            if let Some((_, c)) = self.sema.index().class(&class) {
+                if c.kind == ast::ClassLikeKind::Enum {
+                    match name.as_str() {
+                        "name" => out.push(Type::String),
+                        "value" => out.push(c.backing_type.clone().unwrap_or(Type::Mixed)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            Type::Mixed
+        } else {
+            Type::union(out)
+        }
+    }
+
+    fn class_const_type(&self, node: &SyntaxNode) -> Type {
+        let Some(name) = Self::member_name(node) else { return Type::Mixed };
+        let classes = self.receiver_classes(node);
+        if name.eq_ignore_ascii_case("class") {
+            return match classes.into_iter().next() {
+                Some(c) => Type::ClassString(Some(Box::new(Type::Named(c, Vec::new())))),
+                None => Type::ClassString(None),
+            };
+        }
+        let mut out = Vec::new();
+        for c in classes {
+            if let Some(case) = self.sema.index().find_case(&c, &name) {
+                out.push(Type::Named(case.owner.fqn.clone(), Vec::new()));
+            } else if let Some(k) = self.sema.index().find_class_constant(&c, &name) {
+                out.push(
+                    k.def
+                        .ty
+                        .clone()
+                        .unwrap_or_else(|| k.def.value.as_deref().map(literal_type).unwrap_or(Type::Mixed)),
+                );
+            }
+        }
+        if out.is_empty() {
+            Type::Mixed
+        } else {
+            Type::union(out)
+        }
+    }
+
+    // ------------------------------------------------------------------ variables
+
+    /// Type of variable `$name` as seen at `at`.
+    pub fn variable_type(&self, name: &str, at: &SyntaxNode) -> Type {
+        let offset = at.text_range().start();
+        let scope = self.sema.variable_scope(at);
+        if let Some(t) = self.narrowed(name, at, &scope) {
+            return t;
+        }
+        let mut best: Option<(TextSize, Type)> = None;
+        let consider =
+            |pos: TextSize, ty: Box<dyn FnOnce() -> Type + '_>, best: &mut Option<(TextSize, Type)>| {
+                if best.as_ref().is_none_or(|(p, _)| pos >= *p) {
+                    *best = Some((pos, ty()));
+                }
+            };
+
+        // parameters
+        if let Some(pl) = scope.children().find_map(ast::ParamList::cast) {
+            for p in pl.params() {
+                if p.name().as_deref() == Some(name) {
+                    let t = self.param_type(&p, &scope);
+                    consider(scope.text_range().start(), Box::new(move || t), &mut best);
+                }
+            }
+        }
+        // arrow functions between `at` and the scope also bind parameters
+        for anc in at.ancestors().take_while(|n| n != &scope) {
+            if anc.kind() == ARROW_FN_EXPR {
+                if let Some(pl) = anc.children().find_map(ast::ParamList::cast) {
+                    for p in pl.params() {
+                        if p.name().as_deref() == Some(name) {
+                            let t = self.param_type(&p, &anc);
+                            consider(anc.text_range().start(), Box::new(move || t), &mut best);
+                        }
+                    }
+                }
+            }
+        }
+        // closure `use` variables come from the outer scope
+        if scope.kind() == CLOSURE_EXPR {
+            if let Some(uses) = scope.children().find(|c| c.kind() == CLOSURE_USE) {
+                let used = uses
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| t.kind() == VARIABLE && &t.text()[1..] == name);
+                if used {
+                    if let Some(parent) = scope.parent() {
+                        let t = self.variable_type(name, &parent_expr_anchor(&scope, &parent));
+                        consider(scope.text_range().start(), Box::new(move || t), &mut best);
+                    }
+                }
+            }
+        }
+
+        let mut stack: Vec<SyntaxNode> = scope.children().collect();
+        while let Some(n) = stack.pop() {
+            if n.text_range().start() >= offset {
+                continue;
+            }
+            match n.kind() {
+                FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR | CLASS_DECL | INTERFACE_DECL | TRAIT_DECL
+                | ENUM_DECL | ANON_CLASS => continue,
+                ASSIGN_EXPR if n.text_range().end() <= offset => {
+                    if let Some(lhs) = n.first_child() {
+                        if lhs.kind() == VARIABLE_EXPR
+                            && ast::VariableExpr::cast(lhs.clone()).and_then(|v| v.name()).as_deref()
+                                == Some(name)
+                        {
+                            let pos = n.text_range().start();
+                            let doc = statement_doc_var(&n, name);
+                            let node = n.clone();
+                            consider(
+                                pos,
+                                Box::new(move || match doc {
+                                    Some(d) => self.doc_type(&d, &node),
+                                    None => self.expr_type(&node),
+                                }),
+                                &mut best,
+                            );
+                        } else if matches!(lhs.kind(), ARRAY_EXPR | LIST_EXPR) {
+                            self.destructuring(&n, &lhs, name, &mut best);
+                        }
+                    }
+                }
+                FOREACH_STMT if n.text_range().contains(offset) => {
+                    let iter = expr_children(&n).next();
+                    let bound = |child_kind: SyntaxKind, best: &mut Option<(TextSize, Type)>, key: bool| {
+                        let Some(binding) = n.children().find(|c| c.kind() == child_kind) else { return };
+                        let Some(var) = binding.children().find(|c| c.kind() == VARIABLE_EXPR) else {
+                            return;
+                        };
+                        if ast::VariableExpr::cast(var).and_then(|v| v.name()).as_deref() != Some(name) {
+                            return;
+                        }
+                        let doc = statement_doc_var(&n, name);
+                        let t = match (doc, &iter) {
+                            (Some(d), _) => self.doc_type(&d, &n),
+                            (None, Some(it)) => {
+                                let it_ty = self.expr_type(it);
+                                if key {
+                                    it_ty.iterable_key().unwrap_or(Type::union(vec![Type::Int, Type::String]))
+                                } else {
+                                    self.iteration_value(&it_ty)
+                                }
+                            }
+                            _ => Type::Mixed,
+                        };
+                        if best.as_ref().is_none_or(|(p, _)| n.text_range().start() >= *p) {
+                            *best = Some((n.text_range().start(), t));
+                        }
+                    };
+                    bound(FOREACH_VALUE, &mut best, false);
+                    bound(FOREACH_KEY, &mut best, true);
+                    stack.extend(n.children());
+                }
+                CATCH_CLAUSE if n.text_range().contains(offset) => {
+                    let var = n
+                        .children_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .find(|t| t.kind() == VARIABLE);
+                    if var.is_some_and(|v| &v.text()[1..] == name) {
+                        let types: Vec<Type> = n
+                            .children()
+                            .find(|c| c.kind() == CATCH_TYPES)
+                            .map(|ct| {
+                                ct.children()
+                                    .map(|q| {
+                                        Type::Named(
+                                            self.sema
+                                                .scope_at(q.text_range().start())
+                                                .resolve_class(&ast::text_without_trivia(&q)),
+                                            Vec::new(),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let t = Type::union(types);
+                        consider(n.text_range().start(), Box::new(move || t), &mut best);
+                    }
+                    stack.extend(n.children());
+                }
+                STATIC_VAR | GLOBAL_STMT => {
+                    if n.descendants_with_tokens()
+                        .filter_map(|e| e.into_token())
+                        .any(|t| t.kind() == VARIABLE && &t.text()[1..] == name)
+                    {
+                        let doc = statement_doc_var(&n, name);
+                        let value = expr_children(&n).nth(1);
+                        let node = n.clone();
+                        consider(
+                            n.text_range().start(),
+                            Box::new(move || match (doc, value) {
+                                (Some(d), _) => self.doc_type(&d, &node),
+                                (None, Some(v)) => self.expr_type(&v),
+                                _ => Type::Mixed,
+                            }),
+                            &mut best,
+                        );
+                    }
+                    stack.extend(n.children());
+                }
+                CALL_EXPR => {
+                    // assert($x instanceof Foo)
+                    if let Some(t) = self.assert_instanceof(&n, name) {
+                        consider(n.text_range().start(), Box::new(move || t), &mut best);
+                    }
+                    stack.extend(n.children());
+                }
+                _ => stack.extend(n.children()),
+            }
+        }
+        // standalone `/** @var Type $name */` comments
+        for tok in scope.descendants_with_tokens().filter_map(|e| e.into_token()) {
+            if tok.kind() != DOC_COMMENT || tok.text_range().start() >= offset {
+                continue;
+            }
+            if !tok.text().contains("@var") || !tok.text().contains(&format!("${name}")) {
+                continue;
+            }
+            let doc = DocBlock::parse(tok.text());
+            if let Some(v) =
+                doc.var(Some(name)).filter(|v| v.var.as_deref() == Some(name) && !v.type_text.is_empty())
+            {
+                let pos = tok.text_range().start();
+                if best.as_ref().is_none_or(|(p, _)| pos >= *p) {
+                    best = Some((pos, self.doc_type(&v.type_text, at)));
+                }
+            }
+        }
+        best.map(|(_, t)| t).unwrap_or(if is_superglobal(name) {
+            Type::Array(None, None)
+        } else {
+            Type::Mixed
+        })
+    }
+
+    fn iteration_value(&self, t: &Type) -> Type {
+        if let Some(v) = t.iterable_value() {
+            return v;
+        }
+        // Traversable objects: generics `Collection<K, V>` or getIterator()/current()
+        let mut out = Vec::new();
+        for m in t.members() {
+            if let Type::Named(c, args) = m {
+                if let Some(last) = args.last() {
+                    out.push(last.clone());
+                    continue;
+                }
+                for method in ["current", "getIterator"] {
+                    if let Some(found) = self.sema.index().find_method(c, method) {
+                        if let Some(rt) = found.def.effective_return_type() {
+                            let rt = self.resolve_rel(&rt, Some(&found.owner.fqn), Some(c));
+                            if method == "current" {
+                                out.push(rt);
+                            } else if let Some(v) = rt.iterable_value() {
+                                out.push(v);
+                            } else if let Type::Named(_, args) = &rt {
+                                if let Some(l) = args.last() {
+                                    out.push(l.clone());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            Type::Mixed
+        } else {
+            Type::union(out)
+        }
+    }
+
+    fn destructuring(
+        &self,
+        assign: &SyntaxNode,
+        pattern: &SyntaxNode,
+        name: &str,
+        best: &mut Option<(TextSize, Type)>,
+    ) {
+        let rhs = expr_children(assign).nth(1).map(|r| self.expr_type(&r)).unwrap_or(Type::Mixed);
+        for (i, el) in pattern.children().filter(|c| c.kind() == ARRAY_ELEMENT).enumerate() {
+            let parts: Vec<SyntaxNode> = expr_children(&el).collect();
+            let (key, target) = match parts.as_slice() {
+                [k, v] => {
+                    (k.first_token().map(|t| t.text().trim_matches(['\'', '"']).to_string()), v.clone())
+                }
+                [v] => (Some(i.to_string()), v.clone()),
+                _ => continue,
+            };
+            if target.kind() == VARIABLE_EXPR
+                && ast::VariableExpr::cast(target).and_then(|v| v.name()).as_deref() == Some(name)
+            {
+                let t = rhs.index(key.as_deref()).unwrap_or(Type::Mixed);
+                let pos = assign.text_range().start();
+                if best.as_ref().is_none_or(|(p, _)| pos >= *p) {
+                    *best = Some((pos, t));
+                }
+            }
+        }
+    }
+
+    fn param_type(&self, p: &ast::Param, func: &SyntaxNode) -> Type {
+        let name = p.name().unwrap_or_default();
+        let doc = php_syntax::ast::doc_comment(func)
+            .or_else(|| func.parent().filter(|pp| pp.kind() == ARG).and_then(|_| None))
+            .map(|d| DocBlock::parse(d.text()));
+        let declared = p.ty().map(|t| self.syntax_type(&t, func));
+        let doc_ty = doc
+            .as_ref()
+            .and_then(|d| d.param(&name))
+            .filter(|t| !t.type_text.is_empty())
+            .map(|t| self.doc_type(&t.type_text, func));
+        let t = match (declared, doc_ty) {
+            (_, Some(d)) if !d.is_mixed() => d,
+            (Some(d), _) => d,
+            _ => Type::Mixed,
+        };
+        if p.is_variadic() {
+            Type::List(Some(Box::new(t)))
+        } else {
+            t
+        }
+    }
+
+    /// `if ($x instanceof Foo) { ... $x ... }`
+    fn narrowed(&self, name: &str, at: &SyntaxNode, scope: &SyntaxNode) -> Option<Type> {
+        for anc in at.ancestors() {
+            if &anc == scope {
+                break;
+            }
+            if !matches!(anc.kind(), IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT) {
+                continue;
+            }
+            let cond = expr_children(&anc).next()?;
+            if cond.text_range().contains_range(at.text_range()) {
+                continue;
+            }
+            // only the "then" branch: not inside else / elseif clauses of this if
+            let in_else = anc
+                .children()
+                .filter(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE))
+                .any(|c| c.text_range().contains_range(at.text_range()));
+            if in_else {
+                continue;
+            }
+            if let Some(t) = self.instanceof_condition(&cond, name) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn instanceof_condition(&self, cond: &SyntaxNode, name: &str) -> Option<Type> {
+        match cond.kind() {
+            INSTANCEOF_EXPR => {
+                let mut parts = expr_children(cond);
+                let lhs = parts.next()?;
+                let rhs = parts.next()?;
+                if lhs.kind() != VARIABLE_EXPR
+                    || ast::VariableExpr::cast(lhs).and_then(|v| v.name()).as_deref() != Some(name)
+                {
+                    return None;
+                }
+                if rhs.kind() == NAME_EXPR {
+                    let text = ast::text_without_trivia(&rhs);
+                    return self.sema.resolve_class_name(&text, &rhs).map(|c| Type::Named(c, Vec::new()));
+                }
+                None
+            }
+            PAREN_EXPR => self.instanceof_condition(&expr_children(cond).next()?, name),
+            BIN_EXPR => {
+                let is_and = cond.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW));
+                if !is_and {
+                    return None;
+                }
+                expr_children(cond).find_map(|c| self.instanceof_condition(&c, name))
+            }
+            _ => None,
+        }
+    }
+
+    fn assert_instanceof(&self, call: &SyntaxNode, name: &str) -> Option<Type> {
+        let callee = call.first_child()?;
+        if callee.kind() != NAME_EXPR
+            || !ast::text_without_trivia(&callee).trim_start_matches('\\').eq_ignore_ascii_case("assert")
+        {
+            return None;
+        }
+        let arg = call.children().find(|c| c.kind() == ARG_LIST)?.children().find(|c| c.kind() == ARG)?;
+        let e = expr_children(&arg).next()?;
+        self.instanceof_condition(&e, name)
+    }
+}
+
+/// A node in the outer scope positioned at the closure (for looking up
+/// `use` variables).
+fn parent_expr_anchor(closure: &SyntaxNode, _parent: &SyntaxNode) -> SyntaxNode {
+    // the closure node itself lives in the outer scope; looking up from its
+    // parent finds assignments before the closure
+    closure.parent().unwrap_or_else(|| closure.clone())
+}
+
+/// `/** @var Type $name */` (or without name) directly before the statement
+/// containing `node`.
+fn statement_doc_var(node: &SyntaxNode, name: &str) -> Option<String> {
+    let stmt = node.ancestors().find(|n| {
+        matches!(n.kind(), EXPR_STMT | FOREACH_STMT | STATIC_STMT | GLOBAL_STMT | RETURN_STMT | ECHO_STMT)
+    })?;
+    let doc = ast::doc_comment(&stmt)?;
+    let doc = DocBlock::parse(doc.text());
+    let v = doc.var(Some(name))?;
+    if v.var.is_none() || v.var.as_deref() == Some(name) {
+        Some(v.type_text).filter(|t| !t.is_empty())
+    } else {
+        None
+    }
+}
+
+fn is_superglobal(name: &str) -> bool {
+    matches!(
+        name,
+        "_GET" | "_POST" | "_SERVER" | "_REQUEST" | "_COOKIE" | "_FILES" | "_ENV" | "_SESSION" | "GLOBALS"
+    )
+}

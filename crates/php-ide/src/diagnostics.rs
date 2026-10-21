@@ -1,6 +1,6 @@
 //! Diagnostics.
 
-use crate::{Config, SourceFile, TextRange};
+use crate::{Config, TextRange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
@@ -36,10 +36,10 @@ pub struct Diagnostic {
     pub deprecated: bool,
 }
 
-pub(crate) fn diagnostics(config: &Config, file: &SourceFile) -> Vec<Diagnostic> {
+pub(crate) fn diagnostics(config: &Config, parse: &php_syntax::Parse) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     if config.syntax_diagnostics {
-        for e in file.parse.errors() {
+        for e in parse.errors() {
             out.push(Diagnostic {
                 range: e.range,
                 severity: Severity::Error,
