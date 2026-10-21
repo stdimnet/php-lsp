@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 pub use classify::Definition;
 pub use completion::{CompletionItem, CompletionKind, CompletionList, TextEdit};
-pub use diagnostics::{Diagnostic, DiagnosticCode, Severity};
+pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
 pub use folding::{Fold, FoldKind};
 pub use hover::Hover;
 pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
@@ -58,8 +58,8 @@ pub const STUB_SCHEME: &str = "phpstub://";
 pub struct Config {
     /// The PHP version used for parsing and version dependent analysis.
     pub php_version: PhpVersion,
-    /// Report syntax errors.
-    pub syntax_diagnostics: bool,
+    /// Which diagnostics are reported.
+    pub diagnostics: DiagnosticsConfig,
     /// Stub extensions to load (see [`php_stubs::DEFAULT_STUBS`]).
     pub stubs: Vec<String>,
     /// Insert `use` statements when completing class names.
@@ -72,7 +72,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             php_version: PhpVersion::default(),
-            syntax_diagnostics: true,
+            diagnostics: DiagnosticsConfig::default(),
             stubs: php_stubs::DEFAULT_STUBS.iter().map(|s| s.to_string()).collect(),
             auto_import: true,
             max_completion_items: 100,
@@ -111,6 +111,9 @@ pub struct Workspace {
     files: Vec<Option<SourceFile>>,
     index: Index,
     stubs_loaded: Vec<String>,
+    /// While `false` (e.g. during initial indexing) diagnostics about
+    /// undefined symbols are suppressed.
+    index_not_ready: bool,
 }
 
 impl Workspace {
@@ -124,6 +127,15 @@ impl Workspace {
 
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Whether the index is complete enough to report undefined symbols.
+    pub fn index_ready(&self) -> bool {
+        !self.index_not_ready
+    }
+
+    pub fn set_index_ready(&mut self, ready: bool) {
+        self.index_not_ready = !ready;
     }
 
     /// Changes the configuration. Files are re-analysed if the PHP version
@@ -301,10 +313,12 @@ impl Workspace {
     // ----------------------------------------------------------- features
 
     pub fn diagnostics(&self, id: FileId) -> Vec<Diagnostic> {
-        match self.parse(id) {
-            Some(parse) => diagnostics::diagnostics(&self.config, &parse),
-            None => Vec::new(),
+        let Some(parse) = self.parse(id) else { return Vec::new() };
+        let mut out = diagnostics::syntax_diagnostics(&self.config, &parse);
+        if let Some(sema) = sema::Sema::new(self, id) {
+            out.extend(diagnostics::semantic_diagnostics(&sema));
         }
+        out
     }
 
     pub fn document_symbols(&self, id: FileId) -> Vec<Symbol> {

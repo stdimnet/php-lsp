@@ -68,6 +68,8 @@ pub struct FunctionDef {
     pub doc: Option<Arc<DocBlock>>,
     pub deprecated: Option<String>,
     pub templates: Vec<TemplateTag>,
+    /// The body reads its arguments dynamically (`func_get_args()`).
+    pub dynamic_args: bool,
 }
 
 impl FunctionDef {
@@ -283,6 +285,7 @@ impl Cx<'_> {
             deprecated: deprecation(node, doc.as_deref(), self.opts.php_version),
             doc,
             templates,
+            dynamic_args: uses_dynamic_args(node),
         })
     }
 
@@ -330,12 +333,19 @@ impl Cx<'_> {
                     name,
                     ty,
                     doc_ty,
-                    default: p.default_value().map(|d| compact_text(&d)),
+                    // stubs mark optional overload parameters as `[optional]`
+                    default: p.default_value().map(|d| compact_text(&d)).or_else(|| {
+                        tag.as_ref()
+                            .filter(|t| t.description.starts_with("[optional]"))
+                            .map(|_| "?".to_string())
+                    }),
                     variadic: p.is_variadic(),
                     by_ref: p.by_ref(),
                     promoted,
                     readonly,
-                    description: tag.map(|t| t.description).filter(|d| !d.is_empty()),
+                    description: tag
+                        .map(|t| t.description.trim_start_matches("[optional]").trim().to_string())
+                        .filter(|d| !d.is_empty()),
                     range: p.syntax().text_range(),
                 })
             })
@@ -481,6 +491,7 @@ impl Cx<'_> {
                     doc,
                     deprecated,
                     templates,
+                    dynamic_args: uses_dynamic_args(node),
                 });
             }
             Member::Property(prop) => {
@@ -617,6 +628,7 @@ impl Cx<'_> {
                 doc: Some(Arc::new(DocBlock { summary: m.description.clone(), ..Default::default() })),
                 deprecated: None,
                 templates: Vec::new(),
+                dynamic_args: false,
             });
         }
     }
@@ -667,6 +679,20 @@ impl Cx<'_> {
             deprecated: None,
         });
     }
+}
+
+fn uses_dynamic_args(node: &SyntaxNode) -> bool {
+    node.children().find(|c| c.kind() == BLOCK).is_some_and(|b| {
+        b.descendants_with_tokens().any(|e| {
+            e.as_token().is_some_and(|t| {
+                t.kind() == IDENT
+                    && matches!(
+                        t.text().to_ascii_lowercase().as_str(),
+                        "func_get_args" | "func_num_args" | "func_get_arg"
+                    )
+            })
+        })
+    })
 }
 
 fn find_variable_range(method: &SyntaxNode, param_range: TextRange) -> Option<TextRange> {

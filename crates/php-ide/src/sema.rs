@@ -17,6 +17,8 @@ pub(crate) struct Sema<'a> {
     pub root: SyntaxNode,
     pub scopes: Arc<FileScopes>,
     pub text: Arc<str>,
+    /// Recursion depth of type inference (shared by all `Infer` instances).
+    pub infer_depth: std::cell::Cell<u32>,
 }
 
 impl<'a> Sema<'a> {
@@ -25,7 +27,7 @@ impl<'a> Sema<'a> {
         let scopes = ws.scopes(file, &parse);
         let root = parse.syntax_node();
         let text = ws.file(file)?.text.clone();
-        Some(Sema { ws, file, root, scopes, text })
+        Some(Sema { ws, file, root, scopes, text, infer_depth: std::cell::Cell::new(0) })
     }
 
     pub fn index(&self) -> &'a Index {

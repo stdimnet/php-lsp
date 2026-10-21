@@ -15,6 +15,7 @@ pub const SECTIONS: &[&str] = &["intelephense", "php-lsp"];
 pub struct ServerConfig {
     pub php_version: PhpVersion,
     pub diagnostics_enabled: bool,
+    pub diagnostics: php_ide::DiagnosticsConfig,
     /// Files larger than this (in bytes) are not analysed.
     pub max_file_size: u64,
     pub associations: Vec<String>,
@@ -31,6 +32,7 @@ impl Default for ServerConfig {
         ServerConfig {
             php_version: PhpVersion::default(),
             diagnostics_enabled: true,
+            diagnostics: php_ide::DiagnosticsConfig::default(),
             max_file_size: scan.max_size,
             associations: scan.associations,
             exclude: scan.exclude,
@@ -49,7 +51,10 @@ impl ServerConfig {
     pub fn ide_config(&self) -> php_ide::Config {
         php_ide::Config {
             php_version: self.php_version,
-            syntax_diagnostics: self.diagnostics_enabled,
+            diagnostics: php_ide::DiagnosticsConfig {
+                enable: self.diagnostics_enabled,
+                ..self.diagnostics.clone()
+            },
             stubs: self.stubs.clone(),
             auto_import: self.insert_use_declaration,
             max_completion_items: self.max_completion_items,
@@ -76,6 +81,25 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "diagnostics.enable").and_then(Value::as_bool) {
                 self.diagnostics_enabled = v;
+            }
+            let d = &mut self.diagnostics;
+            for (key, flag) in [
+                ("diagnostics.syntax", &mut d.syntax),
+                ("diagnostics.undefinedTypes", &mut d.undefined_types),
+                ("diagnostics.undefinedFunctions", &mut d.undefined_functions),
+                ("diagnostics.undefinedConstants", &mut d.undefined_constants),
+                ("diagnostics.undefinedClassConstants", &mut d.undefined_class_constants),
+                ("diagnostics.undefinedMethods", &mut d.undefined_methods),
+                ("diagnostics.undefinedProperties", &mut d.undefined_properties),
+                ("diagnostics.undefinedVariables", &mut d.undefined_variables),
+                ("diagnostics.unusedSymbols", &mut d.unused_symbols),
+                ("diagnostics.deprecated", &mut d.deprecated),
+                ("diagnostics.argumentCount", &mut d.argument_count),
+                ("diagnostics.implementationErrors", &mut d.implementation_errors),
+            ] {
+                if let Some(v) = get(&root, key).and_then(Value::as_bool) {
+                    *flag = v;
+                }
             }
             if let Some(v) = get(&root, "files.maxSize").and_then(Value::as_u64) {
                 self.max_file_size = v;

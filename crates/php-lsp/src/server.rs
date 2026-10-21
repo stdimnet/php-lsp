@@ -346,6 +346,7 @@ impl Server {
         let generation = self.generation;
         // apply the new stub list now; the stubs are re-indexed below
         self.workspace.set_config(self.config.ide_config());
+        self.workspace.set_index_ready(false);
         let stubs = self.workspace.stub_files();
         let roots = self.roots.clone();
         let scan = self.config.scan_config();
@@ -419,7 +420,12 @@ impl Server {
                     return;
                 }
                 self.indexing = false;
+                self.workspace.set_index_ready(true);
                 self.log(&format!("indexed {count} files in {millis} ms"));
+                let ids: Vec<FileId> = self.client_uris.keys().copied().collect();
+                for id in ids {
+                    self.publish_diagnostics(id);
+                }
                 self.notify_raw("indexingEnded", Value::Null);
                 if self.caps.work_done_progress {
                     self.progress(lsp::WorkDoneProgress::End(lsp::WorkDoneProgressEnd {

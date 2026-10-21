@@ -193,35 +193,44 @@ impl Index {
     /// its traits, then the parent chain (each with traits), then
     /// interfaces, then `@mixin` classes.
     pub fn ancestors(&self, fqn: &Fqn) -> Vec<(FileId, &ClassDef)> {
+        self.ancestors_with(fqn, true)
+    }
+
+    /// Like [`Index::ancestors`]; `mixins` controls whether `@mixin`
+    /// classes are included.
+    pub fn ancestors_with(&self, fqn: &Fqn, include_mixins: bool) -> Vec<(FileId, &ClassDef)> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        let mut interfaces = Vec::new();
-        let mut mixins = Vec::new();
-        let mut current = Some(fqn.clone());
-        while let Some(name) = current.take() {
-            if !seen.insert(name.key()) {
-                break;
-            }
-            let Some((id, class)) = self.class(&name) else { break };
-            out.push((id, class));
-            self.collect_traits(class, &mut seen, &mut out);
-            interfaces.extend(class.interfaces.iter().cloned());
-            mixins.extend(class.mixins.iter().cloned());
-            current = class.parent.clone();
-        }
-        while let Some(i) = interfaces.pop() {
-            if !seen.insert(i.key()) {
+        let mut mixins = vec![fqn.clone()];
+        let mut first = true;
+        // the class itself, then each `@mixin` (recursively, cycle safe)
+        while let Some(start) = mixins.pop() {
+            if !first && seen.contains(&start.key()) {
                 continue;
             }
-            if let Some((id, class)) = self.class(&i) {
+            first = false;
+            let mut interfaces = Vec::new();
+            let mut current = Some(start);
+            while let Some(name) = current.take() {
+                if !seen.insert(name.key()) {
+                    break;
+                }
+                let Some((id, class)) = self.class(&name) else { break };
                 out.push((id, class));
+                self.collect_traits(class, &mut seen, &mut out);
                 interfaces.extend(class.interfaces.iter().cloned());
+                if include_mixins {
+                    mixins.extend(class.mixins.iter().rev().cloned());
+                }
+                current = class.parent.clone();
             }
-        }
-        for m in mixins {
-            for a in self.ancestors(&m) {
-                if seen.insert(a.1.fqn.key()) {
-                    out.push(a);
+            while let Some(i) = interfaces.pop() {
+                if !seen.insert(i.key()) {
+                    continue;
+                }
+                if let Some((id, class)) = self.class(&i) {
+                    out.push((id, class));
+                    interfaces.extend(class.interfaces.iter().cloned());
                 }
             }
         }
@@ -243,6 +252,16 @@ impl Index {
                 self.collect_traits(tr, seen, out);
             }
         }
+    }
+
+    /// Whether some supertype (parent, interface, trait, mixin) of the class
+    /// is not in the index, so member lookups may be incomplete.
+    pub fn has_unknown_ancestor(&self, fqn: &Fqn) -> bool {
+        let ancestors = self.ancestors(fqn);
+        if ancestors.is_empty() {
+            return true;
+        }
+        ancestors.iter().any(|(_, c)| c.supertypes().chain(c.mixins.iter()).any(|s| self.class(s).is_none()))
     }
 
     /// Whether `sub` is `sup` or extends / implements it.
@@ -289,14 +308,29 @@ impl Index {
 
     /// All members visible on a class, the most derived declaration first.
     pub fn members(&self, class: &Fqn) -> Members<'_> {
+        self.members_with(class, true)
+    }
+
+    /// Like [`Index::members`]; concrete methods win over abstract ones
+    /// declared earlier in the lookup order (e.g. abstract trait methods).
+    pub fn members_with(&self, class: &Fqn, include_mixins: bool) -> Members<'_> {
         let mut m = Members::default();
-        let mut seen_methods = HashSet::new();
+        let mut methods: HashMap<String, usize> = HashMap::new();
         let mut seen_props = HashSet::new();
         let mut seen_consts = HashSet::new();
-        for (file, owner) in self.ancestors(class) {
+        for (file, owner) in self.ancestors_with(class, include_mixins) {
             for def in &owner.methods {
-                if seen_methods.insert(def.name.to_ascii_lowercase()) {
-                    m.methods.push(Found { file, owner, def });
+                let key = def.name.to_ascii_lowercase();
+                match methods.get(&key) {
+                    Some(&i) => {
+                        if m.methods[i].def.is_abstract && !def.is_abstract {
+                            m.methods[i] = Found { file, owner, def };
+                        }
+                    }
+                    None => {
+                        methods.insert(key, m.methods.len());
+                        m.methods.push(Found { file, owner, def });
+                    }
                 }
             }
             for def in &owner.properties {

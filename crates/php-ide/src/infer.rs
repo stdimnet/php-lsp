@@ -1,7 +1,5 @@
 //! Local type inference for expressions and variables.
 
-use std::cell::Cell;
-
 use php_hir::phpdoc::DocBlock;
 use php_hir::symbols::{FunctionDef, TypeResolver};
 use php_hir::{Fqn, Type};
@@ -59,7 +57,6 @@ pub(crate) fn is_expr(kind: SyntaxKind) -> bool {
 
 pub(crate) struct Infer<'s, 'a> {
     sema: &'s Sema<'a>,
-    depth: Cell<u32>,
 }
 
 /// Child expression nodes of `node`.
@@ -90,17 +87,18 @@ fn literal_type(text: &str) -> Type {
 
 impl<'s, 'a> Infer<'s, 'a> {
     pub fn new(sema: &'s Sema<'a>) -> Self {
-        Infer { sema, depth: Cell::new(0) }
+        Infer { sema }
     }
 
     /// Infers the type of an expression. `self`/`static`/`parent` are resolved.
     pub fn expr_type(&self, node: &SyntaxNode) -> Type {
-        if self.depth.get() > MAX_DEPTH {
+        let depth = &self.sema.infer_depth;
+        if depth.get() > MAX_DEPTH {
             return Type::Mixed;
         }
-        self.depth.set(self.depth.get() + 1);
+        depth.set(depth.get() + 1);
         let t = self.expr_type_inner(node);
-        self.depth.set(self.depth.get() - 1);
+        depth.set(depth.get() - 1);
         t
     }
 
@@ -581,6 +579,17 @@ impl<'s, 'a> Infer<'s, 'a> {
 
     /// Type of variable `$name` as seen at `at`.
     pub fn variable_type(&self, name: &str, at: &SyntaxNode) -> Type {
+        let depth = &self.sema.infer_depth;
+        if depth.get() > MAX_DEPTH {
+            return Type::Mixed;
+        }
+        depth.set(depth.get() + 1);
+        let t = self.variable_type_inner(name, at);
+        depth.set(depth.get() - 1);
+        t
+    }
+
+    fn variable_type_inner(&self, name: &str, at: &SyntaxNode) -> Type {
         let offset = at.text_range().start();
         let scope = self.sema.variable_scope(at);
         if let Some(t) = self.narrowed(name, at, &scope) {

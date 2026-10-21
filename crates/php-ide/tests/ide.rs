@@ -270,3 +270,84 @@ fn stubs_are_indexed() {
     let syms = f.ws.workspace_symbols("DateTimeImm", 10);
     assert_eq!(syms[0].name, "DateTimeImmutable");
 }
+
+fn diags(text: &str) -> Vec<String> {
+    let mut ws = Workspace::new(Config::default());
+    ws.load_stubs();
+    let id = ws.set_file("file:///d.php", text.to_string());
+    ws.diagnostics(id).into_iter().map(|d| format!("{} {}", d.code.as_str(), d.message)).collect()
+}
+
+#[test]
+fn semantic_diagnostics() {
+    let d = diags(
+        r#"<?php
+namespace App;
+use Some\Unused;
+interface Shape { public function area(): float; }
+abstract class Base { abstract function name(): string; }
+class Circle extends Base implements Shape {}
+class Ok extends Base implements Shape { function area(): float { return 1.0; } function name(): string { return ''; } }
+function two(int $a, int $b) {}
+function f(Ok $ok) {
+    two(1);
+    two(1, 2, 3);
+    $ok->missing();
+    $ok->area();
+    echo $ok->nope;
+    echo Ok::NOPE;
+    new Shape();
+    new Nope();
+    undefined_fn();
+    echo $undefinedVar;
+    $unused = 1;
+    if (isset($maybe)) {}
+    foreach ([1] as $item) { echo $item; }
+    preg_match('/x/', 'x', $m);
+    echo $m[0];
+}
+"#,
+    );
+    let expected = [
+        "P1003 Symbol 'Some\\Unused' is declared but not used.",
+        "P1037 'App\\Circle' does not implement methods App\\Base::name, App\\Shape::area.",
+        "P1005 Expected 2 arguments. Found 1.",
+        "P1005 Expected 2 arguments. Found 3.",
+        "P1013 Undefined method 'missing'.",
+        "P1014 Undefined property '$nope'.",
+        "P1012 Undefined class constant 'NOPE'.",
+        "P1016 Cannot instantiate interface 'App\\Shape'.",
+        "P1009 Undefined type 'App\\Nope'.",
+        "P1010 Call to unknown function: 'undefined_fn'",
+        "P1008 Undefined variable '$undefinedVar'.",
+        "P1003 Symbol '$unused' is declared but not used.",
+    ];
+    for e in expected {
+        assert!(d.iter().any(|x| x == e), "missing `{e}` in {d:#?}");
+    }
+    assert_eq!(d.len(), expected.len(), "{d:#?}");
+}
+
+#[test]
+fn no_false_positives_for_dynamic_code() {
+    let d = diags(
+        r#"<?php
+class Magic { function __call($n, $a) {} function __get($n) {} }
+#[\AllowDynamicProperties] class Dyn {}
+trait T { function t() { return $this->fromUser(); } }
+function g(Magic $m, Dyn $d, \stdClass $s) {
+    $m->anything();
+    echo $m->prop;
+    echo $d->x;
+    echo $s->y;
+    $x = $y ?? 1;
+    echo @$z;
+    $cb = function () use (&$count) { $count++; };
+    $cb();
+    while (true) { if ($first ?? false) {} $later = 1; echo $later; }
+    echo $x;
+}
+"#,
+    );
+    assert!(d.is_empty(), "{d:#?}");
+}
