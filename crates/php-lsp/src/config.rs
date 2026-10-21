@@ -17,21 +17,51 @@ pub struct ServerConfig {
     pub diagnostics_enabled: bool,
     /// Files larger than this (in bytes) are not analysed.
     pub max_file_size: u64,
+    pub associations: Vec<String>,
+    pub exclude: Vec<String>,
+    pub stubs: Vec<String>,
+    pub insert_use_declaration: bool,
+    pub max_completion_items: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let scan = php_ide::ScanConfig::default();
+        let ide = php_ide::Config::default();
         ServerConfig {
             php_version: PhpVersion::default(),
             diagnostics_enabled: true,
-            max_file_size: 1_000_000,
+            max_file_size: scan.max_size,
+            associations: scan.associations,
+            exclude: scan.exclude,
+            stubs: ide.stubs,
+            insert_use_declaration: ide.auto_import,
+            max_completion_items: ide.max_completion_items,
         }
     }
 }
 
+fn string_list(v: &Value) -> Option<Vec<String>> {
+    Some(v.as_array()?.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+}
+
 impl ServerConfig {
     pub fn ide_config(&self) -> php_ide::Config {
-        php_ide::Config { php_version: self.php_version, syntax_diagnostics: self.diagnostics_enabled }
+        php_ide::Config {
+            php_version: self.php_version,
+            syntax_diagnostics: self.diagnostics_enabled,
+            stubs: self.stubs.clone(),
+            auto_import: self.insert_use_declaration,
+            max_completion_items: self.max_completion_items,
+        }
+    }
+
+    pub fn scan_config(&self) -> php_ide::ScanConfig {
+        php_ide::ScanConfig {
+            associations: self.associations.clone(),
+            exclude: self.exclude.clone(),
+            max_size: self.max_file_size,
+        }
     }
 
     /// Applies a settings object. Unknown keys are ignored.
@@ -49,6 +79,21 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "files.maxSize").and_then(Value::as_u64) {
                 self.max_file_size = v;
+            }
+            if let Some(v) = get(&root, "files.associations").and_then(string_list) {
+                self.associations = v;
+            }
+            if let Some(v) = get(&root, "files.exclude").and_then(string_list) {
+                self.exclude = v;
+            }
+            if let Some(v) = get(&root, "stubs").and_then(string_list) {
+                self.stubs = v;
+            }
+            if let Some(v) = get(&root, "completion.insertUseDeclaration").and_then(Value::as_bool) {
+                self.insert_use_declaration = v;
+            }
+            if let Some(v) = get(&root, "completion.maxItems").and_then(Value::as_u64) {
+                self.max_completion_items = v as usize;
             }
         }
     }

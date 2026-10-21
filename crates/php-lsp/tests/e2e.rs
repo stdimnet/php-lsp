@@ -13,18 +13,18 @@ struct Client {
 
 impl Client {
     fn start(init_options: Value) -> Client {
+        Client::start_with(
+            json!({"capabilities": {"general": {"positionEncodings": ["utf-16"]}}, "initializationOptions": init_options}),
+        )
+    }
+
+    fn start_with(params: Value) -> Client {
         let (server_conn, client_conn) = Connection::memory();
         let server = thread::spawn(move || {
             php_lsp::Server::initialize(server_conn).unwrap().run().unwrap();
         });
         let mut client = Client { conn: client_conn, server: Some(server), next_id: 0 };
-        let result = client.request(
-            "initialize",
-            json!({
-                "capabilities": {"general": {"positionEncodings": ["utf-16"]}},
-                "initializationOptions": init_options,
-            }),
-        );
+        let result = client.request("initialize", params);
         assert_eq!(result["serverInfo"]["name"], "php-lsp");
         assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
         client.notify("initialized", json!({}));
@@ -52,7 +52,15 @@ impl Client {
 
     fn wait_notification(&self, method: &str) -> Value {
         loop {
-            match self.conn.receiver.recv().unwrap() {
+            let msg = self
+                .conn
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("timed out waiting for notification");
+            if std::env::var("E2E_DEBUG").is_ok() {
+                eprintln!("<- {msg:?}");
+            }
+            match msg {
                 Message::Notification(n) if n.method == method => return n.params,
                 _ => {}
             }
@@ -155,4 +163,101 @@ fn php_version_from_intelephense_settings() {
     let d = c.wait_notification("textDocument/publishDiagnostics");
     assert_eq!(d["diagnostics"], json!([]));
     c.shutdown();
+}
+
+#[test]
+fn indexes_workspace_and_navigates() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src/Models")).unwrap();
+    std::fs::create_dir_all(dir.join("vendor/acme/lib")).unwrap();
+    std::fs::write(
+        dir.join("src/Models/User.php"),
+        "<?php\nnamespace App\\Models;\n\n/** A user. */\nclass User\n{\n    public function posts(): array { return []; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("vendor/acme/lib/Helper.php"),
+        "<?php\nnamespace Acme;\nfunction help(): int { return 1; }\n",
+    )
+    .unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {"window": {"workDoneProgress": true}},
+        "initializationOptions": {"storagePath": dir.join(".storage").display().to_string()},
+    }));
+    c.wait_notification("indexingEnded");
+
+    let uri = format!("{root_uri}/src/main.php");
+    let text =
+        "<?php\nuse App\\Models\\User;\n$u = new User();\n$u->posts();\n$n = strlen('x');\n\\Acme\\help();\n";
+    c.open(&uri, text);
+    c.wait_notification("textDocument/publishDiagnostics");
+
+    // definition in another (unopened) file
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 6}}),
+    );
+    assert!(def[0]["uri"].as_str().unwrap().ends_with("src/Models/User.php"), "{def}");
+    assert_eq!(def[0]["range"]["start"]["line"], 6);
+
+    // stubs: hover and definition (materialized on disk)
+    let hover = c.request(
+        "textDocument/hover",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 7}}),
+    );
+    assert!(hover["contents"]["value"].as_str().unwrap().contains("function strlen"), "{hover}");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 7}}),
+    );
+    let stub_uri = def[0]["uri"].as_str().unwrap().to_string();
+    assert!(stub_uri.starts_with("file://") && stub_uri.contains("php-lsp-stubs"), "{stub_uri}");
+    let path = php_lsp::uri::path_from_uri(&stub_uri).unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("function strlen"));
+
+    // vendor files are indexed
+    let hover = c.request(
+        "textDocument/hover",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 5, "character": 7}}),
+    );
+    assert!(hover["contents"]["value"].as_str().unwrap().contains("function help(): int"), "{hover}");
+
+    // member completion
+    let comp = c.request(
+        "textDocument/completion",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 4}}),
+    );
+    let labels: Vec<&str> =
+        comp["items"].as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
+    assert!(labels.contains(&"posts"), "{labels:?}");
+
+    // references to User across files
+    let refs = c.request(
+        "textDocument/references",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 10}, "context": {"includeDeclaration": true}}),
+    );
+    assert_eq!(refs.as_array().unwrap().len(), 3, "{refs}");
+
+    // workspace symbols
+    let syms = c.request("workspace/symbol", json!({"query": "User"}));
+    assert_eq!(syms[0]["name"], "User");
+    assert_eq!(syms[0]["containerName"], "App\\Models");
+
+    // signature help
+    c.notify(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": "<?php\nstr_replace('a', \n"}]}),
+    );
+    let sh = c.request(
+        "textDocument/signatureHelp",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 17}}),
+    );
+    assert_eq!(sh["activeParameter"], 1, "{sh}");
+    assert!(sh["signatures"][0]["label"].as_str().unwrap().starts_with("str_replace("));
+
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
 }

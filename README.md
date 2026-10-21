@@ -16,7 +16,10 @@ It can be used in three ways:
 | Crate        | Purpose |
 |--------------|---------|
 | `php-syntax` | Lossless, error tolerant lexer + parser (rowan CST) for PHP 5.3 – 8.5, typed AST, version gating |
-| `php-ide`    | IDE features as a Rust API (`Workspace`): diagnostics, document symbols, folding, selection ranges |
+| `php-hir`    | Semantic model: namespaces/imports, PHPDoc (incl. PHPStan/Psalm types), type model, declared symbols |
+| `php-index`  | Global symbol index with inheritance aware member lookup (traits, parents, interfaces, mixins) |
+| `php-stubs`  | JetBrains phpstorm-stubs (Apache-2.0) embedded in compressed form |
+| `php-ide`    | IDE features as a Rust API (`Workspace`): completion, hover, navigation, references, symbols, ... |
 | `php-lsp`    | LSP server and `php-lsp` binary |
 
 ## Usage
@@ -52,15 +55,21 @@ when both set the same key, `php-lsp` wins.
 | `environment.phpVersion`  | `8.4`     |
 | `diagnostics.enable`      | `true`    |
 | `files.maxSize`           | `1000000` |
+| `files.associations`      | `["*.php", "*.phtml"]` |
+| `files.exclude`           | Intelephense defaults (`**/.git/**`, `**/node_modules/**`, ...) |
+| `stubs`                   | Intelephense default stub list |
+| `completion.insertUseDeclaration` | `true` |
+| `completion.maxItems`     | `100` |
 
 ## Status / roadmap
 
 - [x] **Phase 1, foundation:** parser for all PHP versions, syntax diagnostics, document
   symbols, folding, selection ranges, LSP server (stdio/socket, incremental sync, UTF-8/16/32
   positions)
-- [ ] **Phase 2, semantics & index:** name resolution, PHPDoc, workspace index + cache,
-  phpstorm-stubs, Composer/PSR-4, hover, definition, references, workspace symbols,
-  completion, signature help
+- [x] **Phase 2, semantics & index:** name resolution, PHPDoc, background workspace
+  indexing, phpstorm-stubs, hover, definition / type definition / implementation,
+  references, document highlights, workspace symbols, completion with auto import,
+  signature help, file watching (on-disk index cache and Composer/PSR-4 still open)
 - [ ] **Phase 3, types & diagnostics:** type inference (generics, `@template`, array shapes),
   undefined symbol / type diagnostics, inlay hints, semantic tokens, highlights
 - [ ] **Phase 4, editing:** rename, code actions, formatter, implementations,
@@ -77,4 +86,5 @@ when both set the same key, `php-lsp` wins.
 cargo test --workspace
 cargo run --release -p php-syntax --example parse_corpus -- path/to/php/project
 cargo run -p php-syntax --example fuzz_truncate -- some/file.php
+cargo run --release -p php-ide --example index_project -- path/to/php/project ClassName
 ```

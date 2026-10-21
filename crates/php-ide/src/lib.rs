@@ -38,7 +38,7 @@ pub use completion::{CompletionItem, CompletionKind, CompletionList, TextEdit};
 pub use diagnostics::{Diagnostic, DiagnosticCode, Severity};
 pub use folding::{Fold, FoldKind};
 pub use hover::Hover;
-pub use indexer::{collect_files, IndexedFile, ScanConfig};
+pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
 pub use line_index::{LineCol, LineIndex, PositionEncoding};
 pub use navigation::{Location, Reference, ReferenceKind};
 pub use php_hir as hir;
@@ -49,6 +49,9 @@ pub use symbols::{Symbol, SymbolKind};
 pub use workspace_symbols::WorkspaceSymbol;
 
 use php_hir::{ExtractOptions, FileScopes, FileSymbols};
+
+/// Path prefix of embedded stub files.
+pub const STUB_SCHEME: &str = "phpstub://";
 
 /// Analysis configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +149,11 @@ impl Workspace {
         }
     }
 
+    /// Options used when extracting symbols (for indexing on other threads).
+    pub fn extract_options(&self) -> ExtractOptions {
+        self.opts()
+    }
+
     fn opts(&self) -> ExtractOptions {
         ExtractOptions { php_version: self.config.php_version }
     }
@@ -222,15 +230,25 @@ impl Workspace {
 
     /// Loads the configured stub extensions (replacing previously loaded stubs).
     pub fn load_stubs(&mut self) {
+        let files = self.stub_files();
+        self.index_files(files);
+        self.mark_stubs_loaded();
+    }
+
+    /// Removes previously loaded stubs and returns the configured stub files
+    /// as `(path, text, kind)`, e.g. for indexing on another thread.
+    pub fn stub_files(&mut self) -> Vec<(String, Arc<str>, FileKind)> {
         let stale: Vec<FileId> =
             self.files().filter(|(_, f)| f.kind == FileKind::Stub).map(|(id, _)| id).collect();
         for id in stale {
             self.remove_file(id);
         }
-        let files = php_stubs::files_for(&self.config.stubs)
-            .map(|f| (format!("phpstub://{}", f.path), Arc::<str>::from(f.text), FileKind::Stub))
-            .collect();
-        self.index_files(files);
+        php_stubs::files_for(&self.config.stubs)
+            .map(|f| (format!("{STUB_SCHEME}{}", f.path), Arc::<str>::from(f.text), FileKind::Stub))
+            .collect()
+    }
+
+    pub fn mark_stubs_loaded(&mut self) {
         self.stubs_loaded = self.config.stubs.clone();
     }
 

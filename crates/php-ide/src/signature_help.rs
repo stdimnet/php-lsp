@@ -71,7 +71,12 @@ pub(crate) fn callee_params<'a>(sema: &Sema<'a>, call: &SyntaxNode) -> Option<&'
 }
 
 pub(crate) fn signature_help(sema: &Sema, offset: TextSize) -> Option<SignatureHelp> {
-    let token = sema.token_at(offset)?;
+    // the significant token left of the cursor (trailing whitespace of an
+    // unfinished call belongs to an outer node)
+    let mut token = sema.root.token_at_offset(offset).left_biased()?;
+    while token.kind().is_trivia() {
+        token = token.prev_token()?;
+    }
     // innermost argument list whose parentheses contain the cursor
     let arg_list = token.parent_ancestors().find(|n| {
         n.kind() == ARG_LIST && {

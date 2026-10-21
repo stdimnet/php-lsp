@@ -12,7 +12,9 @@
 pub mod config;
 pub mod convert;
 pub mod ext;
+mod handlers;
 mod server;
+pub mod uri;
 
 pub use lsp_server;
 pub use server::{Result, Server, SERVER_NAME};
