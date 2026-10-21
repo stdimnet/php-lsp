@@ -30,6 +30,7 @@ mod infer;
 mod inlay_hints;
 mod line_index;
 mod links;
+mod lint;
 mod navigation;
 pub mod plugins;
 mod refactor;
@@ -40,6 +41,7 @@ mod sema;
 mod semantic_tokens;
 mod signature_help;
 mod symbols;
+mod typecheck;
 mod workspace_symbols;
 
 use std::collections::HashMap;

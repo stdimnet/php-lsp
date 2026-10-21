@@ -63,8 +63,15 @@ impl<'a> Sema<'a> {
 
     /// The class-like declaration enclosing `node`.
     pub fn enclosing_class_node(&self, node: &SyntaxNode) -> Option<SyntaxNode> {
-        node.ancestors()
-            .find(|n| matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL | ANON_CLASS))
+        node.ancestors().find(|n| match n.kind() {
+            CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL => true,
+            // `new class($this->x) { ... }`: the arguments belong to the outer scope
+            ANON_CLASS => n
+                .children()
+                .find(|c| c.kind() == MEMBER_LIST)
+                .is_some_and(|m| m.text_range().contains_range(node.text_range())),
+            _ => false,
+        })
     }
 
     pub fn class_fqn(&self, class_node: &SyntaxNode) -> Option<Fqn> {

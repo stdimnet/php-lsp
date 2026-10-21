@@ -31,6 +31,43 @@ pub enum DiagnosticCode {
     NoTypeInformation,
     UndefinedDocType,
     UnreachableCode,
+    TooManyArguments,
+    LoopVariableIsParameter,
+    OverrideWithoutParent,
+    MissingReturn,
+    PossiblyUndefinedVariable,
+    DuplicateSymbol,
+    MultipleVisibility,
+    FinalNotAllowed,
+    PrivateAbstract,
+    AbstractNotAllowed,
+    InterfaceMethodNotPublic,
+    MethodBodyExpected,
+    MethodBodyNotAllowed,
+    AbstractInNonAbstract,
+    ThisInStatic,
+    ParentWithoutParent,
+    PromotionOutsideConstructor,
+    PositionalAfterNamed,
+    NamedArgumentOverwrites,
+    UnknownNamedArgument,
+    ReadonlyWithoutType,
+    ReadonlyWithDefault,
+    StaticReadonly,
+    ImplicitlyNullable,
+    MemberAccess,
+    OptionalBeforeRequired,
+    BreakOutsideLoop,
+    ConstructorReturnType,
+    VariadicDefault,
+    DuplicateArrayKey,
+    VariadicNotLast,
+    StringConcatOperator,
+    AssignmentInCondition,
+    DuplicateBranch,
+    VoidAssignment,
+    UnknownParamName,
+    TypeMismatch,
     UndefinedConstant,
     UndefinedVariable,
     UndefinedMethod,
@@ -54,11 +91,48 @@ impl DiagnosticCode {
             DiagnosticCode::UndefinedMethod => "P1013",
             DiagnosticCode::UndefinedProperty => "P1014",
             DiagnosticCode::UndefinedClassConstant => "P1012",
-            DiagnosticCode::AbstractInstantiation => "P1016",
+            DiagnosticCode::AbstractInstantiation => "P1098",
             DiagnosticCode::MissingImplementation => "P1037",
             DiagnosticCode::NoTypeInformation => "P1132",
             DiagnosticCode::UndefinedDocType => "P1133",
             DiagnosticCode::UnreachableCode => "P1108",
+            DiagnosticCode::TooManyArguments => "P1119",
+            DiagnosticCode::LoopVariableIsParameter => "P1124",
+            DiagnosticCode::OverrideWithoutParent => "P1128",
+            DiagnosticCode::MissingReturn => "P1075",
+            DiagnosticCode::PossiblyUndefinedVariable => "P1116",
+            DiagnosticCode::DuplicateSymbol => "P1004",
+            DiagnosticCode::MultipleVisibility => "P1015",
+            DiagnosticCode::FinalNotAllowed => "P1016",
+            DiagnosticCode::PrivateAbstract => "P1017",
+            DiagnosticCode::AbstractNotAllowed => "P1018",
+            DiagnosticCode::InterfaceMethodNotPublic => "P1019",
+            DiagnosticCode::MethodBodyExpected => "P1020",
+            DiagnosticCode::MethodBodyNotAllowed => "P1021",
+            DiagnosticCode::AbstractInNonAbstract => "P1029",
+            DiagnosticCode::ThisInStatic => "P1030",
+            DiagnosticCode::ParentWithoutParent => "P1035",
+            DiagnosticCode::PromotionOutsideConstructor => "P1041",
+            DiagnosticCode::PositionalAfterNamed => "P1042",
+            DiagnosticCode::NamedArgumentOverwrites => "P1043",
+            DiagnosticCode::UnknownNamedArgument => "P1044",
+            DiagnosticCode::ReadonlyWithoutType => "P1046",
+            DiagnosticCode::ReadonlyWithDefault => "P1047",
+            DiagnosticCode::StaticReadonly => "P1057",
+            DiagnosticCode::ImplicitlyNullable => "P1078",
+            DiagnosticCode::MemberAccess => "P1080",
+            DiagnosticCode::OptionalBeforeRequired => "P1101",
+            DiagnosticCode::BreakOutsideLoop => "P1104",
+            DiagnosticCode::ConstructorReturnType => "P1109",
+            DiagnosticCode::VariadicDefault => "P1113",
+            DiagnosticCode::DuplicateArrayKey => "P1118",
+            DiagnosticCode::VariadicNotLast => "P1120",
+            DiagnosticCode::StringConcatOperator => "P1121",
+            DiagnosticCode::AssignmentInCondition => "P1122",
+            DiagnosticCode::DuplicateBranch => "P1123",
+            DiagnosticCode::VoidAssignment => "P1125",
+            DiagnosticCode::UnknownParamName => "P1130",
+            DiagnosticCode::TypeMismatch => "P1006",
         }
     }
 }
@@ -76,7 +150,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn new(
+    pub(crate) fn new(
         range: TextRange,
         severity: Severity,
         code: DiagnosticCode,
@@ -107,6 +181,14 @@ pub struct DiagnosticsConfig {
     pub type_errors: bool,
     /// `diagnostics.unreachableCode`.
     pub unreachable_code: bool,
+    /// `diagnostics.languageConstraints`: modifiers, bodies, `$this`, ...
+    pub language_constraints: bool,
+    /// `diagnostics.memberAccess`: private / protected members.
+    pub member_access: bool,
+    /// `diagnostics.suspectCode`: duplicate keys, assignments in conditions, ...
+    pub suspect_code: bool,
+    /// `diagnostics.duplicateSymbols`.
+    pub duplicate_symbols: bool,
 }
 
 impl Default for DiagnosticsConfig {
@@ -127,6 +209,10 @@ impl Default for DiagnosticsConfig {
             implementation_errors: true,
             type_errors: true,
             unreachable_code: true,
+            language_constraints: true,
+            member_access: true,
+            suspect_code: true,
+            duplicate_symbols: true,
         }
     }
 }
@@ -229,6 +315,297 @@ fn class_guarded(node: &SyntaxNode, fqn: &Fqn) -> bool {
     })
 }
 
+/// Whether the definition at `def` is executed on every path to `read`:
+/// none of the conditionally executed parts it is in (if / else branches,
+/// loop bodies, switch cases, catch blocks, `&&` / `||` / `??` / `?:`
+/// operands, match arms) leaves out `read`. An `if` with `else` where every
+/// branch defines the variable counts as a definition.
+fn def_reaches(sema: &Sema, scope: &SyntaxNode, def: TextSize, read: TextSize, defs: &[TextSize]) -> bool {
+    let Some(tok) = scope.token_at_offset(def).right_biased() else { return true };
+    let mut prev: Option<SyntaxNode> = None;
+    for anc in tok.parent_ancestors() {
+        if &anc == scope {
+            return true;
+        }
+        if matches!(anc.kind(), CLOSURE_EXPR | ARROW_FN_EXPR) {
+            return true;
+        }
+        let child = prev.replace(anc.clone());
+        let Some(child) = child else { continue };
+        let cond_child = || anc.children().find(|c| crate::infer::is_expr(c.kind())).as_ref() == Some(&child);
+        let conditional = match anc.kind() {
+            // the branch taken depends on the condition
+            IF_STMT => !cond_child(),
+            ELSE_IF_CLAUSE => !cond_child(),
+            // decided at the `if` (with the else clause as branch)
+            ELSE_CLAUSE => false,
+            CASE_CLAUSE | DEFAULT_CLAUSE | CATCH_CLAUSE | MATCH_ARM => true,
+            WHILE_STMT | FOR_STMT | FOREACH_STMT => {
+                !cond_child() && child.kind() != FOREACH_VALUE && child.kind() != FOREACH_KEY
+            }
+            BIN_EXPR => {
+                let short_circuit = anc
+                    .children_with_tokens()
+                    .any(|e| matches!(e.kind(), AMP2 | PIPE2 | QUESTION2 | AND_KW | OR_KW));
+                short_circuit
+                    && anc.first_child().as_ref() != Some(&child)
+                    && !and_condition_guards(&anc, read)
+                    && !or_condition_exits(sema, &anc, read)
+            }
+            TERNARY_EXPR => anc.first_child().as_ref() != Some(&child),
+            _ => false,
+        };
+        if !conditional || anc.text_range().contains(read) {
+            continue;
+        }
+        // `if (...) { $x = 1; } else { $x = 2; }`
+        let if_stmt = anc.ancestors().find(|a| a.kind() == IF_STMT);
+        if let Some(if_stmt) = if_stmt.filter(|i| {
+            matches!(anc.kind(), IF_STMT | ELSE_IF_CLAUSE | ELSE_CLAUSE) && !i.text_range().contains(read)
+        }) {
+            if exhaustive_if_defines(sema, &if_stmt, defs) || correlated_condition(&anc, &child, read) {
+                // defined either way; outer conditions still matter
+                continue;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// A read inside `if (isset($x) ...) { ... }` / `!empty($x)` / `$x ?? ...`.
+fn isset_guarded(scope: &SyntaxNode, read: TextRange, name: &str) -> bool {
+    let Some(tok) = scope.token_at_offset(read.start()).right_biased() else { return false };
+    let checks = [format!("isset(${name}"), format!("empty(${name}"), format!("${name}??")];
+    tok.parent_ancestors().take_while(|a| a != scope).any(|a| {
+        let cond = match a.kind() {
+            IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT | TERNARY_EXPR | BIN_EXPR => {
+                a.children().find(|c| crate::infer::is_expr(c.kind()))
+            }
+            _ => None,
+        };
+        cond.is_some_and(|c| {
+            let t = ast::text_without_trivia(&c);
+            !c.text_range().contains_range(read) && checks.iter().any(|k| t.contains(k.as_str()))
+        })
+    })
+}
+
+/// `if (a && $x = f()) { ...$x... }`: in the "then" branch every operand
+/// of the `&&` chain in the condition was evaluated.
+fn and_condition_guards(bin: &SyntaxNode, read: TextSize) -> bool {
+    let mut cur = bin.clone();
+    loop {
+        let is_and = cur.kind() == PAREN_EXPR
+            || cur.kind() == BIN_EXPR
+                && cur.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW));
+        if !is_and {
+            return false;
+        }
+        let Some(parent) = cur.parent() else { return false };
+        // `a && ($x = f()) && g($x)`: later operands of the chain
+        if parent.kind() == BIN_EXPR
+            && parent.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW))
+            && parent.first_child().as_ref() == Some(&cur)
+            && parent.text_range().contains(read)
+            && !cur.text_range().contains(read)
+        {
+            return true;
+        }
+        if matches!(parent.kind(), IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT) {
+            let cond = parent.children().find(|c| crate::infer::is_expr(c.kind()));
+            if cond.as_ref() != Some(&cur) {
+                return false;
+            }
+            // the body right after the condition (not elseif / else)
+            let body =
+                parent.children().find(|c| c != &cur && (is_statement(c.kind()) || c.kind() == STMT_LIST));
+            return body.is_some_and(|b| b.text_range().contains(read));
+        }
+        cur = parent;
+    }
+}
+
+/// `if (a || is_null($x = f())) { return; } ...$x...`: after an `if` whose
+/// body always exits, every operand of its `||` condition was evaluated.
+fn or_condition_exits(sema: &Sema, bin: &SyntaxNode, read: TextSize) -> bool {
+    let mut cur = bin.clone();
+    loop {
+        let is_or = cur.kind() == PAREN_EXPR
+            || cur.kind() == BIN_EXPR
+                && cur.children_with_tokens().any(|e| matches!(e.kind(), PIPE2 | OR_KW));
+        if !is_or {
+            return false;
+        }
+        let Some(parent) = cur.parent() else { return false };
+        if parent.kind() == IF_STMT {
+            let cond = parent.children().find(|c| crate::infer::is_expr(c.kind()));
+            if cond.as_ref() != Some(&cur)
+                || parent.children().any(|c| matches!(c.kind(), ELSE_CLAUSE | ELSE_IF_CLAUSE))
+            {
+                return false;
+            }
+            let body =
+                parent.children().find(|c| c != &cur && (is_statement(c.kind()) || c.kind() == STMT_LIST));
+            return read >= parent.text_range().end() && body.is_some_and(|b| always_exits(sema, &b));
+        }
+        cur = parent;
+    }
+}
+
+/// Every branch of the `if` (which needs an `else`) defines the variable or
+/// never completes.
+fn exhaustive_if_defines(sema: &Sema, if_stmt: &SyntaxNode, defs: &[TextSize]) -> bool {
+    let Some(else_clause) = if_stmt.children().find(|c| c.kind() == ELSE_CLAUSE) else { return false };
+    let body = |n: &SyntaxNode| n.children().find(|c| is_statement(c.kind()) || c.kind() == STMT_LIST);
+    let covers = |b: Option<SyntaxNode>| {
+        b.is_some_and(|b| defs.iter().any(|d| b.text_range().contains(*d)) || always_exits(sema, &b))
+    };
+    covers(body(if_stmt))
+        && if_stmt.children().filter(|c| c.kind() == ELSE_IF_CLAUSE).all(|c| covers(body(&c)))
+        && covers(body(&else_clause))
+}
+
+/// `if (C) { $x = ...; } ... if (C) { ...$x... }`: the same condition guards
+/// definition and use.
+fn correlated_condition(branch_owner: &SyntaxNode, branch: &SyntaxNode, read: TextSize) -> bool {
+    if !matches!(branch_owner.kind(), IF_STMT | ELSE_IF_CLAUSE) {
+        return false;
+    }
+    let cond = |n: &SyntaxNode| n.children().find(|c| crate::infer::is_expr(c.kind()));
+    let Some(c) = cond(branch_owner) else { return false };
+    if &c == branch {
+        return false;
+    }
+    let text = ast::text_without_trivia(&c);
+    let Some(tok) =
+        branch_owner.ancestors().last().and_then(|root| root.token_at_offset(read).right_biased())
+    else {
+        return false;
+    };
+    // defined in the `else` of `if (C)`: used in the `else` of another `if (C)`
+    if branch.kind() == ELSE_CLAUSE {
+        return tok.parent_ancestors().any(|a| {
+            a.kind() == IF_STMT
+                && &a != branch_owner
+                && cond(&a).is_some_and(|ac| ast::text_without_trivia(&ac) == text)
+                && !a.children().any(|c| c.kind() == ELSE_IF_CLAUSE)
+                && a.children()
+                    .find(|c| c.kind() == ELSE_CLAUSE)
+                    .is_some_and(|e| e.text_range().contains(read))
+        });
+    }
+    tok.parent_ancestors().any(|a| match a.kind() {
+        IF_STMT | ELSE_IF_CLAUSE => {
+            cond(&a)
+                .is_some_and(|ac| ast::text_without_trivia(&ac) == text && !ac.text_range().contains(read))
+                && a.children()
+                    .find(|c| is_statement(c.kind()) || c.kind() == STMT_LIST)
+                    .is_some_and(|b| b.text_range().contains(read))
+        }
+        // `C ? ...$x... : ...`
+        TERNARY_EXPR => {
+            let parts: Vec<SyntaxNode> = a.children().filter(|c| crate::infer::is_expr(c.kind())).collect();
+            parts.len() == 3
+                && ast::text_without_trivia(&parts[0]) == text
+                && parts[1].text_range().contains(read)
+        }
+        // `C && ...$x...`
+        BIN_EXPR if a.children_with_tokens().any(|e| matches!(e.kind(), AMP2 | AND_KW)) => {
+            let parts: Vec<SyntaxNode> = a.children().filter(|c| crate::infer::is_expr(c.kind())).collect();
+            parts.len() == 2
+                && ast::text_without_trivia(&parts[0]) == text
+                && parts[1].text_range().contains(read)
+        }
+        _ => false,
+    })
+}
+
+/// Whether control never reaches the end of `stmt` (return, throw, exit,
+/// calls returning `never`, exhaustive if / switch / try, infinite loops).
+fn always_exits(sema: &Sema, stmt: &SyntaxNode) -> bool {
+    let body_of =
+        |n: &SyntaxNode| n.children().find(|c| is_statement(c.kind()) || matches!(c.kind(), STMT_LIST));
+    match stmt.kind() {
+        RETURN_STMT | THROW_STMT | GOTO_STMT => true,
+        EXPR_STMT => stmt.children().next().is_some_and(|e| match e.kind() {
+            THROW_EXPR | EXIT_EXPR => true,
+            CALL_EXPR | METHOD_CALL_EXPR | STATIC_CALL_EXPR => {
+                matches!(sema.infer().expr_type(&e), Type::Never)
+            }
+            _ => false,
+        }),
+        BLOCK | STMT_LIST => {
+            stmt.children().filter(|c| is_statement(c.kind())).any(|c| always_exits(sema, &c))
+        }
+        IF_STMT => {
+            let Some(else_clause) = stmt.children().find(|c| c.kind() == ELSE_CLAUSE) else { return false };
+            body_of(stmt).is_some_and(|b| always_exits(sema, &b))
+                && stmt
+                    .children()
+                    .filter(|c| c.kind() == ELSE_IF_CLAUSE)
+                    .all(|c| body_of(&c).is_some_and(|b| always_exits(sema, &b)))
+                && body_of(&else_clause).is_some_and(|b| always_exits(sema, &b))
+        }
+        SWITCH_STMT => {
+            let clauses: Vec<SyntaxNode> = stmt
+                .descendants()
+                .filter(|n| matches!(n.kind(), CASE_CLAUSE | DEFAULT_CLAUSE))
+                .filter(|c| c.ancestors().find(|a| a.kind() == SWITCH_STMT).as_ref() == Some(stmt))
+                .collect();
+            if !clauses.iter().any(|c| c.kind() == DEFAULT_CLAUSE) {
+                return false;
+            }
+            // every clause exits before a `break` (empty clauses fall through)
+            clauses.iter().all(|c| {
+                let stmts: Vec<SyntaxNode> = c.children().filter(|s| is_statement(s.kind())).collect();
+                if stmts.is_empty() {
+                    return true;
+                }
+                for s in &stmts {
+                    if s.kind() == BREAK_STMT {
+                        return false;
+                    }
+                    if always_exits(sema, s) {
+                        return true;
+                    }
+                }
+                false
+            })
+        }
+        TRY_STMT => {
+            let finally = stmt
+                .children()
+                .find(|c| c.kind() == FINALLY_CLAUSE)
+                .and_then(|f| f.children().find(|c| c.kind() == BLOCK));
+            if finally.is_some_and(|f| always_exits(sema, &f)) {
+                return true;
+            }
+            stmt.children().find(|c| c.kind() == BLOCK).is_some_and(|b| always_exits(sema, &b))
+                && stmt
+                    .children()
+                    .filter(|c| c.kind() == CATCH_CLAUSE)
+                    .all(|c| c.children().find(|b| b.kind() == BLOCK).is_some_and(|b| always_exits(sema, &b)))
+        }
+        // `while (true)` / `for (;;)` / `do { } while (true)` without `break`
+        WHILE_STMT | DO_WHILE_STMT | FOR_STMT => {
+            let text = stmt.text().to_string();
+            let infinite = match stmt.kind() {
+                FOR_STMT => text.replace(char::is_whitespace, "").starts_with("for(;;)"),
+                _ => {
+                    let cond = stmt.children().find(|c| crate::infer::is_expr(c.kind()));
+                    cond.is_some_and(|c| {
+                        ast::text_without_trivia(&c).eq_ignore_ascii_case("true")
+                            || ast::text_without_trivia(&c) == "1"
+                    })
+                }
+            };
+            infinite && !stmt.descendants().any(|n| n.kind() == BREAK_STMT)
+        }
+        _ => false,
+    }
+}
+
 /// Whether `node` is only evaluated after a check like
 /// `method_exists($x, 'name')` (in an `if` / `&&` / `?:` condition).
 fn guarded_by(node: &SyntaxNode, checks: &[&str], name: &str) -> bool {
@@ -252,16 +629,16 @@ const BUILTIN_TYPES: &[&str] = &[
     "object", "mixed", "void", "null", "never", "false", "true", "resource", "self", "static", "parent",
 ];
 
-struct Checker<'s, 'a> {
-    sema: &'s Sema<'a>,
-    config: &'s DiagnosticsConfig,
-    out: Vec<Diagnostic>,
+pub(crate) struct Checker<'s, 'a> {
+    pub(crate) sema: &'s Sema<'a>,
+    pub(crate) config: &'s DiagnosticsConfig,
+    pub(crate) out: Vec<Diagnostic>,
     /// Set for Blade templates.
-    blade: Option<crate::blade::Blade>,
+    pub(crate) blade: Option<crate::blade::Blade>,
 }
 
 impl Checker<'_, '_> {
-    fn push(&mut self, d: Diagnostic) {
+    pub(crate) fn push(&mut self, d: Diagnostic) {
         self.out.push(d);
     }
 
@@ -299,6 +676,13 @@ impl Checker<'_, '_> {
             }
             if matches!(node.kind(), FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR) {
                 self.check_variables(&node);
+                self.check_function_body(&node, index_ready);
+            }
+            if self.blade.is_none() {
+                self.lint(&node, index_ready);
+            }
+            if node.kind() == ARROW_FN_EXPR && self.config.unused_symbols && self.blade.is_none() {
+                self.check_arrow_params(&node);
             }
             if matches!(node.kind(), BLOCK | CASE_CLAUSE)
                 && self.config.unreachable_code
@@ -378,6 +762,190 @@ impl Checker<'_, '_> {
         }
     }
 
+    /// Loop variables shadowing parameters (P1124), `#[\Override]` without a
+    /// parent method (P1128) and missing returns (P1075).
+    fn check_function_body(&mut self, func: &SyntaxNode, index_ready: bool) {
+        let params: Vec<String> = func
+            .children()
+            .find_map(ast::ParamList::cast)
+            .map(|pl| pl.params().filter_map(|p| p.name()).collect())
+            .unwrap_or_default();
+        let own = |n: &SyntaxNode| {
+            n.ancestors()
+                .find(|a| matches!(a.kind(), FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR | ARROW_FN_EXPR))
+                .as_ref()
+                == Some(func)
+        };
+        if !params.is_empty() {
+            for binding in func.descendants().filter(|n| matches!(n.kind(), FOREACH_VALUE | FOREACH_KEY)) {
+                if !own(&binding) {
+                    continue;
+                }
+                for tok in binding
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .filter(|t| t.kind() == VARIABLE)
+                {
+                    let name = &tok.text()[1..];
+                    if params.iter().any(|p| p == name) {
+                        self.push(Diagnostic::new(
+                            tok.text_range(),
+                            Severity::Information,
+                            DiagnosticCode::LoopVariableIsParameter,
+                            format!("Loop variable ${name} is also declared as a parameter."),
+                        ));
+                    }
+                }
+            }
+        }
+        if index_ready && func.kind() == METHOD_DECL && self.config.implementation_errors {
+            self.check_override(func);
+        }
+        self.check_missing_return(func, &own);
+    }
+
+    /// Unused parameters of `fn (...) => ...`.
+    fn check_arrow_params(&mut self, arrow: &SyntaxNode) {
+        let Some(params) = arrow.children().find_map(ast::ParamList::cast) else { return };
+        let body: Vec<SyntaxNode> =
+            arrow.children().filter(|c| c.kind() != PARAM_LIST && crate::infer::is_expr(c.kind())).collect();
+        for p in params.params() {
+            let (Some(var), Some(name)) = (p.variable(), p.name()) else { continue };
+            if p.by_ref() {
+                continue;
+            }
+            let used = body.iter().any(|b| {
+                b.descendants_with_tokens().filter_map(|e| e.into_token()).any(|t| {
+                    t.kind() == VARIABLE && t.text()[1..] == name
+                        || t.kind() == STRING && t.text().contains(&format!("${name}"))
+                })
+            });
+            if !used {
+                let mut d = Diagnostic::new(
+                    var.text_range(),
+                    Severity::Hint,
+                    DiagnosticCode::UnusedSymbol,
+                    format!("Symbol '${name}' is declared but not used."),
+                );
+                d.unnecessary = true;
+                self.push(d);
+            }
+        }
+    }
+
+    fn check_override(&mut self, method: &SyntaxNode) {
+        let has_override = method
+            .children()
+            .filter(|c| c.kind() == ATTRIBUTE_GROUP)
+            .flat_map(|g| g.descendants().filter(|n| n.kind() == ATTRIBUTE).collect::<Vec<_>>())
+            .filter_map(|a| a.children().find(|c| c.kind() == QUALIFIED_NAME))
+            .any(|q| {
+                self.sema
+                    .resolve_class_name(&ast::text_without_trivia(&q), &q)
+                    .is_some_and(|f| f.as_str().eq_ignore_ascii_case("Override"))
+            });
+        if !has_override {
+            return;
+        }
+        let Some(class) = method
+            .ancestors()
+            .find(|n| matches!(n.kind(), CLASS_DECL | ENUM_DECL | ANON_CLASS | INTERFACE_DECL | TRAIT_DECL))
+        else {
+            return;
+        };
+        if class.kind() == TRAIT_DECL {
+            return;
+        }
+        let (Some(fqn), Some(name)) =
+            (self.sema.class_fqn(&class), method.children().find_map(ast::MemberName::cast))
+        else {
+            return;
+        };
+        let Some(mname) = name.text() else { return };
+        let index = self.sema.index();
+        if index.has_unknown_ancestor(&fqn) {
+            return;
+        }
+        // traits used by the class itself do not count, those of parents do
+        let own_traits: Vec<Fqn> = index.class(&fqn).map(|(_, c)| c.traits.clone()).unwrap_or_default();
+        let parent_has = index
+            .ancestors(&fqn)
+            .into_iter()
+            .filter(|(_, c)| c.fqn != fqn && !own_traits.contains(&c.fqn))
+            .any(|(_, c)| c.method(&mname).is_some());
+        if !parent_has {
+            self.push(Diagnostic::new(
+                name.syntax().text_range(),
+                Severity::Error,
+                DiagnosticCode::OverrideWithoutParent,
+                format!(
+                    "{}::{mname}() has #[\\Override] attribute, but no matching parent method exists.",
+                    fqn.short()
+                ),
+            ));
+        }
+    }
+
+    /// A declared return type (other than void / never / mixed / null) but a
+    /// body whose end is reachable.
+    fn check_missing_return(&mut self, func: &SyntaxNode, own: &dyn Fn(&SyntaxNode) -> bool) {
+        let Some(ret) = func.children().find(|c| c.kind() == RETURN_TYPE) else { return };
+        let Some(body) = func.children().find(|c| c.kind() == BLOCK) else { return };
+        let ty = ast::text_without_trivia(&ret).trim_start_matches(':').to_ascii_lowercase();
+        if matches!(ty.as_str(), "void" | "never" | "mixed" | "null" | "?mixed") {
+            return;
+        }
+        // generators
+        if body.descendants().any(|n| matches!(n.kind(), YIELD_EXPR | YIELD_FROM_EXPR) && own(&n)) {
+            return;
+        }
+        if always_exits(self.sema, &body) {
+            return;
+        }
+        // a trailing call we cannot resolve may not return (`$this->fail()`
+        // without PHPUnit installed)
+        let last = body.children().filter(|c| is_statement(c.kind())).last();
+        if let Some(call) = last.filter(|l| l.kind() == EXPR_STMT).and_then(|l| l.children().next()) {
+            if matches!(call.kind(), CALL_EXPR | METHOD_CALL_EXPR | STATIC_CALL_EXPR)
+                && self.unresolved_call(&call)
+            {
+                return;
+            }
+        }
+        let range = ret.children().last().map_or(ret.text_range(), |t| t.text_range());
+        self.push(Diagnostic::new(
+            range,
+            Severity::Error,
+            DiagnosticCode::MissingReturn,
+            "Not all paths return a value.".to_string(),
+        ));
+    }
+
+    fn unresolved_call(&self, call: &SyntaxNode) -> bool {
+        match call.kind() {
+            CALL_EXPR => call.first_child().filter(|c| c.kind() == NAME_EXPR).is_none_or(|c| {
+                self.sema.resolve_function(&ast::text_without_trivia(&c), c.text_range().start()).is_none()
+            }),
+            _ => {
+                let Some(name) = call.children().find_map(ast::MemberName::cast).and_then(|m| m.text())
+                else {
+                    return true;
+                };
+                let Some(lhs) = call.first_child() else { return true };
+                let classes = if call.kind() == STATIC_CALL_EXPR {
+                    crate::classify::static_lhs_classes(self.sema, &lhs)
+                } else {
+                    self.sema.infer().expr_type(&lhs).class_names()
+                };
+                let index = self.sema.index();
+                classes.is_empty()
+                    || classes
+                        .iter()
+                        .any(|c| index.has_unknown_ancestor(c) || index.find_method(c, &name).is_none())
+            }
+        }
+    }
+
     /// Statements after `return` / `throw` / `exit` / `break` / `continue`
     /// in the same block.
     fn check_unreachable(&mut self, block: &SyntaxNode) {
@@ -417,7 +985,7 @@ impl Checker<'_, '_> {
         else {
             return true;
         };
-        if matches!(class.kind(), ANON_CLASS | TRAIT_DECL | INTERFACE_DECL) {
+        if matches!(class.kind(), TRAIT_DECL | INTERFACE_DECL) {
             return true;
         }
         let Some(fqn) = self.sema.class_fqn(&class) else { return true };
@@ -580,17 +1148,14 @@ impl Checker<'_, '_> {
                 range,
                 Severity::Error,
                 DiagnosticCode::ArgumentCount,
-                format!(
-                    "Expected {required} argument{}. Found {count}.",
-                    if required == 1 { "" } else { "s" }
-                ),
+                format!("Not enough arguments. Expected {required}. Found {count}."),
             ));
         } else if !variadic && count > max {
             self.push(Diagnostic::new(
                 range,
-                Severity::Error,
-                DiagnosticCode::ArgumentCount,
-                format!("Expected {max} argument{}. Found {count}.", if max == 1 { "" } else { "s" }),
+                Severity::Information,
+                DiagnosticCode::TooManyArguments,
+                format!("Too many arguments. Expected {max}. Found {count}."),
             ));
         }
     }
@@ -855,7 +1420,7 @@ impl Checker<'_, '_> {
                     class.text_range(),
                     Severity::Error,
                     DiagnosticCode::AbstractInstantiation,
-                    format!("Cannot instantiate {what} '{fqn}'."),
+                    format!("Cannot instantiate {what} {fqn}."),
                 ));
                 return;
             }
@@ -869,9 +1434,9 @@ impl Checker<'_, '_> {
                 if n > 0 && !args.children().any(|a| a.children_with_tokens().any(|e| e.kind() == DOT3)) {
                     self.push(Diagnostic::new(
                         class.text_range(),
-                        Severity::Error,
-                        DiagnosticCode::ArgumentCount,
-                        format!("Expected 0 arguments. Found {n}."),
+                        Severity::Information,
+                        DiagnosticCode::TooManyArguments,
+                        format!("Too many arguments. Expected 0. Found {n}."),
                     ));
                 }
             }
@@ -933,7 +1498,7 @@ impl Checker<'_, '_> {
                 if self.sema.index().class(&fqn).is_none() {
                     self.push(Diagnostic::new(
                         r.range,
-                        Severity::Error,
+                        Severity::Information,
                         DiagnosticCode::UndefinedDocType,
                         format!("PHPDoc undefined type '{fqn}'."),
                     ));
@@ -1083,7 +1648,10 @@ impl Checker<'_, '_> {
                         .ancestors()
                         .find(|a| a.kind() == PARAM)
                         .is_some_and(|p| p.children_with_tokens().any(|e| e.kind() == AMP));
-                    if !by_ref {
+                    if by_ref {
+                        // written for the caller
+                        v.reads.push((tok.text_range(), true));
+                    } else {
                         v.def_ranges.push(tok.text_range());
                     }
                 }
@@ -1112,13 +1680,27 @@ impl Checker<'_, '_> {
                     let defined_before = v.defs.iter().any(|d| *d < pos);
                     let defined_in_loop =
                         loops.iter().any(|l| l.contains(pos) && v.defs.iter().any(|d| l.contains(*d)));
-                    if !defined_before && !defined_in_loop {
+                    if !defined_before && !defined_in_loop && !isset_guarded(scope, *range, name) {
                         diags.push(Diagnostic::new(
                             *range,
                             Severity::Error,
                             DiagnosticCode::UndefinedVariable,
                             format!("Undefined variable '${name}'."),
                         ));
+                    } else if defined_before
+                        && !defined_in_loop
+                        && !v.param
+                        && !isset_guarded(scope, *range, name)
+                    {
+                        let before: Vec<TextSize> = v.defs.iter().copied().filter(|d| *d < pos).collect();
+                        if !before.iter().any(|d| def_reaches(self.sema, scope, *d, pos, &before)) {
+                            diags.push(Diagnostic::new(
+                                *range,
+                                Severity::Warning,
+                                DiagnosticCode::PossiblyUndefinedVariable,
+                                format!("Possible undefined variable '${name}'."),
+                            ));
+                        }
                     }
                 }
             }

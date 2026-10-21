@@ -145,8 +145,18 @@ impl ServerConfig {
                 ("diagnostics.implementationErrors", &mut d.implementation_errors),
                 ("diagnostics.typeErrors", &mut d.type_errors),
                 ("diagnostics.unreachableCode", &mut d.unreachable_code),
+                ("diagnostics.languageConstraints", &mut d.language_constraints),
+                ("diagnostics.memberAccess", &mut d.member_access),
+                ("diagnostics.suspectCode", &mut d.suspect_code),
+                ("diagnostics.duplicateSymbols", &mut d.duplicate_symbols),
             ] {
-                if let Some(v) = get(&root, key).and_then(Value::as_bool) {
+                // booleans, or "on" / "off" / "relaxed" (Intelephense 1.13+)
+                let value = get(&root, key).and_then(|v| match v {
+                    Value::Bool(b) => Some(*b),
+                    Value::String(s) => Some(!s.eq_ignore_ascii_case("off")),
+                    _ => None,
+                });
+                if let Some(v) = value {
                     *flag = v;
                 }
             }
@@ -275,5 +285,9 @@ mod tests {
         assert_eq!(c.exclude.len(), 2);
         c.update(&json!({"intelephense": {"diagnostics": {"run": null}}}));
         assert!(c.diagnostics_on_save);
+        c.update(
+            &json!({"intelephense": {"diagnostics": {"undefinedVariables": "off", "argumentCount": "on"}}}),
+        );
+        assert!(!c.diagnostics.undefined_variables && c.diagnostics.argument_count);
     }
 }

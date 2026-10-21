@@ -33,6 +33,8 @@ const TYPE_TAGS: &[&str] = &[
 /// Pseudo types and words that are never class names.
 const NOT_CLASSES: &[&str] = &[
     "of",
+    "covariant",
+    "contravariant",
     "as",
     "is",
     "not",

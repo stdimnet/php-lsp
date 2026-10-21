@@ -43,12 +43,13 @@ fn main() {
         structure += ws.semantic_tokens(*id, None).len();
         for d in ws.diagnostics(*id) {
             *counts.entry(d.code.as_str()).or_default() += 1;
-            if show.as_deref() == Some(d.code.as_str()) && shown < n {
+            if show.as_deref().is_some_and(|s| s.split(',').any(|c| c == d.code.as_str())) && shown < n {
                 shown += 1;
                 let f = ws.file(*id).unwrap();
                 let lc = f.line_index.line_col(d.range.start());
                 println!(
-                    "{}:{}: {} [{}]",
+                    "{} {}:{}: {} [{}]",
+                    d.code.as_str(),
                     f.path.trim_start_matches("file://"),
                     lc.line + 1,
                     d.message,

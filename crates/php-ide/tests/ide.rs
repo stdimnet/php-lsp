@@ -311,12 +311,12 @@ function f(Ok $ok) {
     let expected = [
         "P1003 Symbol 'Some\\Unused' is declared but not used.",
         "P1037 'App\\Circle' does not implement methods App\\Base::name, App\\Shape::area.",
-        "P1005 Expected 2 arguments. Found 1.",
-        "P1005 Expected 2 arguments. Found 3.",
+        "P1005 Not enough arguments. Expected 2. Found 1.",
+        "P1119 Too many arguments. Expected 2. Found 3.",
         "P1013 Undefined method 'missing'.",
         "P1014 Undefined property '$nope'.",
         "P1012 Undefined class constant 'NOPE'.",
-        "P1016 Cannot instantiate interface 'App\\Shape'.",
+        "P1098 Cannot instantiate interface App\\Shape.",
         "P1009 Undefined type 'App\\Nope'.",
         "P1010 Undefined function 'App\\undefined_fn'.",
         "P1008 Undefined variable '$undefinedVar'.",
@@ -953,6 +953,85 @@ fn blade_structure() {
     assert!(tokens.windows(2).all(|w| w[0].range.start() <= w[1].range.start()));
 }
 
+#[test]
+fn language_constraints_and_suspect_code() {
+    let src = r#"<?php
+interface I { private function a(); function b() {} }
+abstract class A { abstract private function c(); abstract function d() {} function e(); }
+class B { abstract function f(); public public function g() {} readonly $r; public readonly int $s = 1; public static readonly int $t;
+  function __construct(private int $p) {}
+  function __construct2(private int $q) {}
+  public function __destruct(): void {}
+  private function hidden(): int { return 1; }
+  protected int $prot = 1;
+  /** @param int $nope */
+  function h(int $x = 1, int $y, int ...$z) { return [$x, $y, $z]; }
+  static function st() { return $this; }
+  function k() { return parent::k(); }
+  function m() { return [1 => 'a', '1' => 'b', 'x' => 1, 'x' => 2]; }
+  function m() {}
+}
+function fn1() { break; }
+function fn2(int $a, int $b) { return $a + $b; }
+fn2(a: 1, 2);
+fn2(a: 1, a: 2);
+fn2(c: 1, b: 2);
+function fn3(B $b) { $b->hidden(); return $b->prot; }
+function fn4($v) { if ($v = 1) { return 'a' + 1; } elseif ($v) { return 1; } elseif ($v) { return 2; } return match ($v) { 1 => 'a', 1 => 'b', default => 'c' }; }
+function fn5(): void {}
+function fn6() { $x = fn5(); return $x; }
+"#;
+    let d = diags(src);
+    let codes: Vec<&str> = d.iter().map(|x| &x[..5]).collect();
+    for c in [
+        "P1019", "P1021", "P1017", "P1020", "P1029", "P1015", "P1046", "P1047", "P1057", "P1041", "P1101",
+        "P1130", "P1030", "P1035", "P1118", "P1004", "P1104", "P1042", "P1043", "P1044", "P1080", "P1122",
+        "P1121", "P1123", "P1125",
+    ] {
+        assert!(codes.contains(&c), "missing {c} in {d:#?}");
+    }
+    let access: Vec<&String> = d.iter().filter(|x| x.starts_with("P1080")).collect();
+    assert_eq!(
+        access,
+        vec![
+            "P1080 Cannot access private method B::hidden from global scope.",
+            "P1080 Cannot access protected property B::$prot from global scope."
+        ]
+    );
+}
+
+#[test]
+fn argument_type_errors() {
+    let src = r#"<?php
+interface Shape {}
+class Circle implements Shape { function __toString(): string { return ''; } }
+class Other {}
+function area(Shape $s): float { return 1.0; }
+function name(string $n): string { return $n; }
+function nums(array $a, ?int $i = null, int|string $u = 1, iterable $it = [], callable $c = null) {}
+area(new Circle());
+area(new Other());
+area(null);
+name(new Circle());
+name(42);
+name([]);
+nums([1], null, 'x', [], fn () => 1);
+nums('x');
+nums([], new Other());
+"#;
+    let d: Vec<String> = diags(src).into_iter().filter(|d| d.starts_with("P1006")).collect();
+    assert_eq!(
+        d,
+        vec![
+            "P1006 Expected type 'Shape'. Found 'Other'.",
+            "P1006 Expected type 'Shape'. Found 'null'.",
+            "P1006 Expected type 'string'. Found 'array'.",
+            "P1006 Expected type 'array'. Found 'string'.",
+            "P1006 Expected type '?int'. Found 'Other'.",
+        ]
+    );
+}
+
 /// Differences found by comparing with Intelephense (editors/compare).
 #[test]
 fn intelephense_parity() {
@@ -1039,6 +1118,43 @@ fn intelephense_parity() {
     let d = diags(&format!("<?php\n{classes}function a() {{ $p = new class extends Stmt {{ public int $actual = 1; function run(): int {{ return $this->actual; }} }}; return $p->actual + $p->run(); }}\n"));
     assert!(d.is_empty(), "{d:?}");
     assert_eq!(type_at(&format!("<?php\n{classes}function a() {{ $p = new class extends Stmt {{ public int $actual = 1; }}; $p->actual<|>; }}\n")), "int");
+    // P1124 / P1128 / P1075
+    let d = diags("<?php\nfunction lp(array $items, int $item) { foreach ($items as $item) { echo $item; } }\nclass OB { function a(): int { return 1; } }\nclass OC extends OB {\n  #[\\Override] function a(): int { return 2; }\n  #[\\Override] function b(): int { if (rand()) { return 1; } }\n  function c(): int { if (rand()) { return 1; } else { throw new \\Exception(); } }\n  function d(int $x): string { switch ($x) { case 1: return 'a'; default: return 'b'; } }\n  function e(): iterable { yield 1; }\n  function f(): int { while (true) { } }\n}\n");
+    assert_eq!(
+        d,
+        vec![
+            "P1124 Loop variable $item is also declared as a parameter.",
+            "P1128 OC::b() has #[\\Override] attribute, but no matching parent method exists.",
+            "P1075 Not all paths return a value."
+        ]
+    );
+    // P1116 possibly undefined variables
+    let d = diags("<?php\nfunction pu(int $a) {\n  if ($a) { $x = 1; }\n  echo $x;\n  if ($a) { $y = 1; } else { $y = 2; }\n  echo $y;\n  foreach ([1] as $v) { $z = $v; }\n  echo $z;\n  $a && ($w = 1);\n  echo $w;\n  if (preg_match('/x/', 'y', $m)) {}\n  echo $m[0];\n  try { $t = 1; } catch (\\Exception) { return; }\n  echo $t;\n}\n");
+    assert_eq!(
+        d,
+        vec![
+            "P1116 Possible undefined variable '$x'.",
+            "P1116 Possible undefined variable '$z'.",
+            "P1116 Possible undefined variable '$w'."
+        ]
+    );
+    // && in conditions, by-ref outputs, arrow fn params, `$this` in anon class arguments
+    let d = diags("<?php\nclass Q2 { private int $store = 1;\n  function a(?int &$code, $h): int|false {\n    $code = 0;\n    if (rand() && $p = $this->b()) { return $p; }\n    $f = fn (string $unused, int $u) => $u;\n    $o = new class($this->store) { function __construct(public int $s) {} };\n    return $f('x', 1) + $o->s + $h;\n  }\n  function b(): int { return 1; }\n}\n");
+    assert_eq!(
+        d,
+        vec![
+            "P1132 Parameter $h has no type information available.",
+            "P1003 Symbol '$unused' is declared but not used."
+        ]
+    );
+    let d = diags("<?php\nfunction w(?object $j): int { if (!$j || is_null($u = $j->id ?? null)) { return 0; } return $u; }\n");
+    assert!(d.is_empty(), "{d:?}");
+    let d = diags("<?php\nfunction r1($f, ?string $n) { if ($f) { $c = 1; } else { return 0; } if ($n !== null) { $u = 1; } if (isset($i)) { echo $i; } if ($n !== null) { echo $u; } return $c; }\n");
+    assert_eq!(d, vec!["P1132 Parameter $f has no type information available."]);
+    let d = diags("<?php\nclass PB { const X = 1; }\nclass PF { const X = PB::X; const Y = PB::X;\n  /**\n   * @param string|array<int, covariant $this> $r\n   */\n  function f($r, bool $c, object $m) { if ($c) { $k = 1; } if ($m instanceof PB) { $g = 1; } $o = $c ? $k : 0; return [$r, $o, $m instanceof PB && $g, rand() && ($i = 1) && $i]; }\n}\n");
+    assert!(d.is_empty(), "{d:?}");
+    let d = diags("<?php\nfunction sd(bool $s) { if (!$s) { echo 1; } else { $d = 2; } if (!$s) { return 0; } else { return $d; } }\n");
+    assert!(d.is_empty(), "{d:?}");
     // attribute classes
     let d = diags(
         "<?php\nnamespace A;\nuse Sym\\AsCommand;\n#[AsCommand('x'), \\Attribute, \\Override]\nclass C {}\n",
