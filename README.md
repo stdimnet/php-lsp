@@ -30,6 +30,15 @@ cargo build --release
 ./target/release/php-lsp --stdio          # or --socket=<port>
 ```
 
+`--node-ipc` is supported as well, and [`editors/node/php-lsp.js`](editors/node) is a
+Node.js launcher for clients that expect a Node server module, such as the Intelephense
+VS Code extension. Neovim example:
+
+```lua
+vim.lsp.config('php_lsp', { cmd = { 'php-lsp', '--stdio' }, filetypes = { 'php' }, root_markers = { 'composer.json', '.git' } })
+vim.lsp.enable('php_lsp')
+```
+
 To use it as a library:
 
 ```rust
@@ -65,6 +74,12 @@ when both set the same key, `php-lsp` wins.
 | `inlayHint.*`             | `parameterNames`, `returnTypes`, `parameterTypes` (all `true`) |
 | `format.enable`           | `true` |
 | `format.braces`           | `psr12` (`allman`, `k&r`) |
+| `diagnostics.run`         | `onType` (`onSave`) |
+| `environment.includePaths`| `[]` (extra directories indexed like `vendor/`) |
+
+Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `clearCache`,
+`licenceKey`, `isVscode`) are accepted; a licence key is not needed for any feature. The
+`cancelIndexing` request is supported.
 
 ## Status / roadmap
 
@@ -81,8 +96,8 @@ when both set the same key, `php-lsp` wins.
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
   hierarchy, code lens, PHPDoc completion
-- [ ] **Phase 5, Intelephense compatibility:** full settings schema, `--node-ipc`, custom
-  messages, `intelephense` alias binary
+- [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
+  `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher
 - [ ] **Phase 6, extras:** refactorings, dead code / unused detection, PHPStan / Psalm /
   PHPCS / php-cs-fixer / PHPUnit integration
 - [ ] **Phase 7, frameworks:** plugin API, Laravel, Symfony, WordPress

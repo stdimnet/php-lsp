@@ -137,8 +137,12 @@ fn incremental_changes_with_utf16() {
             "contentChanges": [{"range": {"start": {"line": 1, "character": 18}, "end": {"line": 1, "character": 18}}, "text": ";"}]
         }),
     );
-    let d = c.wait_notification("textDocument/publishDiagnostics");
-    assert_eq!(d["version"], 2);
+    let d = loop {
+        let d = c.wait_notification("textDocument/publishDiagnostics");
+        if d["version"] == 2 {
+            break d;
+        }
+    };
     assert_eq!(d["diagnostics"], json!([]));
     let tree = c.request("php-lsp/syntaxTree", json!({"textDocument": {"uri": uri}}));
     assert!(tree.as_str().unwrap().contains("SEMICOLON@"));
@@ -160,8 +164,8 @@ fn php_version_from_intelephense_settings() {
         "workspace/didChangeConfiguration",
         json!({"settings": {"intelephense.environment.phpVersion": "8.3"}}),
     );
-    let d = c.wait_notification("textDocument/publishDiagnostics");
-    assert_eq!(d["diagnostics"], json!([]));
+    // diagnostics may be republished several times (re-indexing); wait for the new result
+    while c.wait_notification("textDocument/publishDiagnostics")["diagnostics"] != json!([]) {}
     c.shutdown();
 }
 

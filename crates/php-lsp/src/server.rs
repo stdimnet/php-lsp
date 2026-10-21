@@ -56,6 +56,8 @@ pub struct Server {
     task_rx: Receiver<Task>,
     generation: u32,
     indexing: bool,
+    cancel_indexing: Arc<std::sync::atomic::AtomicBool>,
+    loaded_stubs: Vec<String>,
 }
 
 impl Server {
@@ -108,6 +110,8 @@ impl Server {
             task_rx,
             generation: 0,
             indexing: false,
+            cancel_indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            loaded_stubs: Vec::new(),
         })
     }
 
@@ -201,6 +205,11 @@ impl Server {
         });
     }
 
+    /// `cancelIndexing` (Intelephense): stops the running indexing job.
+    pub(crate) fn cancel_indexing(&mut self) {
+        self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn log(&self, message: &str) {
         self.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
             typ: lsp::MessageType::LOG,
@@ -227,7 +236,14 @@ impl Server {
                 DidOpenTextDocument::METHOD => self.did_open(serde_json::from_value(not.params)?),
                 DidChangeTextDocument::METHOD => self.did_change(serde_json::from_value(not.params)?),
                 DidCloseTextDocument::METHOD => self.did_close(serde_json::from_value(not.params)?),
-                DidSaveTextDocument::METHOD => {}
+                DidSaveTextDocument::METHOD => {
+                    let p: lsp::DidSaveTextDocumentParams = serde_json::from_value(not.params)?;
+                    if self.config.diagnostics_on_save {
+                        if let Some(id) = self.file_for(&p.text_document.uri) {
+                            self.publish_now(id);
+                        }
+                    }
+                }
                 DidChangeWatchedFiles::METHOD => {
                     self.did_change_watched_files(serde_json::from_value(not.params)?)
                 }
@@ -309,7 +325,8 @@ impl Server {
             || old.stubs != self.config.stubs
             || old.exclude != self.config.exclude
             || old.associations != self.config.associations
-            || old.max_file_size != self.config.max_file_size;
+            || old.max_file_size != self.config.max_file_size
+            || old.include_paths != self.config.include_paths;
         let mut ide = self.config.ide_config();
         if reindex {
             // keep the old stubs until re-indexing replaces them
@@ -357,11 +374,21 @@ impl Server {
         // apply the new stub list now; the stubs are re-indexed below
         self.workspace.set_config(self.config.ide_config());
         self.workspace.set_index_ready(false);
-        let stubs = self.workspace.stub_files();
-        let roots = self.roots.clone();
+        // stubs are small: index them right away so hover / completion of
+        // built-ins work from the first request
+        if self.workspace.config().stubs != self.loaded_stubs || self.generation == 1 {
+            self.workspace.load_stubs();
+            self.loaded_stubs = self.workspace.config().stubs.clone();
+        }
+        let mut roots: Vec<(PathBuf, FileKind)> =
+            self.roots.iter().map(|r| (r.clone(), FileKind::Workspace)).collect();
+        roots.extend(self.config.include_paths.iter().map(|p| (PathBuf::from(p), FileKind::Vendor)));
         let scan = self.config.scan_config();
         let opts = self.workspace.extract_options();
         let tx = self.task_tx.clone();
+        self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel_indexing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.cancel_indexing.clone();
         if !self.indexing {
             self.indexing = true;
             self.notify_raw("indexingStarted", Value::Null);
@@ -379,11 +406,17 @@ impl Server {
         }
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let files = php_ide::index_files(stubs, opts);
-            let _ = tx.send(Task::Indexed { generation, files, stubs: true });
             let mut count = 0;
-            for root in roots {
-                let paths = php_ide::collect_files(&root, &scan);
+            for (root, root_kind) in roots {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let mut paths = php_ide::collect_files(&root, &scan);
+                if root_kind == FileKind::Vendor {
+                    for p in &mut paths {
+                        p.1 = FileKind::Vendor;
+                    }
+                }
                 // read and index in chunks to keep memory bounded and the UI updated
                 for chunk in paths.chunks(2000) {
                     let texts: Vec<(String, Arc<str>, FileKind)> = chunk
@@ -394,6 +427,9 @@ impl Server {
                             Some((uri::key_from_path(p), Arc::<str>::from(text), *kind))
                         })
                         .collect();
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     count += texts.len();
                     let files = php_ide::index_files(texts, opts);
                     if tx.send(Task::Indexed { generation, files, stubs: false }).is_err() {
@@ -505,7 +541,9 @@ impl Server {
         }
         self.workspace.set_file(&key, text);
         self.versions.insert(id, p.text_document.version);
-        self.publish_diagnostics(id);
+        if !self.config.diagnostics_on_save {
+            self.publish_diagnostics(id);
+        }
     }
 
     fn did_close(&mut self, p: lsp::DidCloseTextDocumentParams) {
@@ -528,6 +566,10 @@ impl Server {
     }
 
     pub(crate) fn publish_diagnostics(&mut self, id: FileId) {
+        self.publish_now(id);
+    }
+
+    fn publish_now(&mut self, id: FileId) {
         let (Some(uri), Some(index), Some(file)) =
             (self.client_uris.get(&id).cloned(), self.workspace.line_index(id), self.workspace.file(id))
         else {
@@ -676,7 +718,7 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             change: Some(lsp::TextDocumentSyncKind::INCREMENTAL),
             will_save: None,
             will_save_wait_until: None,
-            save: None,
+            save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
         })),
         document_symbol_provider: Some(lsp::OneOf::Left(true)),
         folding_range_provider: Some(lsp::FoldingRangeProviderCapability::Simple(true)),

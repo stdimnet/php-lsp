@@ -41,6 +41,10 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         SemanticTokensFullRequest::METHOD => handle(s, req, semantic_tokens_full),
         SemanticTokensRangeRequest::METHOD => handle(s, req, semantic_tokens_range),
         crate::ext::SyntaxTree::METHOD => handle(s, req, syntax_tree),
+        "cancelIndexing" => {
+            s.cancel_indexing();
+            Ok(Value::Null)
+        }
         _ => {
             s.respond_error(
                 req.id,

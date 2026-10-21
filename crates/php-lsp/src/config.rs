@@ -24,6 +24,10 @@ pub struct ServerConfig {
     pub stubs: Vec<String>,
     pub insert_use_declaration: bool,
     pub format_enable: bool,
+    /// `diagnostics.run`: publish on save instead of on every change.
+    pub diagnostics_on_save: bool,
+    /// `environment.includePaths`: extra directories indexed as dependencies.
+    pub include_paths: Vec<String>,
     pub format_braces: php_ide::BraceStyle,
     pub max_completion_items: usize,
 }
@@ -43,6 +47,8 @@ impl Default for ServerConfig {
             stubs: ide.stubs,
             insert_use_declaration: ide.auto_import,
             format_enable: true,
+            diagnostics_on_save: false,
+            include_paths: Vec::new(),
             format_braces: php_ide::BraceStyle::Psr12,
             max_completion_items: ide.max_completion_items,
         }
@@ -132,6 +138,12 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "completion.insertUseDeclaration").and_then(Value::as_bool) {
                 self.insert_use_declaration = v;
+            }
+            if let Some(v) = get(&root, "diagnostics.run").and_then(Value::as_str) {
+                self.diagnostics_on_save = v.eq_ignore_ascii_case("onSave");
+            }
+            if let Some(v) = get(&root, "environment.includePaths").and_then(string_list) {
+                self.include_paths = v;
             }
             if let Some(v) = get(&root, "format.enable").and_then(Value::as_bool) {
                 self.format_enable = v;

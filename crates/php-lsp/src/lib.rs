@@ -13,6 +13,7 @@ pub mod config;
 pub mod convert;
 pub mod ext;
 mod handlers;
+pub mod node_ipc;
 mod server;
 pub mod uri;
 
@@ -24,6 +25,14 @@ pub fn run_stdio() -> Result<()> {
     let (connection, io_threads) = lsp_server::Connection::stdio();
     Server::initialize(connection)?.run()?;
     io_threads.join()?;
+    Ok(())
+}
+
+/// Runs the server over the Node IPC channel (`--node-ipc`).
+pub fn run_node_ipc() -> Result<()> {
+    let (connection, writer) = node_ipc::connect()?;
+    Server::initialize(connection)?.run()?;
+    let _ = writer.join();
     Ok(())
 }
 
