@@ -42,7 +42,7 @@ fn main() {
                     f.path.trim_start_matches("file://"),
                     lc.line + 1,
                     d.message,
-                    &f.text[d.range].chars().take(60).collect::<String>()
+                    f.text[d.range].chars().take(60).collect::<String>()
                 );
             }
         }

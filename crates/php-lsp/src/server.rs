@@ -679,6 +679,15 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
         references_provider: Some(lsp::OneOf::Left(true)),
         document_highlight_provider: Some(lsp::OneOf::Left(true)),
         workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+        inlay_hint_provider: Some(lsp::OneOf::Left(true)),
+        semantic_tokens_provider: Some(lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(
+            lsp::SemanticTokensOptions {
+                work_done_progress_options: Default::default(),
+                legend: crate::handlers::semantic_tokens_legend(),
+                range: Some(true),
+                full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+            },
+        )),
         completion_provider: Some(lsp::CompletionOptions {
             trigger_characters: Some(
                 ["$", ">", ":", "\\", "@", "#", "["].iter().map(|s| s.to_string()).collect(),

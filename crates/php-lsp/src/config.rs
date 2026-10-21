@@ -16,6 +16,7 @@ pub struct ServerConfig {
     pub php_version: PhpVersion,
     pub diagnostics_enabled: bool,
     pub diagnostics: php_ide::DiagnosticsConfig,
+    pub inlay_hints: php_ide::InlayHintsConfig,
     /// Files larger than this (in bytes) are not analysed.
     pub max_file_size: u64,
     pub associations: Vec<String>,
@@ -33,6 +34,7 @@ impl Default for ServerConfig {
             php_version: PhpVersion::default(),
             diagnostics_enabled: true,
             diagnostics: php_ide::DiagnosticsConfig::default(),
+            inlay_hints: php_ide::InlayHintsConfig::default(),
             max_file_size: scan.max_size,
             associations: scan.associations,
             exclude: scan.exclude,
@@ -58,6 +60,7 @@ impl ServerConfig {
             stubs: self.stubs.clone(),
             auto_import: self.insert_use_declaration,
             max_completion_items: self.max_completion_items,
+            inlay_hints: self.inlay_hints.clone(),
         }
     }
 
@@ -81,6 +84,16 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "diagnostics.enable").and_then(Value::as_bool) {
                 self.diagnostics_enabled = v;
+            }
+            let h = &mut self.inlay_hints;
+            for (key, flag) in [
+                ("inlayHint.parameterNames", &mut h.parameter_names),
+                ("inlayHint.returnTypes", &mut h.return_types),
+                ("inlayHint.parameterTypes", &mut h.parameter_types),
+            ] {
+                if let Some(v) = get(&root, key).and_then(Value::as_bool) {
+                    *flag = v;
+                }
             }
             let d = &mut self.diagnostics;
             for (key, flag) in [

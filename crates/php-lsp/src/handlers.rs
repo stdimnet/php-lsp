@@ -24,6 +24,9 @@ pub(crate) fn dispatch(s: &mut Server, req: Request) -> Option<Result<Value>> {
         Completion::METHOD => handle(s, req, completion),
         SignatureHelpRequest::METHOD => handle(s, req, signature_help),
         WorkspaceSymbolRequest::METHOD => handle(s, req, workspace_symbol),
+        InlayHintRequest::METHOD => handle(s, req, inlay_hints),
+        SemanticTokensFullRequest::METHOD => handle(s, req, semantic_tokens_full),
+        SemanticTokensRangeRequest::METHOD => handle(s, req, semantic_tokens_range),
         crate::ext::SyntaxTree::METHOD => handle(s, req, syntax_tree),
         _ => {
             s.respond_error(
@@ -307,4 +310,79 @@ fn workspace_symbol(s: &mut Server, p: lsp::WorkspaceSymbolParams) -> Option<lsp
 fn syntax_tree(s: &mut Server, p: crate::ext::SyntaxTreeParams) -> Option<String> {
     let id = s.file_for(&p.text_document.uri)?;
     s.workspace.syntax_tree(id)
+}
+
+fn inlay_hints(s: &mut Server, p: lsp::InlayHintParams) -> Option<Vec<lsp::InlayHint>> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    let range = convert::text_range(&index, s.encoding, p.range);
+    Some(
+        s.workspace
+            .inlay_hints(id, range)
+            .into_iter()
+            .map(|h| lsp::InlayHint {
+                position: convert::position(&index, s.encoding, h.offset),
+                label: lsp::InlayHintLabel::String(h.label),
+                kind: Some(match h.kind {
+                    php_ide::InlayHintKind::Parameter => lsp::InlayHintKind::PARAMETER,
+                    php_ide::InlayHintKind::Type => lsp::InlayHintKind::TYPE,
+                }),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(h.padding_left),
+                padding_right: Some(h.padding_right),
+                data: None,
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn semantic_tokens_legend() -> lsp::SemanticTokensLegend {
+    lsp::SemanticTokensLegend {
+        token_types: php_ide::TOKEN_TYPES.iter().map(|t| lsp::SemanticTokenType::new(t)).collect(),
+        token_modifiers: php_ide::TOKEN_MODIFIERS
+            .iter()
+            .map(|m| lsp::SemanticTokenModifier::new(m))
+            .collect(),
+    }
+}
+
+fn encode_tokens(s: &Server, id: FileId, range: Option<php_ide::TextRange>) -> Option<lsp::SemanticTokens> {
+    let index = s.workspace.line_index(id)?;
+    let mut data = Vec::new();
+    let (mut prev_line, mut prev_col) = (0u32, 0u32);
+    for t in s.workspace.semantic_tokens(id, range) {
+        let start = convert::position(&index, s.encoding, t.range.start());
+        let end = convert::position(&index, s.encoding, t.range.end());
+        if end.line != start.line {
+            continue;
+        }
+        let delta_line = start.line - prev_line;
+        let delta_start = if delta_line == 0 { start.character - prev_col } else { start.character };
+        data.push(lsp::SemanticToken {
+            delta_line,
+            delta_start,
+            length: end.character - start.character,
+            token_type: t.token_type as u32,
+            token_modifiers_bitset: t.modifiers,
+        });
+        prev_line = start.line;
+        prev_col = start.character;
+    }
+    Some(lsp::SemanticTokens { result_id: None, data })
+}
+
+fn semantic_tokens_full(s: &mut Server, p: lsp::SemanticTokensParams) -> Option<lsp::SemanticTokensResult> {
+    let id = s.file_for(&p.text_document.uri)?;
+    encode_tokens(s, id, None).map(lsp::SemanticTokensResult::Tokens)
+}
+
+fn semantic_tokens_range(
+    s: &mut Server,
+    p: lsp::SemanticTokensRangeParams,
+) -> Option<lsp::SemanticTokensRangeResult> {
+    let id = s.file_for(&p.text_document.uri)?;
+    let index = s.workspace.line_index(id)?;
+    let range = convert::text_range(&index, s.encoding, p.range);
+    encode_tokens(s, id, Some(range)).map(lsp::SemanticTokensRangeResult::Tokens)
 }

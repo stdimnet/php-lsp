@@ -21,11 +21,13 @@ mod folding;
 mod hover;
 mod indexer;
 mod infer;
+mod inlay_hints;
 mod line_index;
 mod navigation;
 mod render;
 mod selection;
 mod sema;
+mod semantic_tokens;
 mod signature_help;
 mod symbols;
 mod workspace_symbols;
@@ -39,11 +41,13 @@ pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
 pub use folding::{Fold, FoldKind};
 pub use hover::Hover;
 pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
+pub use inlay_hints::{InlayHint, InlayHintKind, InlayHintsConfig};
 pub use line_index::{LineCol, LineIndex, PositionEncoding};
 pub use navigation::{Location, Reference, ReferenceKind};
 pub use php_hir as hir;
 pub use php_index::{FileId, FileKind, Index};
 pub use php_syntax::{self as syntax, PhpVersion, TextRange, TextSize};
+pub use semantic_tokens::{SemanticToken, SemanticTokenType, TOKEN_MODIFIERS, TOKEN_TYPES};
 pub use signature_help::{ParameterInfo, SignatureHelp, SignatureInfo};
 pub use symbols::{Symbol, SymbolKind};
 pub use workspace_symbols::WorkspaceSymbol;
@@ -66,6 +70,7 @@ pub struct Config {
     pub auto_import: bool,
     /// Maximum number of completion items.
     pub max_completion_items: usize,
+    pub inlay_hints: InlayHintsConfig,
 }
 
 impl Default for Config {
@@ -76,6 +81,7 @@ impl Default for Config {
             stubs: php_stubs::DEFAULT_STUBS.iter().map(|s| s.to_string()).collect(),
             auto_import: true,
             max_completion_items: 100,
+            inlay_hints: InlayHintsConfig::default(),
         }
     }
 }
@@ -382,6 +388,15 @@ impl Workspace {
 
     pub fn workspace_symbols(&self, query: &str, limit: usize) -> Vec<WorkspaceSymbol> {
         workspace_symbols::workspace_symbols(self, query, limit)
+    }
+
+    pub fn inlay_hints(&self, id: FileId, range: TextRange) -> Vec<InlayHint> {
+        sema::Sema::new(self, id).map(|s| inlay_hints::inlay_hints(&s, range)).unwrap_or_default()
+    }
+
+    /// Semantic tokens of a file (optionally limited to `range`).
+    pub fn semantic_tokens(&self, id: FileId, range: Option<TextRange>) -> Vec<SemanticToken> {
+        sema::Sema::new(self, id).map(|s| semantic_tokens::semantic_tokens(&s, range)).unwrap_or_default()
     }
 
     /// The inferred type of the expression at `offset`, rendered as text.

@@ -351,3 +351,42 @@ function g(Magic $m, Dyn $d, \stdClass $s) {
     );
     assert!(d.is_empty(), "{d:#?}");
 }
+
+#[test]
+fn inlay_hints_and_semantic_tokens() {
+    let text = "<?php\nfunction greet(string $name, int $times = 1) {}\n$name = 'x';\ngreet($name, 3);\ngreet('bob');\n$f = fn($x) => 'a' . $x;\n$g = function () { return 1; };\n";
+    let mut ws = Workspace::new(Config::default());
+    let id = ws.set_file("file:///h.php", text.to_string());
+    let hints: Vec<String> = ws
+        .inlay_hints(id, php_ide::TextRange::up_to(TextSize::from(text.len() as u32)))
+        .into_iter()
+        .map(|h| format!("{}@{}", h.label, &text[usize::from(h.offset)..usize::from(h.offset) + 3]))
+        .collect();
+    assert_eq!(
+        hints,
+        vec![": void@ {}", "times:@3);", "name:@'bo", ": string@ =>", ": int@ { "],
+        "{hints:?}"
+    );
+
+    let text = "<?php\nclass A { const C = 1; public static function make(): static { return new static(); } }\n$a = A::make();\necho A::C;\n";
+    let id = ws.set_file("file:///s.php", text.to_string());
+    let toks: Vec<String> = ws
+        .semantic_tokens(id, None)
+        .into_iter()
+        .map(|t| format!("{}:{:?}:{}", &text[t.range], t.token_type, t.modifiers))
+        .collect();
+    assert_eq!(
+        toks,
+        vec![
+            "A:Class:1",
+            "C:Property:7",
+            "make:Method:3",
+            "$a:Variable:0",
+            "A:Class:0",
+            "make:Method:2",
+            "A:Class:0",
+            "C:Property:6"
+        ],
+        "{toks:?}"
+    );
+}
