@@ -1,0 +1,23 @@
+{
+  "name": "php-lsp-wasm",
+  "version": "0.0.0",
+  "description": "PHP language server (completion, diagnostics, navigation, formatting, ...) as WebAssembly, speaking LSP",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/stdimnet/php-lsp",
+  "keywords": ["php", "lsp", "language-server", "intelephense", "wasm", "formatter", "monaco"],
+  "main": "node/php_lsp_wasm.js",
+  "types": "node/php_lsp_wasm.d.ts",
+  "exports": {
+    ".": {
+      "types": "./node/php_lsp_wasm.d.ts",
+      "node": "./node/php_lsp_wasm.js",
+      "default": "./bundler/php_lsp_wasm.js"
+    },
+    "./web": {
+      "types": "./web/php_lsp_wasm.d.ts",
+      "default": "./web/php_lsp_wasm.js"
+    }
+  },
+  "files": ["node", "bundler", "web", "README.md"],
+  "sideEffects": ["./bundler/php_lsp_wasm.js", "./bundler/snippets/*"]
+}

@@ -35,6 +35,7 @@ mod lint;
 mod lint_compat;
 mod lint_types;
 mod navigation;
+mod par;
 pub mod plugins;
 mod refactor;
 mod rename;

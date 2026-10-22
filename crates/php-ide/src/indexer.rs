@@ -6,7 +6,6 @@ use std::sync::Arc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use php_hir::{ExtractOptions, FileSymbols};
 use php_index::FileKind;
-use rayon::prelude::*;
 
 /// A file analysed by [`index_files`], ready for [`crate::Workspace::add_indexed`].
 #[derive(Debug, Clone)]
@@ -48,18 +47,15 @@ pub fn index_files_cached(
     opts: ExtractOptions,
     cache: Option<&crate::IndexCache>,
 ) -> Vec<IndexedFile> {
-    files
-        .into_par_iter()
-        .map(|(path, text, kind)| {
-            let opts = crate::index_cache::opts_for(opts, kind);
-            let symbols = match cache {
-                Some(c) => c.symbols(&path, &text, kind, || extract_symbols(&path, &text, opts)),
-                None => Arc::new(extract_symbols(&path, &text, opts)),
-            };
-            let line_index = Some(Arc::new(crate::LineIndex::new(&text)));
-            IndexedFile { path: path.into(), text, kind, symbols, line_index }
-        })
-        .collect()
+    crate::par::map(files, |(path, text, kind)| {
+        let opts = crate::index_cache::opts_for(opts, kind);
+        let symbols = match cache {
+            Some(c) => c.symbols(&path, &text, kind, || extract_symbols(&path, &text, opts)),
+            None => Arc::new(extract_symbols(&path, &text, opts)),
+        };
+        let line_index = Some(Arc::new(crate::LineIndex::new(&text)));
+        IndexedFile { path: path.into(), text, kind, symbols, line_index }
+    })
 }
 
 /// Which files belong to a workspace (mirrors Intelephense's

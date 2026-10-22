@@ -2,9 +2,12 @@
 //! with `TransportKind.ipc`: the parent passes a channel file descriptor in
 //! `NODE_CHANNEL_FD`; every message is one line of JSON.
 
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 
-use lsp_server::{Connection, Message};
+use lsp_server::Connection;
+#[cfg(unix)]
+use lsp_server::Message;
 
 /// Creates a connection over the Node IPC channel of this process.
 #[cfg(unix)]

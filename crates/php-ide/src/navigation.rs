@@ -3,7 +3,6 @@
 
 use php_index::{FileId, FileKind};
 use php_syntax::{SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, TextSize};
-use rayon::prelude::*;
 
 use crate::classify::{classify, classify_token, Definition};
 use crate::infer::is_expr;
@@ -501,19 +500,19 @@ pub(crate) fn references(sema: &Sema, offset: TextSize, include_declaration: boo
         })
         .map(|(id, _)| id)
         .collect();
-    let mut out: Vec<Reference> = candidates
-        .into_par_iter()
-        .flat_map_iter(|id| match Sema::new(ws, id) {
-            Some(s) => {
-                let mut refs = file_references_of(&s, &defs, &name, include_declaration);
-                if let Some(class) = &constructor_of {
-                    refs.extend(new_expressions(&s, class));
-                }
-                refs
+    let mut out: Vec<Reference> = crate::par::map(candidates, |id| match Sema::new(ws, id) {
+        Some(s) => {
+            let mut refs = file_references_of(&s, &defs, &name, include_declaration);
+            if let Some(class) = &constructor_of {
+                refs.extend(new_expressions(&s, class));
             }
-            None => Vec::new(),
-        })
-        .collect();
+            refs
+        }
+        None => Vec::new(),
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     // declarations outside the workspace (vendor / stubs)
     if include_declaration {
         for def in &defs {

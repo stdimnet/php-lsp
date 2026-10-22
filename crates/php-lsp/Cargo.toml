@@ -10,6 +10,11 @@ repository.workspace = true
 name = "php-lsp"
 path = "src/main.rs"
 
+[features]
+default = ["parallel"]
+# Index and search references on several threads.
+parallel = ["php-ide/parallel"]
+
 [dependencies]
 php-ide.workspace = true
 php-tools.workspace = true

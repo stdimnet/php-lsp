@@ -556,6 +556,10 @@ type Namespaces = Vec<(String, PathBuf)>;
 type NamespaceCache = HashMap<PathBuf, (Instant, Arc<Namespaces>)>;
 
 fn namespaces(root: &Path) -> Arc<Namespaces> {
+    // no file system (and no clock) in WebAssembly
+    if cfg!(target_family = "wasm") {
+        return Arc::new(Vec::new());
+    }
     static CACHE: Mutex<Option<NamespaceCache>> = Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);

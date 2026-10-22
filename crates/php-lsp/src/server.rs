@@ -77,7 +77,7 @@ pub struct Server {
     pending: HashMap<RequestId, &'static str>,
     shutdown_requested: bool,
     task_tx: Sender<Task>,
-    task_rx: Receiver<Task>,
+    pub(crate) task_rx: Receiver<Task>,
     generation: u32,
     indexing: bool,
     cancel_indexing: Arc<std::sync::atomic::AtomicBool>,
@@ -93,6 +93,14 @@ impl Server {
     /// Performs the `initialize` handshake and creates the server.
     pub fn initialize(connection: Connection) -> Result<Server> {
         let (id, params) = connection.initialize_start()?;
+        let (server, result) = Server::create(connection, params)?;
+        server.connection.initialize_finish(id, result)?;
+        Ok(server)
+    }
+
+    /// Creates the server for the `initialize` params (without the
+    /// handshake); returns it and the `initialize` result.
+    pub(crate) fn create(connection: Connection, params: Value) -> Result<(Server, Value)> {
         let params: lsp::InitializeParams = serde_json::from_value(params)?;
         let encoding = negotiate_encoding(&params.capabilities);
         let mut config = ServerConfig::default();
@@ -124,21 +132,19 @@ impl Server {
         let mut result = serde_json::to_value(result)?;
         // not modelled by lsp-types yet
         result["capabilities"]["typeHierarchyProvider"] = Value::Bool(true);
-        connection.initialize_finish(id, result)?;
         let workspace = Workspace::new(config.ide_config());
         let cache_dir = match &storage {
             Some(s) => s.join("php-lsp-index"),
             None => std::env::var_os("XDG_CACHE_HOME")
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-                .unwrap_or_else(std::env::temp_dir)
+                .unwrap_or_else(temp_dir)
                 .join("php-lsp"),
         };
-        let stub_dir = storage
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("php-lsp-stubs-{}", env!("CARGO_PKG_VERSION")));
+        let stub_dir =
+            storage.unwrap_or_else(temp_dir).join(format!("php-lsp-stubs-{}", env!("CARGO_PKG_VERSION")));
         let (task_tx, task_rx) = crossbeam_channel::unbounded();
-        Ok(Server {
+        let server = Server {
             connection,
             workspace,
             config,
@@ -163,7 +169,8 @@ impl Server {
             tool_runs: HashMap::new(),
             tool_diags: HashMap::new(),
             reported_tool_errors: std::collections::HashSet::new(),
-        })
+        };
+        Ok((server, result))
     }
 
     pub fn workspace(&self) -> &Workspace {
@@ -194,7 +201,7 @@ impl Server {
     }
 
     /// Handles one message; returns `true` on `exit`.
-    fn on_message(&mut self, msg: Message) -> bool {
+    pub(crate) fn on_message(&mut self, msg: Message) -> bool {
         match msg {
             Message::Request(req) => {
                 if self.shutdown_requested {
@@ -299,7 +306,7 @@ impl Server {
             let run = *run;
             let (cfg, root, path, text, tx) =
                 (cfg.clone(), root.clone(), path.clone(), text.clone(), self.task_tx.clone());
-            std::thread::spawn(move || {
+            spawn(move || {
                 let result = php_tools::diagnostics(tool, &root, &path, &text, &cfg);
                 let _ = tx.send(Task::ToolDiagnostics { file: id, tool, run, result });
             });
@@ -329,7 +336,7 @@ impl Server {
         };
         let encoding = self.encoding;
         let sender = self.connection.sender.clone();
-        std::thread::spawn(move || {
+        spawn(move || {
             let response = match php_tools::format(formatter, &root, &path, &text, &cfg) {
                 Ok(new_text) if new_text != text => {
                     let end = convert::position(&index, encoding, php_ide::TextSize::from(text.len() as u32));
@@ -358,7 +365,7 @@ impl Server {
                 let cfg = self.config.tools.phpunit.clone();
                 let sender = self.connection.sender.clone();
                 self.show_message(&format!("Running {}…", filter.as_deref().unwrap_or("tests")));
-                std::thread::spawn(move || {
+                spawn(move || {
                     let (typ, message, log) =
                         match php_tools::run_phpunit(&root, &path, filter.as_deref(), &cfg) {
                             Ok(run) => (
@@ -451,6 +458,23 @@ impl Server {
                 Initialized::METHOD => {}
                 // Intelephense compatible commands
                 "indexWorkspace" | "intelephense/index" => self.reindex(),
+                // files of the project sent by the client (no file system,
+                // e.g. WebAssembly): `{"files": [{"uri": ..., "text": ...}]}`
+                "php/indexFiles" => {
+                    let files: Vec<(String, Arc<str>, FileKind)> = not
+                        .params
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|f| {
+                            let uri = f.get("uri")?.as_str()?;
+                            let text = f.get("text")?.as_str()?;
+                            Some((uri::key_from_uri(uri), Arc::<str>::from(text), FileKind::Workspace))
+                        })
+                        .collect();
+                    self.workspace.index_files(files);
+                }
                 _ => {}
             }
             Ok(())
@@ -460,7 +484,7 @@ impl Server {
         }
     }
 
-    fn on_initialized(&mut self) {
+    pub(crate) fn on_initialized(&mut self) {
         self.register_watchers();
         self.pull_config();
         self.start_indexing();
@@ -605,8 +629,8 @@ impl Server {
                 }));
             }
         }
-        std::thread::spawn(move || {
-            let start = std::time::Instant::now();
+        spawn(move || {
+            let start = Stopwatch::start();
             let mut count = 0;
             for (root, root_kind) in roots {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -640,12 +664,7 @@ impl Server {
             }
             let cached = cache.as_ref().map_or(0, |c| c.hits());
             let writing = cache_writer.lock();
-            let _ = tx.send(Task::IndexingDone {
-                generation,
-                count,
-                cached,
-                millis: start.elapsed().as_millis(),
-            });
+            let _ = tx.send(Task::IndexingDone { generation, count, cached, millis: start.millis() });
             // after reporting: writing does not delay the first requests
             if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
                 let _ = c.save();
@@ -661,7 +680,7 @@ impl Server {
         });
     }
 
-    fn on_task(&mut self, task: Task) {
+    pub(crate) fn on_task(&mut self, task: Task) {
         match task {
             Task::ToolDiagnostics { file, tool, run, result } => {
                 if self.tool_runs.get(&(file, tool)) != Some(&run) {
@@ -1083,5 +1102,36 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
             }),
         }),
         ..Default::default()
+    }
+}
+
+/// Runs `f` on a new thread; inline where there are no threads
+/// (WebAssembly): its results arrive as tasks like those of a thread.
+fn spawn(f: impl FnOnce() + Send + 'static) {
+    #[cfg(not(target_family = "wasm"))]
+    std::thread::spawn(f);
+    #[cfg(target_family = "wasm")]
+    f();
+}
+
+/// The temporary directory (none in WebAssembly).
+fn temp_dir() -> PathBuf {
+    if cfg!(target_family = "wasm") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// Elapsed time, where a clock exists.
+struct Stopwatch(Option<std::time::Instant>);
+
+impl Stopwatch {
+    fn start() -> Stopwatch {
+        Stopwatch((!cfg!(target_family = "wasm")).then(std::time::Instant::now))
+    }
+
+    fn millis(&self) -> u128 {
+        self.0.map_or(0, |s| s.elapsed().as_millis())
     }
 }

@@ -1,7 +1,9 @@
 //! PHP language server.
 //!
-//! Embeddable: create a [`lsp_server::Connection`] (stdio, TCP or an in-memory
-//! pair) and hand it to [`Server::initialize`]:
+//! In another program: [`Embedded`] takes LSP messages as JSON strings and
+//! returns the server's messages, no stdio needed. Or create a
+//! [`lsp_server::Connection`] (stdio, TCP or an in-memory pair) and hand it
+//! to [`Server::initialize`]:
 //!
 //! ```no_run
 //! let (connection, io_threads) = lsp_server::Connection::stdio();
@@ -11,12 +13,14 @@
 
 pub mod config;
 pub mod convert;
+mod embedded;
 pub mod ext;
 mod handlers;
 pub mod node_ipc;
 mod server;
 pub mod uri;
 
+pub use embedded::{format_document, Embedded};
 pub use lsp_server;
 pub use server::{Result, Server, SERVER_NAME};
 
