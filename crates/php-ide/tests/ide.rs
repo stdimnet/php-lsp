@@ -2013,3 +2013,27 @@ class Uses { use Macroable { __call as macroCall; } public function f() { self::
     let t = type_at("<?php\nclass Model {}\ninterface Cast { /** @param Model $m */ public function get($m); }\n$c = new class implements Cast { public function get($m) { $m<|>; } };");
     assert_eq!(t, "Model");
 }
+
+/// Go to definition like Intelephense (fourth comparison).
+#[test]
+fn definition_parity() {
+    // `$this` and `Foo::class` have no target
+    assert!(goto("<?php\nclass A { function f() { $th<|>is; } }").is_empty());
+    assert!(goto("<?php\nclass A {}\n$x = A::cl<|>ass;").is_empty());
+    // the first definition in the scope
+    let f = fixture("<?php\nfunction f($id) {\n    $id = (string) $id;\n    return $i<|>d;\n}");
+    let g = f.ws.goto_definition(f.file, f.offset);
+    assert_eq!(g.len(), 1);
+    assert_eq!(u32::from(g[0].focus.start()), 17, "the parameter");
+    // doc comments: @param of a promoted parameter, @see, @method
+    let g = goto("<?php\nclass E {\n    /** @param string $gu<|>ard */\n    public function __construct(public string $guard) {}\n}");
+    assert_eq!(g.len(), 1, "{g:?}");
+    let g = goto("<?php\nclass R { public function register() {} public $items; }\n/** @see R::regi<|>ster() */\nfunction f() {}");
+    assert_eq!(g.len(), 1, "{g:?}");
+    let g = goto("<?php\nclass R { public $items; }\n/** @see R::$ite<|>ms */\nfunction f() {}");
+    assert_eq!(g.len(), 1, "{g:?}");
+    let g = goto("<?php\nfunction helper() {}\n/** @see help<|>er() */\nfunction f() {}");
+    assert_eq!(g.len(), 1, "{g:?}");
+    let g = goto("<?php\n/** @method static int conf<|>igure() */\nclass F {}");
+    assert_eq!(g.len(), 1, "{g:?}");
+}

@@ -328,6 +328,19 @@ async function main() {
       } else if (b) report.hover.onlyOurs++;
       const [ka, kb] = [defTarget(gt, opts.project), defTarget(gy, opts.project)];
       const d = report.definition;
+      // DEFS=1: every definition difference with the line, for analysis
+      if (process.env.DEFS && !(ka && kb && sameTarget(ka, kb)) && (ka || kb)) {
+        (d.all ||= []).push({
+          at,
+          kind: p.kind,
+          word: p.word,
+          text: text.split('\n')[position.line].trim(),
+          theirs: ka && ka.key,
+          ours: kb && kb.key,
+          theirsExternal: ka && ka.external,
+          oursExternal: kb && kb.external,
+        });
+      }
       if (ka && kb) {
         if (sameTarget(ka, kb)) d.same++;
         else {

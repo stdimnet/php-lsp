@@ -50,6 +50,19 @@ fn superglobal_declaration(sema: &Sema, name: &str) -> Option<Location> {
 fn is_definition_token(t: &php_syntax::SyntaxToken) -> bool {
     let Some(var) = t.parent() else { return false };
     let Some(p) = var.parent() else { return false };
+    // `[$a, $b] = ...`
+    if p.kind() == ARRAY_ELEMENT {
+        let mut cur = p.clone();
+        while let Some(up) = cur.parent() {
+            match up.kind() {
+                ARRAY_EXPR | LIST_EXPR | ARRAY_ELEMENT => cur = up,
+                ASSIGN_EXPR => return up.first_child().as_ref() == Some(&cur),
+                FOREACH_VALUE => return true,
+                _ => return false,
+            }
+        }
+        return false;
+    }
     match p.kind() {
         ASSIGN_EXPR => p.first_child().as_ref() == Some(&var),
         PARAM | FOREACH_VALUE | FOREACH_KEY | CATCH_CLAUSE | GLOBAL_STMT | STATIC_VAR | CLOSURE_USE_VAR => {
@@ -97,13 +110,33 @@ pub(crate) fn declarations(sema: &Sema, def: &Definition, at: Option<TextSize>) 
             if crate::infer::is_superglobal(name) {
                 return superglobal_declaration(sema, name).into_iter().collect();
             }
-            // the closest definition before the use (as Intelephense), else the first
-            let candidates = variable_tokens(&scope_node, name)
+            // like Intelephense: the first definition in the scope
+            let same = |t: &SyntaxToken| {
+                classify_token(sema, t).is_some_and(|d| d.same_as(def))
+                    // promoted parameters are properties, but also the variable
+                    || t.parent().is_some_and(|p| p.kind() == PARAM)
+            };
+            let candidates: Vec<SyntaxToken> = variable_tokens(&scope_node, name)
                 .into_iter()
                 .filter(|t| at.is_none_or(|a| t.text_range().start() <= a))
-                .filter(|t| classify_token(sema, t).is_some_and(|d| d.same_as(def)))
-                .filter(|t| at.is_none() || is_definition_token(t));
-            let first = if at.is_some() { candidates.last() } else { candidates.into_iter().next() };
+                .filter(|t| same(t))
+                .filter(|t| at.is_none() || is_definition_token(t))
+                .collect();
+            let first = candidates.first().cloned();
+            // `function () use ($x)`: the definition outside
+            if let Some(closure) = first
+                .as_ref()
+                .filter(|t| t.parent().is_some_and(|p| p.kind() == CLOSURE_USE_VAR))
+                .and_then(|t| t.parent_ancestors().find(|n| n.kind() == CLOSURE_EXPR))
+            {
+                if let Some(outer) = closure.parent().map(|p| sema.variable_scope(&p)) {
+                    let outer_def = Definition::Variable { name: name.clone(), scope: outer.text_range() };
+                    let found = declarations(sema, &outer_def, Some(closure.text_range().start()));
+                    if !found.is_empty() {
+                        return found;
+                    }
+                }
+            }
             let first = first.or_else(|| {
                 variable_tokens(&scope_node, name)
                     .into_iter()
@@ -139,6 +172,57 @@ pub(crate) fn declarations(sema: &Sema, def: &Definition, at: Option<TextSize>) 
     }
 }
 
+/// `@see foo()`, `@see Foo::bar()`, `@see Foo::$baz`, `@see Foo::BAR` and the
+/// name in `@method T name()` (its own declaration).
+fn doc_reference(sema: &Sema, token: &SyntaxToken, offset: TextSize) -> Option<Vec<Location>> {
+    let text = token.text();
+    let base = token.text_range().start();
+    let rel = usize::from(offset - base).min(text.len());
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '\\' || c == '$';
+    let start =
+        rel - text[..rel].chars().rev().take_while(|c| is_word(*c)).map(char::len_utf8).sum::<usize>();
+    let end = rel + text[rel..].chars().take_while(|c| is_word(*c)).map(char::len_utf8).sum::<usize>();
+    let word = &text[start..end];
+    if word.is_empty() {
+        return None;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line = &text[line_start..];
+    let tag = line.trim_start_matches([' ', '\t', '*', '/']).split_whitespace().next().unwrap_or("");
+    let call = text[end..].starts_with('(');
+    let range = TextRange::new(base + TextSize::from(start as u32), base + TextSize::from(end as u32));
+    if tag == "@method" && call {
+        return Some(vec![Location { file: sema.file, range, focus: range }]);
+    }
+    if tag != "@see" && tag != "@uses" {
+        return None;
+    }
+    let index = sema.index();
+    let anchor = token.parent()?;
+    let loc = |f: FileId, r: TextRange, n: TextRange| Location { file: f, range: r, focus: n };
+    if let Some(class_end) = text[..start].strip_suffix("::").map(|h| h.len()) {
+        let cstart = class_end
+            - text[..class_end].chars().rev().take_while(|c| is_word(*c)).map(char::len_utf8).sum::<usize>();
+        let class = sema.resolve_class_name(&text[cstart..class_end], &anchor)?;
+        let found = if let Some(prop) = word.strip_prefix('$') {
+            index.find_property(&class, prop).map(|p| loc(p.file, p.def.range, p.def.name_range))
+        } else if call {
+            index.find_method(&class, word).map(|m| loc(m.file, m.def.range, m.def.name_range))
+        } else {
+            index
+                .find_class_constant(&class, word)
+                .map(|c| loc(c.file, c.def.range, c.def.name_range))
+                .or_else(|| index.find_case(&class, word).map(|c| loc(c.file, c.def.range, c.def.name_range)))
+        };
+        return Some(found.into_iter().collect());
+    }
+    if call {
+        let (file, f) = sema.resolve_function(word, anchor.text_range().start())?;
+        return Some(vec![loc(file, f.range, f.name_range)]);
+    }
+    None
+}
+
 fn node_with_range(root: &SyntaxNode, range: TextRange) -> Option<SyntaxNode> {
     root.descendants().find(|n| {
         n.text_range() == range
@@ -160,7 +244,22 @@ fn variable_tokens(scope: &SyntaxNode, name: &str) -> Vec<SyntaxToken> {
 }
 
 pub(crate) fn goto_definition(sema: &Sema, offset: TextSize) -> Vec<Location> {
-    // `include 'file.php'` could be resolved here in the future
+    if let Some(t) = sema.token_at(offset) {
+        // like Intelephense: no target for `$this` and the `class` of `Foo::class`
+        if t.kind() == VARIABLE && t.text() == "$this" {
+            return Vec::new();
+        }
+        if t.text().eq_ignore_ascii_case("class")
+            && t.parent().and_then(|p| p.parent()).is_some_and(|f| f.kind() == CLASS_CONST_FETCH_EXPR)
+        {
+            return Vec::new();
+        }
+        if t.kind() == DOC_COMMENT {
+            if let Some(locs) = doc_reference(sema, &t, offset) {
+                return locs;
+            }
+        }
+    }
     match classify(sema, offset) {
         Some((def, _)) => {
             // `$x` in a doc comment documents a parameter declared after it
