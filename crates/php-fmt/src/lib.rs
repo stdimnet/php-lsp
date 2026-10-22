@@ -13,6 +13,9 @@
 //! assert_eq!(php_fmt::apply("<?php\nif($a==1){\necho 'x' ;\n}\n", &edits), "<?php\nif ($a == 1) {\n    echo 'x';\n}\n");
 //! ```
 
+pub mod beautify;
+mod template;
+
 use php_syntax::{PhpVersion, SyntaxKind, SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, TextSize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -42,6 +45,9 @@ pub struct FormatOptions {
     pub space_around_concat: Option<bool>,
     /// Space after `!`; `None` keeps the existing style.
     pub space_after_not: Option<bool>,
+    /// Also format the HTML of templates mixing HTML and PHP (like
+    /// Intelephense, with js-beautify's rules).
+    pub format_html: bool,
 }
 
 impl Default for FormatOptions {
@@ -55,6 +61,7 @@ impl Default for FormatOptions {
             insert_final_newline: true,
             space_around_concat: Some(true),
             space_after_not: None,
+            format_html: true,
         }
     }
 }
@@ -75,7 +82,8 @@ pub enum FormatError {
 /// Applies edits (sorted or not) to `text`.
 pub fn apply(text: &str, edits: &[Edit]) -> String {
     let mut edits: Vec<&Edit> = edits.iter().collect();
-    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start()));
+    // back to front; at the same start a replacement before an insertion
+    edits.sort_by_key(|e| std::cmp::Reverse((e.range.start(), e.range.end())));
     let mut out = text.to_string();
     for e in edits {
         out.replace_range(usize::from(e.range.start())..usize::from(e.range.end()), &e.new_text);
@@ -90,7 +98,16 @@ pub fn format(text: &str, options: &FormatOptions) -> Result<Vec<Edit>, FormatEr
         return Err(FormatError::SyntaxErrors);
     }
     let root = parse.syntax_node();
-    let mut current = apply(text, &Formatter::new(text, &root, options).run());
+    // templates: the HTML first, then the PHP code
+    let html = options
+        .format_html
+        .then(|| template::format_html(text, &root, options.indent_size, options.use_tabs))
+        .flatten()
+        .filter(|t| php_syntax::parse(t, options.php_version).errors().is_empty());
+    let mut current = match html {
+        Some(t) => t,
+        None => apply(text, &Formatter::new(text, &root, options).run()),
+    };
     // moving braces changes the line structure the indentation is based on;
     // iterate to a fixed point (a few passes at most)
     for _ in 0..3 {
@@ -123,6 +140,11 @@ fn whitespace_diff(original: &str, formatted: &str, version: PhpVersion) -> Vec<
     };
     let a = sig(original);
     let b = sig(formatted);
+    // templates: the HTML may tokenize differently; one edit for the
+    // changed middle part
+    if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.0 != y.0) {
+        return middle_edit(original, formatted).into_iter().collect();
+    }
     let mut edits = Vec::new();
     let (mut pa, mut pb) = (0usize, 0usize);
     for ((_, sa, ea), (_, sb, eb)) in a.iter().zip(b.iter()) {
@@ -147,12 +169,54 @@ fn whitespace_diff(original: &str, formatted: &str, version: PhpVersion) -> Vec<
             new_text: formatted[pb..].to_string(),
         });
     }
-    edits
+    // adjacent edits (whitespace before a changed token) become one
+    let mut merged: Vec<Edit> = Vec::with_capacity(edits.len());
+    for e in edits {
+        match merged.last_mut() {
+            Some(last) if last.range.end() == e.range.start() => {
+                last.range = TextRange::new(last.range.start(), e.range.end());
+                last.new_text.push_str(&e.new_text);
+            }
+            _ => merged.push(e),
+        }
+    }
+    merged
 }
 
-/// Formats only the lines touched by `range`.
+/// The edit replacing the part between the common prefix and suffix.
+fn middle_edit(original: &str, formatted: &str) -> Option<Edit> {
+    if original == formatted {
+        return None;
+    }
+    let prefix = original
+        .char_indices()
+        .zip(formatted.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(original.len().min(formatted.len()), |((i, _), _)| i);
+    let max_suffix = (original.len() - prefix).min(formatted.len() - prefix);
+    let suffix = original[prefix..]
+        .chars()
+        .rev()
+        .zip(formatted[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum::<usize>()
+        .min(max_suffix);
+    Some(Edit {
+        range: TextRange::new((prefix as u32).into(), ((original.len() - suffix) as u32).into()),
+        new_text: formatted[prefix..formatted.len() - suffix].to_string(),
+    })
+}
+
+/// Formats only the lines touched by `range` (templates are formatted
+/// whole, like Intelephense does when the range touches HTML).
 pub fn format_range(text: &str, range: TextRange, options: &FormatOptions) -> Result<Vec<Edit>, FormatError> {
     let edits = format(text, options)?;
+    if options.format_html
+        && template::is_template(&php_syntax::parse(text, options.php_version).syntax_node())
+    {
+        return Ok(edits);
+    }
     Ok(edits
         .into_iter()
         .filter(|e| e.range.intersect(range).is_some() || range.contains_range(e.range))
@@ -184,6 +248,13 @@ struct Formatter<'a> {
     line_depth: std::cell::RefCell<Vec<Option<usize>>>,
     /// Memoized delimiters of lists and whether they expand.
     lists: std::cell::RefCell<std::collections::HashMap<TextRange, ListLayout>>,
+    /// The file mixes HTML and PHP: PHP is indented relative to its `<?php`.
+    template: bool,
+    /// PHP regions of a template: start of the open tag and end of the
+    /// region (end of the close tag, or of the file).
+    regions: Vec<(TextSize, TextSize)>,
+    /// Memoized indentation levels at the start of each region.
+    region_bases: std::cell::RefCell<std::collections::HashMap<usize, usize>>,
 }
 
 type ListLayout = Option<(SyntaxToken, SyntaxToken, bool)>;
@@ -240,7 +311,30 @@ impl<'a> Formatter<'a> {
             line_tokens: vec![None; lines],
             line_depth: std::cell::RefCell::new(vec![None; lines]),
             lists: Default::default(),
+            template: false,
+            regions: Vec::new(),
+            region_bases: Default::default(),
         };
+        let mut open: Option<TextSize> = None;
+        for t in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
+            match t.kind() {
+                INLINE_HTML
+                    if !(t.text_range().start() == TextSize::from(0) && t.text().trim().is_empty()) =>
+                {
+                    f.template |= !t.text().trim().is_empty();
+                }
+                OPEN_TAG | OPEN_TAG_WITH_ECHO => open = Some(t.text_range().start()),
+                CLOSE_TAG => {
+                    if let Some(o) = open.take() {
+                        f.regions.push((o, t.text_range().end()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(o) = open {
+            f.regions.push((o, TextSize::from(text.len() as u32)));
+        }
         for t in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
             if t.kind() == WHITESPACE {
                 continue;
@@ -349,6 +443,9 @@ impl<'a> Formatter<'a> {
             return d;
         }
         let d = match &self.line_tokens[line] {
+            Some(t) if self.template && matches!(t.kind(), INLINE_HTML | OPEN_TAG | OPEN_TAG_WITH_ECHO) => {
+                self.region_base_at(t.text_range().end())
+            }
             Some(t) if self.line_of(t.text_range().start()) == line && self.starts_line(t) => self.depth(t),
             Some(t) => {
                 // the line continues after a token of an earlier line
@@ -393,18 +490,26 @@ impl<'a> Formatter<'a> {
     /// than the line opening the innermost enclosing container.
     fn depth(&self, token: &SyntaxToken) -> usize {
         let pos = token.text_range().start();
+        let region = self.template.then(|| self.region_of(pos)).flatten();
         // a closing delimiter goes back to the indentation of its opener
         if let Some(c) = self.containers.iter().rev().find(|c| c.has_close_token && c.close == pos) {
-            return self.depth_of_line(c.open_line);
+            if let Some(r) = region.filter(|r| c.open < self.regions[*r].0) {
+                return self.region_base_after(r, pos);
+            }
+            return self.anchor(c);
         }
         let inner = self
             .containers
             .iter()
             .filter(|c| c.open_end <= pos && (pos < c.close || !c.has_close_token && pos <= c.close))
             .max_by_key(|c| c.open);
-        let base = match inner {
-            Some(c) => self.depth_of_line(c.open_line) + 1,
-            None => 0,
+        let base = match (inner, region) {
+            // templates: code after `<?php` starts at the tag's indentation
+            // (or deeper in a block opened before)
+            (Some(c), Some(r)) if c.open < self.regions[r].0 => self.region_base_after(r, pos),
+            (None, Some(r)) => self.region_base_after(r, pos),
+            (Some(c), _) => self.anchor(c) + 1,
+            (None, None) => 0,
         };
         // comments at the end of a `case` body (`// no break`)
         if matches!(token.kind(), COMMENT | DOC_COMMENT) {
@@ -458,6 +563,85 @@ impl<'a> Formatter<'a> {
             base
         } else {
             base + 1
+        }
+    }
+
+    /// The depth of the line opening container `c`.
+    fn anchor(&self, c: &Container) -> usize {
+        if self.template {
+            let first = self.line_tokens[c.open_line].as_ref();
+            if first
+                .is_none_or(|t| matches!(t.kind(), INLINE_HTML | OPEN_TAG | OPEN_TAG_WITH_ECHO | CLOSE_TAG))
+            {
+                return self.region_base_at(c.open);
+            }
+        }
+        self.depth_of_line(c.open_line)
+    }
+
+    fn region_of(&self, pos: TextSize) -> Option<usize> {
+        let i = self.regions.partition_point(|r| r.0 <= pos);
+        let r = i.checked_sub(1)?;
+        (pos < self.regions[r].1 || usize::from(self.regions[r].1) == self.text.len()).then_some(r)
+    }
+
+    fn region_base_at(&self, pos: TextSize) -> usize {
+        self.region_of(pos).map_or(0, |r| self.region_base(r))
+    }
+
+    /// Intelephense: after `<?php` the indentation is that of the tag's
+    /// column, or of the enclosing statement list if deeper.
+    fn region_base(&self, r: usize) -> usize {
+        if let Some(b) = self.region_bases.borrow().get(&r) {
+            return *b;
+        }
+        let open = self.regions[r].0;
+        let column = self.open_tag_column(r);
+        let list = self
+            .containers
+            .iter()
+            .filter(|c| c.open_end <= open && open < c.close && self.is_statement_list(c))
+            .max_by_key(|c| c.open)
+            .map_or(0, |c| self.anchor(c) + 1);
+        let base = column.max(list);
+        self.region_bases.borrow_mut().insert(r, base);
+        base
+    }
+
+    /// The level at `pos` in region `r` before any container opened in the
+    /// region: the region's base, one less for each block around the
+    /// `<?php` that closed before `pos` (Intelephense counts down).
+    fn region_base_after(&self, r: usize, pos: TextSize) -> usize {
+        let open = self.regions[r].0;
+        let closed = self
+            .containers
+            .iter()
+            .filter(|c| c.open_end <= open && open < c.close && c.close <= pos && self.is_statement_list(c))
+            .count();
+        self.region_base(r).saturating_sub(closed)
+    }
+
+    /// The indentation level of a region's `<?php` column.
+    fn open_tag_column(&self, r: usize) -> usize {
+        let start = usize::from(self.regions[r].0);
+        let line_start = self.text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let tab = self.opts.indent_size.max(1);
+        let width: usize =
+            self.text[line_start..start].chars().map(|c| if c == '\t' { tab } else { 1 }).sum();
+        width.div_ceil(tab)
+    }
+
+    /// Containers holding statements or members (not parentheses).
+    fn is_statement_list(&self, c: &Container) -> bool {
+        match c.open_kind {
+            COLON => true,
+            L_CURLY => self
+                .root
+                .covering_element(TextRange::at(c.open, 1.into()))
+                .into_token()
+                .and_then(|t| t.parent())
+                .is_some_and(|p| matches!(p.kind(), BLOCK | MEMBER_LIST | SWITCH_BODY | MATCH_EXPR)),
+            _ => false,
         }
     }
 
@@ -523,6 +707,8 @@ impl<'a> Formatter<'a> {
                 .is_some_and(|p| matches!(p.kind(), TERNARY_EXPR | RETURN_TYPE | ARG | ENUM_BACKING_TYPE)),
             // attributes before declarations
             R_BRACK => !prev.parent().is_some_and(|p| p.kind() == ATTRIBUTE_GROUP),
+            // `'key' =>\n'value'`
+            FAT_ARROW => !prev.parent().is_some_and(|p| p.kind() == ARRAY_ELEMENT),
             // `else` / `do` without braces: the statement is indented
             _ => true,
         }
@@ -544,14 +730,6 @@ impl<'a> Formatter<'a> {
     }
 
     fn run(mut self) -> Vec<Edit> {
-        // templates mixing HTML and PHP are left alone
-        let has_html = self.root.descendants_with_tokens().filter_map(|e| e.into_token()).any(|t| {
-            t.kind() == INLINE_HTML
-                && !(t.text_range().start() == TextSize::from(0) && t.text().trim().is_empty())
-        });
-        if has_html {
-            return Vec::new();
-        }
         let tokens: Vec<SyntaxToken> =
             self.root.descendants_with_tokens().filter_map(|e| e.into_token()).collect();
         let mut prev: Option<SyntaxToken> = None;
@@ -592,11 +770,37 @@ impl<'a> Formatter<'a> {
             prev = Some(t.clone());
             i += 1;
         }
+        // PSR-12: a file containing only PHP has no closing `?>`
+        if !self.template {
+            let last = tokens
+                .iter()
+                .rev()
+                .find(|t| !(t.kind() == WHITESPACE || t.kind() == INLINE_HTML && t.text().trim().is_empty()));
+            if let Some(close) = last.filter(|t| t.kind() == CLOSE_TAG) {
+                let ended =
+                    Self::prev_significant(close).is_some_and(|b| matches!(b.kind(), SEMICOLON | R_CURLY));
+                let mut before = close.prev_token();
+                while let Some(t) = before.as_ref().filter(|t| t.kind() == WHITESPACE) {
+                    before = t.prev_token();
+                }
+                if let Some(before) = before.filter(|_| ended) {
+                    let from = before.text_range().end();
+                    self.edits.retain(|e| e.range.end() <= from);
+                    let end = TextSize::from(self.text.len() as u32);
+                    self.push(from, end, "\n".into());
+                    return self.edits;
+                }
+            }
+        }
         // trailing whitespace at the end of the file
         if let Some(p) = &prev {
             let end = TextSize::from(self.text.len() as u32);
             let start = p.text_range().end();
-            if p.kind() != INLINE_HTML && p.kind() != HALT_COMPILER_DATA && self.opts.insert_final_newline {
+            if p.kind() != INLINE_HTML
+                && p.kind() != HALT_COMPILER_DATA
+                && self.opts.insert_final_newline
+                && !self.template
+            {
                 let new = if p.kind() == CLOSE_TAG && p.text().ends_with('\n') {
                     String::new()
                 } else {
@@ -649,13 +853,32 @@ impl<'a> Formatter<'a> {
                 };
             }
             let lines = newlines.min(self.opts.max_blank_lines).max(usize::from(blank));
-            if lines == 0 {
+            if lines == 0 && !prev.text().ends_with('\n') {
                 return if original.is_empty() { None } else { Some(String::new()) };
             }
             return Some("\n".repeat(lines) + &self.indent(self.depth(next)));
         }
-        if next.kind() == CLOSE_TAG || prev.kind() == CLOSE_TAG {
+        if prev.kind() == CLOSE_TAG {
             return None;
+        }
+        // `<?php echo 1; ?>`, `<?= $x ?>`
+        if next.kind() == CLOSE_TAG {
+            let newlines = original.matches('\n').count();
+            if newlines > 0 {
+                // Intelephense: at the column of its `<?php`
+                let depth = match self.template.then(|| self.region_of(next.text_range().start())).flatten() {
+                    Some(r) => self.open_tag_column(r),
+                    None => self.depth(next),
+                };
+                return Some(
+                    "\n".repeat(newlines.min(self.opts.max_blank_lines.saturating_add(1)))
+                        + &self.indent(depth),
+                );
+            }
+            return Some(" ".into());
+        }
+        if prev.kind() == OPEN_TAG_WITH_ECHO && !original.contains('\n') {
+            return Some(" ".into());
         }
         let newlines = original.matches('\n').count();
         // `;` ends the line of its statement
@@ -756,6 +979,10 @@ impl<'a> Formatter<'a> {
 
     /// `<?php` is followed by a blank line before these.
     fn blank_after_open_tag(&self, next: &SyntaxToken) -> bool {
+        // in templates only for the `<?php` starting the file
+        if self.template && next.prev_token().is_some_and(|t| t.text_range().start() != TextSize::from(0)) {
+            return false;
+        }
         next.kind() == DOC_COMMENT
             || statement_starting(next)
                 .is_some_and(|s| matches!(s.kind(), NAMESPACE_DECL | DECLARE_STMT | USE_DECL))
@@ -1301,5 +1528,24 @@ mod tests {
             "<?php\nclass A\n{\n    public function f(): void\n    {\n        $x = [1, 2];\n    }\n}\n";
         assert_eq!(fmt(input), input);
         assert_eq!(format("<?php function (", &FormatOptions::default()), Err(FormatError::SyntaxErrors));
+    }
+    /// Templates: Intelephense's output (js-beautify for the HTML, PHP
+    /// indented from its `<?php`).
+    #[test]
+    fn templates_like_intelephense() {
+        let cases: &[(&str, &str)] = &[
+        ("<div>\n<p>Hello</p>\n<?php if ($a): ?>\n<span>x</span>\n<?php else: ?>\n<b>y</b>\n<?php endif; ?>\n</div>\n", "<div>\n    <p>Hello</p>\n    <?php if ($a): ?>\n        <span>x</span>\n    <?php else: ?>\n        <b>y</b>\n    <?php endif; ?>\n</div>"),
+        ("<div>\n<?php\nfoo();\nif ($a) {\nbar();\n}\n?>\n<ul>\n<?php foreach ($items as $i) { ?>\n<li><?php echo $i; ?></li>\n<?php } ?>\n</ul>\n</div>\n", "<div>\n    <?php\n    foo();\n    if ($a) {\n        bar();\n    }\n    ?>\n    <ul>\n        <?php foreach ($items as $i) { ?>\n            <li><?php echo $i; ?></li>\n        <?php } ?>\n    </ul>\n</div>"),
+        ("<?php\n$a = 1;\n?>\n<html>\n<head><title><?= $t ?></title></head>\n<body>\n<div class=\"a\"\nid=\"b\">text  with   spaces</div>\n</body>\n</html>\n", "<?php\n$a = 1;\n?>\n<html>\n\n<head>\n    <title><?= $t ?></title>\n</head>\n\n<body>\n    <div class=\"a\"\n        id=\"b\">text with spaces</div>\n</body>\n\n</html>"),
+        ("<?php $x=1; ?>\n<p>a</p><?php echo 1; ?>\n<p>b</p>\n", "<?php $x = 1; ?>\n<p>a</p><?php echo 1; ?>\n<p>b</p>"),
+        ("<div>\n<?php if ($a): ?>\n<p>\n<?php\nfoo();\n$x = [\n1,\n2,\n];\n?>\n</p>\n<?php endif; ?>\n</div>\n", "<div>\n    <?php if ($a): ?>\n        <p>\n            <?php\n            foo();\n            $x = [\n                1,\n                2,\n            ];\n            ?>\n        </p>\n    <?php endif; ?>\n</div>"),
+        ("<ul>\n<li><?php\necho 1;\n?></li>\n</ul>\n", "<ul>\n    <li><?php\n        echo 1;\n        ?></li>\n</ul>"),
+        ("<p><?php echo 1;?> <?php   echo 2 ?> <?=$x?> <?= $y; ?></p>\n", "<p><?php echo 1; ?> <?php echo 2 ?> <?= $x ?> <?= $y; ?></p>"),
+        ("<?php\nif ($a) {\n?>\n<p>x</p>\n<?php\nfoo();\n}\n?>\n", "<?php\nif ($a) {\n?>\n    <p>x</p>\n<?php\n    foo();\n}\n?>"),
+        ("<?php\nfunction f() {\n?>\n<div>\n<span>a</span>\n</div>\n<?php\n}\n", "<?php\nfunction f()\n{\n?>\n    <div>\n        <span>a</span>\n    </div>\n<?php\n}\n"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&fmt(input), expected, "input: {input}");
+        }
     }
 }

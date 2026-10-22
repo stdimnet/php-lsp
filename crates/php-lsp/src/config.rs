@@ -51,6 +51,8 @@ pub struct ServerConfig {
     /// `environment.includePaths`: extra directories indexed as dependencies.
     pub include_paths: Vec<String>,
     pub format_braces: php_ide::BraceStyle,
+    /// Also format the HTML of templates (`format.html`).
+    pub format_html: bool,
     pub max_completion_items: usize,
     /// `index.cache`: keep extracted symbols on disk between sessions.
     pub index_cache: bool,
@@ -76,6 +78,7 @@ impl Default for ServerConfig {
             diagnostics_on_save: false,
             include_paths: Vec::new(),
             format_braces: php_ide::BraceStyle::Psr12,
+            format_html: true,
             max_completion_items: ide.max_completion_items,
             index_cache: true,
         }
@@ -211,6 +214,9 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "format.enable").and_then(Value::as_bool) {
                 self.format_enable = v;
+            }
+            if let Some(v) = get(&root, "format.html").and_then(Value::as_bool) {
+                self.format_html = v;
             }
             if let Some(v) = get(&root, "format.braces").and_then(Value::as_str) {
                 self.format_braces = match v.to_ascii_lowercase().as_str() {

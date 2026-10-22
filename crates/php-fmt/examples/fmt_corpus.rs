@@ -20,14 +20,18 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn tokens(text: &str) -> Vec<(SyntaxKind, String)> {
-    php_syntax::parse(text, PhpVersion::LATEST)
+    let mut tokens: Vec<(SyntaxKind, String)> = php_syntax::parse(text, PhpVersion::LATEST)
         .syntax_node()
         .descendants_with_tokens()
         .filter_map(|e| e.into_token())
         .filter(|t| t.kind() != SyntaxKind::WHITESPACE)
+        .filter(|t| t.kind() != SyntaxKind::INLINE_HTML || !t.text().trim().is_empty())
         .map(|t| {
             // doc comments may be re-indented
-            let text = if t.kind() == SyntaxKind::OPEN_TAG {
+            let text = if t.kind() == SyntaxKind::INLINE_HTML {
+                // templates: the HTML is re-indented
+                t.text().split_whitespace().collect::<String>()
+            } else if t.kind() == SyntaxKind::OPEN_TAG || t.kind() == SyntaxKind::CLOSE_TAG {
                 t.text().trim_end().to_string()
             } else if t.kind() == SyntaxKind::DOC_COMMENT || t.kind() == SyntaxKind::COMMENT {
                 t.text().split_whitespace().collect::<Vec<_>>().join(" ")
@@ -36,7 +40,12 @@ fn tokens(text: &str) -> Vec<(SyntaxKind, String)> {
             };
             (t.kind(), text)
         })
-        .collect()
+        .collect();
+    // a closing `?>` at the end of a PHP-only file is removed
+    if tokens.last().is_some_and(|t| t.0 == SyntaxKind::CLOSE_TAG) {
+        tokens.pop();
+    }
+    tokens
 }
 
 fn main() {
@@ -49,6 +58,9 @@ fn main() {
     let mut worst: Vec<(usize, PathBuf)> = Vec::new();
     let start = std::time::Instant::now();
     for f in &files {
+        if std::env::var("VERBOSE").is_ok() {
+            eprintln!("file: {}", f.display());
+        }
         let Ok(text) = std::fs::read_to_string(f) else { continue };
         let Ok(edits) = format(&text, &opts) else {
             skipped += 1;

@@ -986,7 +986,8 @@ fn blade_templates() {
         ws.type_at(list, TextSize::from(text.find("$u->").unwrap() as u32 + 1)).unwrap(),
         "App\\Models\\User"
     );
-    assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
+    let php_only = php_ide::FormatOptions { format_html: false, ..Default::default() };
+    assert!(ws.format(id, None, &php_only).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1373,7 +1374,9 @@ fn blade_php_blocks_are_formatted() {
     let mut ws = Workspace::new(Config::default());
     let text = "<div>\n    @php\n$items=[1,2];\n        if($x){\n$y=1;\n}\n    @endphp\n    {{  $x  }}\n    @php $a=1; @endphp\n    @php\n$s = 'a\nb';\n    @endphp\n</div>\n";
     let id = ws.set_file("file:///v.blade.php", text.to_string());
-    let edits = ws.format(id, None, &Default::default()).unwrap();
+    // without HTML formatting only `@php` blocks change
+    let php_only = php_ide::FormatOptions { format_html: false, ..Default::default() };
+    let edits = ws.format(id, None, &php_only).unwrap();
     let mut out = text.to_string();
     for e in edits.iter().rev() {
         out.replace_range(usize::from(e.range.start())..usize::from(e.range.end()), &e.new_text);
@@ -1384,11 +1387,25 @@ fn blade_php_blocks_are_formatted() {
     );
     // idempotent
     ws.set_file("file:///v.blade.php", out.clone());
-    assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
+    assert!(ws.format(id, None, &php_only).unwrap().is_empty());
     // range formatting only touches blocks inside the range
     ws.set_file("file:///v.blade.php", text.to_string());
     let r = php_ide::TextRange::new(TextSize::from(0), TextSize::from(3));
-    assert!(ws.format(id, Some(r), &Default::default()).unwrap().is_empty());
+    assert!(ws.format(id, Some(r), &php_only).unwrap().is_empty());
+}
+
+/// Blade views are formatted as HTML like Intelephense does (js-beautify).
+#[test]
+fn blade_views_are_formatted_as_html() {
+    let mut ws = Workspace::new(Config::default());
+    let text = "<div>\n<ul>\n@foreach ($items as $i)\n<li>{{ $i }}</li>\n@endforeach\n</ul>\n</div>\n";
+    let id = ws.set_file("file:///v.blade.php", text.to_string());
+    let edits = ws.format(id, None, &Default::default()).unwrap();
+    let mut out = text.to_string();
+    for e in edits.iter().rev() {
+        out.replace_range(usize::from(e.range.start())..usize::from(e.range.end()), &e.new_text);
+    }
+    assert_eq!(out, "<div>\n    <ul>\n        @foreach ($items as $i)\n        <li>{{ $i }}</li>\n        @endforeach\n    </ul>\n</div>");
 }
 
 #[test]

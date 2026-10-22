@@ -451,6 +451,7 @@ fn format_options(s: &Server, o: &lsp::FormattingOptions) -> php_ide::FormatOpti
         indent_size: o.tab_size.max(1) as usize,
         use_tabs: !o.insert_spaces,
         braces: s.config.format_braces,
+        format_html: s.config.format_html,
         insert_final_newline: o.insert_final_newline.unwrap_or(true),
         ..Default::default()
     }

@@ -600,7 +600,7 @@ impl Workspace {
         }
         let mut options = options.clone();
         options.php_version = self.config.php_version;
-        if blade::is_blade(&file.path) {
+        if blade::is_blade(&file.path) && !options.format_html {
             // only the code of `@php` blocks; the template stays as it is
             let edits = blade::format(&file.text, range, &options);
             return Some(edits.into_iter().map(|(range, new_text)| TextEdit { range, new_text }).collect());
