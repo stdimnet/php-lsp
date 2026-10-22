@@ -104,16 +104,18 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
 - [x] **Phase 2, semantics & index:** name resolution, PHPDoc, background workspace
   indexing, phpstorm-stubs, hover, definition / type definition / implementation,
   references, document highlights, workspace symbols, completion with auto import,
-  signature help, file watching, Composer/PSR-4 (12.5k files index in ~1.3 s, so there is
-  no on-disk cache)
+  signature help, file watching, Composer/PSR-4, on-disk index cache (12.6k files: 0.85 s
+  cold, 0.2 s with the cache)
 - [x] **Phase 3, types & diagnostics:** type inference (generics via `@template`, array
   shapes, narrowing), inlay hints, semantic tokens, highlights. Diagnostics use
   Intelephense's codes, messages and severities: undefined symbols, argument count and
   types (P1006), implementations, deprecations, unused symbols and parameters, missing
   returns, possibly undefined variables, unreachable code, member visibility, modifier /
   method body / readonly / named argument rules, duplicate keys and declarations,
-  incompatible / final overrides, colliding traits, attribute and enum rules and more
-  (compared with the real Intelephense with `editors/compare`)
+  incompatible / final overrides, colliding traits, attribute targets, enum rules, property
+  hooks and asymmetric visibility, constant expressions, namespace placement, deprecations
+  depending on the targeted PHP version and more: 112 of the 130 codes of Intelephense's catalog,
+  compared with the real Intelephense for PHP 7.4 to 8.5 (`editors/compare`)
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
   hierarchy, code lens, PHPDoc completion, document links (`include`/`require`, URLs),
@@ -136,8 +138,15 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
     `{{ }}` / `@if(...)` / `@foreach(...)`; variable types come from the controllers' `view()`
     / `->with()` / `compact()` calls, `$loop` is typed; directive snippets, HTML completion,
     view names in `@include` / `@extends`; folding of directive blocks, outline of sections /
-    stacks / slots, highlighted directives (semantic tokens), formatting of `@php` blocks. Twig is not supported: VS Code
-    sends `.twig` files (language `twig`) to no PHP server
+    stacks / slots, highlighted directives (semantic tokens), formatting of `@php` blocks
+  - **Twig** (for editors that send `.twig` files; the Intelephense VS Code extension does
+    not): variable types from the controllers' `render()` / `renderView()` calls and
+    `#[Template]`, `{% set %}` and `{% for %}`, `loop`, `app`; hover, completion and go to
+    definition of attributes (`user.name` → `getName()`), tags (with the matching end tag),
+    filters, functions, tests, template names and routes; go to the template of
+    `extends` / `include` / `embed` (also `@Bundle/...`), to the parent's block and to the
+    controller passing a variable; document links, folding, outline of blocks and macros,
+    semantic tokens. No diagnostics and no formatting for Twig
   - **Symfony:** typed `$container->get(Foo::class)` and Doctrine `getRepository()`, route
     names (`#[Route(name: ...)]`, YAML) and Twig templates for `redirectToRoute()`,
     `generateUrl()`, `render()`

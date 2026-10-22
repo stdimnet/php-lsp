@@ -31,6 +31,10 @@ pub(crate) struct Sema<'a> {
 
 impl<'a> Sema<'a> {
     pub fn new(ws: &'a Workspace, file: FileId) -> Option<Sema<'a>> {
+        // templates without PHP code (see `twig.rs`)
+        if crate::twig::is_twig(&ws.file(file)?.path) {
+            return None;
+        }
         let parse = ws.parse(file)?;
         let scopes = ws.scopes(file, &parse);
         let root = parse.syntax_node();

@@ -44,6 +44,7 @@ mod sema;
 mod semantic_tokens;
 mod signature_help;
 mod symbols;
+mod twig;
 mod typecheck;
 mod workspace_symbols;
 
@@ -392,7 +393,14 @@ impl Workspace {
         out
     }
 
+    fn twig_file(&self, id: FileId) -> Option<&SourceFile> {
+        self.file(id).filter(|f| twig::is_twig(&f.path))
+    }
+
     pub fn document_symbols(&self, id: FileId) -> Vec<Symbol> {
+        if let Some(f) = self.twig_file(id) {
+            return twig::symbols(&f.text);
+        }
         if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
             return blade::symbols(&f.text, &blade::virtual_php(&f.text));
         }
@@ -401,6 +409,9 @@ impl Workspace {
 
     pub fn folding_ranges(&self, id: FileId) -> Vec<Fold> {
         let (Some(p), Some(f)) = (self.parse(id), self.file(id)) else { return Vec::new() };
+        if twig::is_twig(&f.path) {
+            return twig::folds(&f.text);
+        }
         if blade::is_blade(&f.path) {
             return blade::folds(&f.text, &blade::virtual_php(&f.text));
         }
@@ -409,6 +420,9 @@ impl Workspace {
 
     /// For each offset, the nested ranges from innermost to outermost.
     pub fn selection_ranges(&self, id: FileId, offsets: &[TextSize]) -> Vec<Vec<TextRange>> {
+        if self.twig_file(id).is_some() {
+            return Vec::new();
+        }
         let Some(p) = self.parse(id) else { return Vec::new() };
         let root = p.syntax_node();
         offsets.iter().map(|&o| selection::selection_ranges(&root, o)).collect()
@@ -421,10 +435,16 @@ impl Workspace {
     }
 
     pub fn hover(&self, id: FileId, offset: TextSize) -> Option<Hover> {
+        if self.twig_file(id).is_some() {
+            return twig::hover(self, id, offset);
+        }
         hover::hover(&sema::Sema::new(self, id)?, offset)
     }
 
     pub fn goto_definition(&self, id: FileId, offset: TextSize) -> Vec<Location> {
+        if self.twig_file(id).is_some() {
+            return twig::goto_definition(self, id, offset);
+        }
         sema::Sema::new(self, id).map(|s| navigation::goto_definition(&s, offset)).unwrap_or_default()
     }
 
@@ -447,7 +467,7 @@ impl Workspace {
     /// Opening and closing tag names of the HTML element at `offset`.
     pub fn linked_editing_ranges(&self, id: FileId, offset: TextSize) -> Option<Vec<TextRange>> {
         let f = self.file(id)?;
-        let root = if blade::is_blade(&f.path) {
+        let root = if blade::is_blade(&f.path) || twig::is_twig(&f.path) {
             php_syntax::parse(&f.text, self.config.php_version).syntax_node()
         } else {
             self.parse(id)?.syntax_node()
@@ -461,6 +481,17 @@ impl Workspace {
     }
 
     pub fn completions(&self, id: FileId, offset: TextSize) -> CompletionList {
+        if let Some(f) = self.twig_file(id) {
+            // outside of Twig tags: HTML
+            return twig::completions(self, id, offset).unwrap_or_else(|| CompletionList {
+                items: html::completions(
+                    &php_syntax::parse(&f.text, self.config.php_version).syntax_node(),
+                    offset,
+                )
+                .unwrap_or_default(),
+                incomplete: false,
+            });
+        }
         if let Some(f) = self.file(id).filter(|f| blade::is_blade(&f.path)) {
             let b = blade::virtual_php(&f.text);
             if !blade::in_code(&b, offset) {
@@ -541,6 +572,9 @@ impl Workspace {
         options: &FormatOptions,
     ) -> Option<Vec<TextEdit>> {
         let file = self.file(id)?;
+        if twig::is_twig(&file.path) {
+            return Some(Vec::new());
+        }
         let mut options = options.clone();
         options.php_version = self.config.php_version;
         if blade::is_blade(&file.path) {
@@ -557,6 +591,9 @@ impl Workspace {
     }
 
     pub fn document_links(&self, id: FileId) -> Vec<DocumentLink> {
+        if self.twig_file(id).is_some() {
+            return twig::document_links(self, id);
+        }
         sema::Sema::new(self, id).map(|s| links::document_links(&s)).unwrap_or_default()
     }
 
@@ -572,6 +609,9 @@ impl Workspace {
 
     /// Semantic tokens of a file (optionally limited to `range`).
     pub fn semantic_tokens(&self, id: FileId, range: Option<TextRange>) -> Vec<SemanticToken> {
+        if let Some(f) = self.twig_file(id) {
+            return twig::tokens(&f.text, range);
+        }
         let mut tokens = sema::Sema::new(self, id)
             .map(|s| semantic_tokens::semantic_tokens(&s, range))
             .unwrap_or_default();
@@ -588,6 +628,9 @@ impl Workspace {
     /// Definition targets of the string literal at `offset` contributed by
     /// plugins (config keys, views, routes, hooks, ...): `(path key, line)`.
     pub fn string_targets(&self, id: FileId, offset: TextSize) -> Vec<(String, u32)> {
+        if self.twig_file(id).is_some() {
+            return twig::string_targets(self, id, offset);
+        }
         let Some(sema) = sema::Sema::new(self, id) else { return Vec::new() };
         let Some((arg, _)) = completion::string_arg_at(&sema, offset) else { return Vec::new() };
         let cx = plugins::PluginCx { ws: self, file: id };

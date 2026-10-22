@@ -28,6 +28,9 @@ pub(crate) fn extract_symbols(path: &str, text: &str, opts: ExtractOptions) -> F
 pub(crate) fn parse_source(path: &str, text: &str, version: php_syntax::PhpVersion) -> php_syntax::Parse {
     if crate::blade::is_blade(path) {
         php_syntax::parse_php_code(&crate::blade::virtual_php(text).text, version)
+    } else if crate::twig::is_twig(path) {
+        // Twig has no PHP code (see `twig.rs`)
+        php_syntax::parse("", version)
     } else {
         php_syntax::parse(text, version)
     }

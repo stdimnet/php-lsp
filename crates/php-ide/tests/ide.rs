@@ -1555,3 +1555,127 @@ fn catalog_round_three() {
         )
     );
 }
+
+#[test]
+fn twig_templates() {
+    let (mut ws, dir) = project(
+        "twig",
+        &[
+            ("composer.json", "{}"),
+            ("symfony.lock", "{}"),
+            (
+                "src/Entity/User.php",
+                "<?php\nnamespace App\\Entity;\nclass User {\n    public string $email = '';\n    /** The display name. */\n    public function getName(): string { return ''; }\n    public function isActive(): bool { return true; }\n    /** @return Post[] */\n    public function getPosts(): array { return []; }\n    public function rename(string $n): static { return $this; }\n}\nclass Post { public string $title = ''; }\n",
+            ),
+            (
+                "src/Controller/UserController.php",
+                "<?php\nnamespace App\\Controller;\nuse App\\Entity\\User;\nclass UserController extends \\Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController {\n    public function show(User $user) {\n        return $this->render('user/show.html.twig', ['user' => $user, 'count' => 3]);\n    }\n    #[\\Route('/users/{id}', name: 'user_show')]\n    public function route() {}\n}\n",
+            ),
+            ("templates/base.html.twig", "<html>\n{% block body %}{% endblock %}\n{% block title %}Site{% endblock %}\n</html>\n"),
+        ],
+    );
+    let path = "templates/user/show.html.twig";
+    let template = "{% extends 'base.html.twig' %}\n{% block body %}\n  <h1>{{ user.name|upper }}</h1>\n  {% set total = user.posts|length %}\n  {% for post in user.posts %}\n    {{ post.title }} {{ loop.index }}\n  {% endfor %}\n  {# a comment\n     on two lines #}\n  <a href=\"{{ path('user_show') }}\">{{ count }} {{ total }}</a>\n{% endblock %}\n";
+    let key = format!("file://{}", dir.join(path).display());
+    std::fs::create_dir_all(dir.join("templates/user")).unwrap();
+    std::fs::write(dir.join(path), template).unwrap();
+    let id = ws.set_file(&key, template.to_string());
+    let at = |needle: &str, delta: usize| TextSize::from((template.find(needle).unwrap() + delta) as u32);
+    let labels = |ws: &Workspace, text: &str, offset: usize| {
+        let id = ws.file_id(&key).unwrap();
+        let _ = text;
+        ws.completions(id, TextSize::from(offset as u32))
+            .items
+            .into_iter()
+            .map(|i| i.label)
+            .collect::<Vec<_>>()
+    };
+
+    // no PHP diagnostics, no formatting
+    assert!(ws.diagnostics(id).is_empty(), "{:?}", ws.diagnostics(id));
+    assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
+
+    // variables from the controller, attributes through getters
+    let h = ws.hover(id, at("user.name", 1)).unwrap();
+    assert!(h.markdown.contains("App\\Entity\\User $user"), "{}", h.markdown);
+    let h = ws.hover(id, at("user.name", 6)).unwrap();
+    assert!(
+        h.markdown.contains("getName(): string") && h.markdown.contains("The display name."),
+        "{}",
+        h.markdown
+    );
+    let defs = ws.goto_definition(id, at("user.name", 6));
+    assert_eq!(defs.len(), 1);
+    assert!(ws.file(defs[0].file).unwrap().path.ends_with("User.php"));
+    let h = ws.hover(id, at("post.title", 6)).unwrap();
+    assert!(h.markdown.contains("string $title"), "{}", h.markdown);
+    let h = ws.hover(id, at("{{ total", 4)).unwrap();
+    assert!(h.markdown.contains("int $total"), "{}", h.markdown);
+    let h = ws.hover(id, at("{{ count", 4)).unwrap();
+    assert!(h.markdown.contains("int $count"), "{}", h.markdown);
+    // a variable from the controller: definition is the array key
+    let defs = ws.goto_definition(id, at("{{ count", 4));
+    assert!(ws.file(defs[0].file).unwrap().path.ends_with("UserController.php"));
+
+    // completion
+    let mut edited = template.replacen("{{ post.title }}", "{{ post. }}", 1);
+    let offset = edited.find("post. ").unwrap() + 5;
+    ws.set_file(&key, edited.clone());
+    let l = labels(&ws, &edited, offset);
+    assert!(l.contains(&"title".to_string()), "{l:?}");
+    edited = template.replacen("{{ user.name|upper }}", "{{ user. }}", 1);
+    let offset = edited.find("user. ").unwrap() + 5;
+    ws.set_file(&key, edited.clone());
+    let l = labels(&ws, &edited, offset);
+    for want in ["name", "active", "posts", "email", "rename"] {
+        assert!(l.contains(&want.to_string()), "{want} {l:?}");
+    }
+    edited = template.replacen("{{ loop.index }}", "{{ loop. }}", 1);
+    let offset = edited.find("loop. ").unwrap() + 5;
+    ws.set_file(&key, edited.clone());
+    assert!(labels(&ws, &edited, offset).contains(&"index0".to_string()));
+    edited = template.replacen("|upper", "|up", 1);
+    let offset = edited.find("|up").unwrap() + 3;
+    ws.set_file(&key, edited.clone());
+    assert!(labels(&ws, &edited, offset).contains(&"upper".to_string()));
+    edited = template.replacen("  {% endfor %}", "  {% e %}", 1);
+    let offset = edited.find("{% e %}").unwrap() + 4;
+    ws.set_file(&key, edited.clone());
+    assert_eq!(labels(&ws, &edited, offset)[0], "endfor");
+    edited = template.replacen("{{ count }}", "{{ c }}", 1);
+    let offset = edited.find("{{ c }}").unwrap() + 4;
+    ws.set_file(&key, edited.clone());
+    let l = labels(&ws, &edited, offset);
+    assert!(
+        l.contains(&"count".to_string())
+            && l.contains(&"user".to_string())
+            && l.contains(&"path".to_string()),
+        "{l:?}"
+    );
+    edited = template.replacen("'base.html.twig'", "''", 1);
+    let offset = edited.find("''").unwrap() + 1;
+    ws.set_file(&key, edited.clone());
+    assert_eq!(labels(&ws, &edited, offset), vec!["base.html.twig", "user/show.html.twig"]);
+    ws.set_file(&key, template.to_string());
+
+    // navigation: templates, parent blocks, routes
+    let t = ws.string_targets(id, at("base.html", 2));
+    assert!(t[0].0.ends_with("templates/base.html.twig"), "{t:?}");
+    let t = ws.string_targets(id, at("block body", 7));
+    assert!(t[0].0.ends_with("templates/base.html.twig") && t[0].1 == 1, "{t:?}");
+    let t = ws.string_targets(id, at("user_show", 2));
+    assert!(t[0].0.ends_with("UserController.php"), "{t:?}");
+    let links = ws.document_links(id);
+    assert_eq!(links.len(), 1);
+    assert!(links[0].target.ends_with("base.html.twig"));
+
+    // structure
+    let syms = ws.document_symbols(id);
+    assert_eq!(syms.len(), 1);
+    assert_eq!(syms[0].name, "body");
+    let folds = ws.folding_ranges(id);
+    assert_eq!(folds.len(), 3, "{folds:?}");
+    let tokens = ws.semantic_tokens(id, None);
+    assert!(tokens.iter().any(|t| t.token_type == php_ide::SemanticTokenType::Property));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -420,3 +420,54 @@ fn index_cache_survives_restart() {
     c.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn twig_over_lsp() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-twig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(dir.join("composer.json"), "{}").unwrap();
+    std::fs::write(dir.join("templates/base.html.twig"), "{% block body %}{% endblock %}").unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {},
+        "initializationOptions": {"storagePath": dir.join(".storage").display().to_string()},
+    }));
+    let uri = format!("{root_uri}/templates/page.html.twig");
+    let text = "{% extends 'base.html.twig' %}\n{% block body %}\n  {% for i in 1..3 %}{{ i }}{% e\n{% endblock %}\n";
+    c.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri, "languageId": "twig", "version": 1, "text": text}}),
+    );
+    let d = c.wait_notification("textDocument/publishDiagnostics");
+    assert_eq!(d["diagnostics"], json!([]));
+    let items = c.request(
+        "textDocument/completion",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 32}}),
+    );
+    let labels: Vec<String> = items["items"]
+        .as_array()
+        .or_else(|| items.as_array())
+        .unwrap()
+        .iter()
+        .map(|i| i["label"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(labels[0], "endfor", "{labels:?}");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 14}}),
+    );
+    assert!(def.to_string().contains("base.html.twig"), "{def}");
+    let symbols = c.request("textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}));
+    assert!(symbols.to_string().contains("\"body\""), "{symbols}");
+    let tokens = c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri}}));
+    assert!(!tokens["data"].as_array().unwrap().is_empty());
+    let fmt = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(fmt.is_null() || fmt == json!([]), "{fmt}");
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

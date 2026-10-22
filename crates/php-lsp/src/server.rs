@@ -275,6 +275,10 @@ impl Server {
         let Some(uri) = self.client_uris.get(&id) else { return };
         let Some(path) = uri::path_from_uri(uri.as_str()) else { return };
         let Some(file) = self.workspace.file(id) else { return };
+        // PHP tools do not understand templates
+        if file.path.ends_with(".twig") {
+            return;
+        }
         let text = file.text.to_string();
         let root = self.root_for(&path);
         for (tool, cfg) in [
@@ -305,6 +309,10 @@ impl Server {
             return;
         };
         let Some(file) = self.workspace.file(id) else { return };
+        if file.path.ends_with(".twig") || file.path.ends_with(".blade.php") {
+            self.respond(request, Value::Null);
+            return;
+        }
         let text = file.text.to_string();
         let index = file.line_index.clone();
         let root = self.root_for(&path);
@@ -625,15 +633,16 @@ impl Server {
                 }
             }
             let cached = cache.as_ref().map_or(0, |c| c.hits());
-            if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
-                let _ = c.save();
-            }
             let _ = tx.send(Task::IndexingDone {
                 generation,
                 count,
                 cached,
                 millis: start.elapsed().as_millis(),
             });
+            // after reporting: writing does not delay the first requests
+            if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                let _ = c.save();
+            }
         });
     }
 

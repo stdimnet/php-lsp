@@ -86,7 +86,7 @@ fn view_name(key: &str) -> Option<String> {
     Some(rest.strip_suffix(".blade.php")?.replace('/', "."))
 }
 
-fn call_name(call: &php_syntax::SyntaxNode) -> Option<String> {
+pub(crate) fn call_name(call: &php_syntax::SyntaxNode) -> Option<String> {
     use php_syntax::{ast, ast::AstNode, SyntaxKind::*};
     match call.kind() {
         CALL_EXPR => {
@@ -99,7 +99,7 @@ fn call_name(call: &php_syntax::SyntaxNode) -> Option<String> {
     }
 }
 
-fn arg_exprs(call: &php_syntax::SyntaxNode) -> Vec<php_syntax::SyntaxNode> {
+pub(crate) fn arg_exprs(call: &php_syntax::SyntaxNode) -> Vec<php_syntax::SyntaxNode> {
     use php_syntax::SyntaxKind::*;
     call.children()
         .find(|c| c.kind() == ARG_LIST)
@@ -112,14 +112,14 @@ fn arg_exprs(call: &php_syntax::SyntaxNode) -> Vec<php_syntax::SyntaxNode> {
         .unwrap_or_default()
 }
 
-fn string_value(expr: &php_syntax::SyntaxNode) -> Option<String> {
+pub(crate) fn string_value(expr: &php_syntax::SyntaxNode) -> Option<String> {
     use php_syntax::SyntaxKind::*;
     let tok = expr.first_token().filter(|t| t.kind() == STRING && expr.kind() == LITERAL)?;
     Some(super::unquote(tok.text()))
 }
 
 /// Type of `var` in view data: `['var' => $x]` or `compact('var')`.
-fn data_type(sema: &crate::sema::Sema, data: &php_syntax::SyntaxNode, var: &str) -> Option<Type> {
+pub(crate) fn data_type(sema: &crate::sema::Sema, data: &php_syntax::SyntaxNode, var: &str) -> Option<Type> {
     use php_syntax::SyntaxKind::*;
     match data.kind() {
         ARRAY_EXPR => data.children().filter(|c| c.kind() == ARRAY_ELEMENT).find_map(|el| {
