@@ -1,5 +1,6 @@
 //! Indexes a project directory and runs a few queries, printing timings.
 //! Usage: `cargo run --release -p php-ide --example index_project -- <dir> [ClassName]`
+//! (`CACHE_DIR=...` uses and updates an on-disk index cache there)
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,6 +12,17 @@ fn main() {
     let root = args.next().expect("usage: index_project <dir> [ClassName]");
     let query = args.next().unwrap_or_else(|| "Collection".into());
     let mut ws = Workspace::new(Config::default());
+    let cache = std::env::var_os("CACHE_DIR").map(|d| {
+        let t = Instant::now();
+        let c = Arc::new(php_ide::IndexCache::open(
+            std::path::Path::new(&d),
+            &[std::path::PathBuf::from(&root)],
+            ws.extract_options(),
+        ));
+        println!("cache: {} entries loaded in {:?}", c.len(), t.elapsed());
+        c
+    });
+    ws.set_index_cache(cache.clone());
 
     let t = Instant::now();
     ws.load_stubs();
@@ -30,6 +42,11 @@ fn main() {
     let t2 = Instant::now();
     ws.index_files(texts);
     println!("project: {n} files, scan {scan:?}, index {:?}", t2.elapsed());
+    if let Some(c) = &cache {
+        let t = Instant::now();
+        c.save().unwrap();
+        println!("cache: {} hits, saved in {:?}", c.hits(), t.elapsed());
+    }
 
     let t = Instant::now();
     let syms = ws.workspace_symbols(&query, 5);

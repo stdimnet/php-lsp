@@ -33,6 +33,8 @@ pub(crate) enum Task {
     IndexingDone {
         generation: u32,
         count: usize,
+        /// Files taken from the on-disk cache.
+        cached: usize,
         millis: u128,
     },
     ToolDiagnostics {
@@ -67,6 +69,10 @@ pub struct Server {
     versions: HashMap<FileId, i32>,
     roots: Vec<PathBuf>,
     pub(crate) stub_dir: PathBuf,
+    /// Where the index cache is stored.
+    pub(crate) cache_dir: PathBuf,
+    /// `clearCache` in the initialization options: rebuild once.
+    pub(crate) clear_cache: bool,
     next_request_id: i32,
     pending: HashMap<RequestId, &'static str>,
     shutdown_requested: bool,
@@ -89,12 +95,14 @@ impl Server {
         let encoding = negotiate_encoding(&params.capabilities);
         let mut config = ServerConfig::default();
         let mut storage: Option<PathBuf> = None;
+        let mut clear_cache = false;
         if let Some(opts) = &params.initialization_options {
             config.update(opts);
             config.update(&serde_json::json!({ "intelephense": opts }));
             if let Some(s) = opts.get("storagePath").and_then(Value::as_str) {
                 storage = Some(PathBuf::from(s));
             }
+            clear_cache = opts.get("clearCache").and_then(Value::as_bool) == Some(true);
         }
         let mut caps = client_caps(&params);
         // sent by the Intelephense VS Code extension
@@ -116,6 +124,14 @@ impl Server {
         result["capabilities"]["typeHierarchyProvider"] = Value::Bool(true);
         connection.initialize_finish(id, result)?;
         let workspace = Workspace::new(config.ide_config());
+        let cache_dir = match &storage {
+            Some(s) => s.join("php-lsp-index"),
+            None => std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+                .unwrap_or_else(std::env::temp_dir)
+                .join("php-lsp"),
+        };
         let stub_dir = storage
             .unwrap_or_else(std::env::temp_dir)
             .join(format!("php-lsp-stubs-{}", env!("CARGO_PKG_VERSION")));
@@ -130,6 +146,8 @@ impl Server {
             versions: HashMap::new(),
             roots,
             stub_dir,
+            cache_dir,
+            clear_cache,
             next_request_id: 0,
             pending: HashMap::new(),
             shutdown_requested: false,
@@ -347,7 +365,7 @@ impl Server {
                     send("window/showMessage", serde_json::json!({"type": typ, "message": message}));
                 });
             }
-            CMD_INDEX => self.start_indexing(),
+            CMD_INDEX => self.reindex(),
             _ => self.log(&format!("unknown command {}", p.command)),
         }
     }
@@ -419,7 +437,7 @@ impl Server {
                 }
                 Initialized::METHOD => {}
                 // Intelephense compatible commands
-                "indexWorkspace" | "intelephense/index" => self.start_indexing(),
+                "indexWorkspace" | "intelephense/index" => self.reindex(),
                 _ => {}
             }
             Ok(())
@@ -515,6 +533,22 @@ impl Server {
 
     // ------------------------------------------------------------------ indexing
 
+    /// "Index workspace": rebuilds the index without the on-disk cache.
+    fn reindex(&mut self) {
+        self.open_index_cache().inspect(|c| c.clear());
+        self.start_indexing();
+    }
+
+    fn open_index_cache(&self) -> Option<Arc<php_ide::IndexCache>> {
+        self.config.index_cache.then(|| {
+            Arc::new(php_ide::IndexCache::open(
+                &self.cache_dir,
+                &self.roots,
+                self.workspace.extract_options(),
+            ))
+        })
+    }
+
     /// Re-indexes stubs and all workspace folders on a background thread.
     fn start_indexing(&mut self) {
         self.generation += 1;
@@ -522,6 +556,11 @@ impl Server {
         // apply the new stub list now; the stubs are re-indexed below
         self.workspace.set_config(self.config.ide_config());
         self.workspace.set_index_ready(false);
+        if std::mem::take(&mut self.clear_cache) {
+            self.open_index_cache().inspect(|c| c.clear());
+        }
+        let cache = self.open_index_cache();
+        self.workspace.set_index_cache(cache.clone());
         // stubs are small: index them right away so hover / completion of
         // built-ins work from the first request
         if self.workspace.config().stubs != self.loaded_stubs || self.generation == 1 {
@@ -579,13 +618,22 @@ impl Server {
                         break;
                     }
                     count += texts.len();
-                    let files = php_ide::index_files(texts, opts);
+                    let files = php_ide::index_files_cached(texts, opts, cache.as_deref());
                     if tx.send(Task::Indexed { generation, files, stubs: false }).is_err() {
                         return;
                     }
                 }
             }
-            let _ = tx.send(Task::IndexingDone { generation, count, millis: start.elapsed().as_millis() });
+            let cached = cache.as_ref().map_or(0, |c| c.hits());
+            if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                let _ = c.save();
+            }
+            let _ = tx.send(Task::IndexingDone {
+                generation,
+                count,
+                cached,
+                millis: start.elapsed().as_millis(),
+            });
         });
     }
 
@@ -626,13 +674,15 @@ impl Server {
                     self.workspace.mark_stubs_loaded();
                 }
             }
-            Task::IndexingDone { generation, count, millis } => {
+            Task::IndexingDone { generation, count, cached, millis } => {
                 if generation != self.generation {
                     return;
                 }
                 self.indexing = false;
                 self.workspace.set_index_ready(true);
-                self.log(&format!("indexed {count} files in {millis} ms"));
+                // later stub reloads (config changes) parse again
+                self.workspace.set_index_cache(None);
+                self.log(&format!("indexed {count} files in {millis} ms ({cached} from cache)"));
                 let ids: Vec<FileId> = self.client_uris.keys().copied().collect();
                 for id in ids {
                     self.publish_diagnostics(id);

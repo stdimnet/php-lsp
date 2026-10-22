@@ -10,7 +10,7 @@ use crate::names::{FileScopes, NamespaceScope};
 use crate::phpdoc::{self, DocBlock, PropertyAccess, TemplateTag};
 use crate::types::{builtin_type, Fqn, Type};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Visibility {
     Public,
     Protected,
@@ -27,7 +27,7 @@ impl Visibility {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParamDef {
     pub name: String,
     pub ty: Option<Type>,
@@ -48,7 +48,7 @@ impl ParamDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FunctionDef {
     /// Short name (`foo`); for functions see [`FunctionDef::fqn`].
     pub name: String,
@@ -80,7 +80,7 @@ impl FunctionDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PropertyDef {
     pub name: String,
     pub ty: Option<Type>,
@@ -105,7 +105,7 @@ impl PropertyDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassConstDef {
     pub name: String,
     pub value: Option<String>,
@@ -118,7 +118,7 @@ pub struct ClassConstDef {
     pub deprecated: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnumCaseDef {
     pub name: String,
     pub value: Option<String>,
@@ -127,7 +127,7 @@ pub struct EnumCaseDef {
     pub doc: Option<Arc<DocBlock>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassDef {
     pub fqn: Fqn,
     pub kind: ClassLikeKind,
@@ -176,7 +176,7 @@ impl ClassDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConstDef {
     pub fqn: Fqn,
     pub value: Option<String>,
@@ -187,7 +187,7 @@ pub struct ConstDef {
 }
 
 /// Everything declared in a file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileSymbols {
     pub classes: Vec<ClassDef>,
     pub functions: Vec<FunctionDef>,

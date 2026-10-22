@@ -52,6 +52,8 @@ pub struct ServerConfig {
     pub include_paths: Vec<String>,
     pub format_braces: php_ide::BraceStyle,
     pub max_completion_items: usize,
+    /// `index.cache`: keep extracted symbols on disk between sessions.
+    pub index_cache: bool,
 }
 
 impl Default for ServerConfig {
@@ -75,6 +77,7 @@ impl Default for ServerConfig {
             include_paths: Vec::new(),
             format_braces: php_ide::BraceStyle::Psr12,
             max_completion_items: ide.max_completion_items,
+            index_cache: true,
         }
     }
 }
@@ -218,6 +221,9 @@ impl ServerConfig {
             }
             if let Some(v) = get(&root, "completion.maxItems").and_then(Value::as_u64) {
                 self.max_completion_items = v as usize;
+            }
+            if let Some(v) = get(&root, "index.cache").and_then(Value::as_bool) {
+                self.index_cache = v;
             }
         }
     }

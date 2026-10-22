@@ -1525,7 +1525,8 @@ fn catalog_round_three() {
     let mut workspaces: std::collections::HashMap<&str, Workspace> = std::collections::HashMap::new();
     for (version, text, expected) in cases {
         let ws = workspaces.entry(version).or_insert_with(|| {
-            let mut ws = Workspace::new(Config { php_version: version.parse().unwrap(), ..Default::default() });
+            let mut ws =
+                Workspace::new(Config { php_version: version.parse().unwrap(), ..Default::default() });
             ws.load_stubs();
             ws
         });

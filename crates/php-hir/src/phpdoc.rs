@@ -3,7 +3,7 @@
 
 use crate::types::{builtin_type, ShapeEntry, Type};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DocBlock {
     /// First paragraph.
     pub summary: String,
@@ -12,7 +12,7 @@ pub struct DocBlock {
     pub tags: Vec<Tag>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Tag {
     /// Tag name without `@`, e.g. `param`, `phpstan-return`.
     pub name: String,
@@ -21,7 +21,7 @@ pub struct Tag {
 }
 
 /// A parsed `@param`, `@var`, `@property`, ... tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypedTag {
     pub type_text: String,
     pub var: Option<String>,
@@ -29,7 +29,7 @@ pub struct TypedTag {
 }
 
 /// A parsed `@method` tag.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodTag {
     pub is_static: bool,
     pub return_type: Option<String>,
@@ -39,7 +39,7 @@ pub struct MethodTag {
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MethodTagParam {
     pub type_text: Option<String>,
     pub name: String,
@@ -48,7 +48,7 @@ pub struct MethodTagParam {
 }
 
 /// `@template T of Bound`
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TemplateTag {
     pub name: String,
     pub bound: Option<String>,
@@ -270,7 +270,7 @@ impl DocBlock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum PropertyAccess {
     ReadWrite,
     Read,

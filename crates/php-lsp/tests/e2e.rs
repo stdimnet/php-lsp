@@ -354,3 +354,69 @@ fn external_tools() {
     c.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `indexed N files in M ms (K from cache)` log line.
+fn wait_index_log(c: &Client) -> (usize, usize) {
+    loop {
+        let m = c.wait_notification("window/logMessage");
+        let text = m["message"].as_str().unwrap_or_default().to_string();
+        if let Some(rest) = text.strip_prefix("indexed ") {
+            let count = rest.split(' ').next().unwrap().parse().unwrap();
+            let cached = rest.split('(').nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+            return (count, cached);
+        }
+    }
+}
+
+#[test]
+fn index_cache_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/A.php"), "<?php\nclass A { public function a(): int { return 1; } }\n")
+        .unwrap();
+    std::fs::write(dir.join("src/B.php"), "<?php\nclass B extends A {}\n").unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let storage = dir.join(".storage");
+    let start = || {
+        let c = Client::start_with(json!({
+            "rootUri": root_uri,
+            "capabilities": {},
+            "initializationOptions": {"storagePath": storage.display().to_string()},
+        }));
+        let counts = wait_index_log(&c);
+        (c, counts)
+    };
+    let (c, (count, cached)) = start();
+    assert_eq!((count, cached), (2, 0));
+    c.shutdown();
+    let cache_file =
+        std::fs::read_dir(storage.join("php-lsp-index")).unwrap().next().unwrap().unwrap().path();
+
+    // unchanged: everything (stubs included) comes from the cache
+    let (mut c, (count, cached)) = start();
+    assert_eq!(count, 2);
+    assert!(cached > 2, "{cached}");
+    let uri = format!("{root_uri}/src/main.php");
+    c.open(&uri, "<?php\n(new B())->a();\n");
+    c.wait_notification("textDocument/publishDiagnostics");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 11}}),
+    );
+    assert!(def.to_string().contains("A.php"), "{def}");
+    c.shutdown();
+
+    // one file changed: parsed again
+    std::fs::write(dir.join("src/B.php"), "<?php\nclass B extends A { }\n").unwrap();
+    let (c, (_, cached_after_change)) = start();
+    assert_eq!(cached_after_change, cached - 1);
+    c.shutdown();
+
+    // a damaged cache is ignored
+    std::fs::write(&cache_file, b"garbage").unwrap();
+    let (c, (count, cached)) = start();
+    assert_eq!((count, cached), (2, 0));
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

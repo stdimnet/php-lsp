@@ -86,6 +86,7 @@ php-lsp specific settings (`php-lsp` section only):
 | `tools.psalm.*`, `tools.phpcs.*`          | same as above |
 | `tools.phpCsFixer.*`, `tools.phpcbf.*`, `tools.phpunit.*` | path / args |
 | `format.provider`                         | `builtin` (`php-cs-fixer`, `phpcbf`) |
+| `index.cache`                             | `true`: symbols are kept on disk (in `storagePath`, else `~/.cache/php-lsp`), so a restart only parses changed files. "Index workspace" and `clearCache` rebuild it |
 
 PHPStan / Psalm / PHPCS run in the background when a file is opened or saved and their
 results are merged with php-lsp's own diagnostics. Test classes get "▶ Run test" code lenses

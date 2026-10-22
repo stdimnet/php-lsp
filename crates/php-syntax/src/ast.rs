@@ -121,7 +121,7 @@ pub fn text_without_trivia(node: &SyntaxNode) -> String {
 }
 
 /// Kind of a class-like declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ClassLikeKind {
     Class,
     Interface,

@@ -25,6 +25,7 @@ mod folding;
 mod hierarchy;
 mod hover;
 mod html;
+mod index_cache;
 mod indexer;
 mod infer;
 mod inlay_hints;
@@ -56,7 +57,8 @@ pub use diagnostics::{Diagnostic, DiagnosticCode, DiagnosticsConfig, Severity};
 pub use folding::{Fold, FoldKind};
 pub use hierarchy::{CodeLens, CodeLensKind, HierarchyCall, HierarchyItem, ResolvedCodeLens};
 pub use hover::Hover;
-pub use indexer::{collect_files, index_files, IndexedFile, ScanConfig};
+pub use index_cache::IndexCache;
+pub use indexer::{collect_files, index_files, index_files_cached, IndexedFile, ScanConfig};
 pub use inlay_hints::{InlayHint, InlayHintKind, InlayHintsConfig};
 pub use line_index::{LineCol, LineIndex, PositionEncoding};
 pub use links::DocumentLink;
@@ -142,6 +144,8 @@ pub struct Workspace {
     plugins: plugins::Plugins,
     /// Incremented on every change (used to invalidate plugin caches).
     revision: u64,
+    /// Used by [`Workspace::index_files`] (and so for the stubs).
+    index_cache: Option<Arc<IndexCache>>,
 }
 
 impl Workspace {
@@ -241,7 +245,13 @@ impl Workspace {
     /// Adds or replaces a file that is only indexed (not opened).
     pub fn index_file(&mut self, path: &str, text: Arc<str>, kind: FileKind) -> FileId {
         let symbols = indexer::extract_symbols(path, &text, self.opts());
-        self.add_indexed(IndexedFile { path: path.into(), text, kind, symbols: Arc::new(symbols) })
+        self.add_indexed(IndexedFile {
+            path: path.into(),
+            text,
+            kind,
+            symbols: Arc::new(symbols),
+            line_index: None,
+        })
     }
 
     /// Adds a file analysed elsewhere (e.g. in parallel with [`indexer::index_files`]).
@@ -253,15 +263,20 @@ impl Workspace {
         }
         self.index.set_file(id, file.kind, file.symbols);
         self.revision += 1;
-        let line_index = Arc::new(LineIndex::new(&file.text));
+        let line_index = file.line_index.unwrap_or_else(|| Arc::new(LineIndex::new(&file.text)));
         self.files[id.0 as usize] =
             Some(SourceFile { path: file.path, kind: file.kind, text: file.text, line_index, open: None });
         id
     }
 
     /// Analyses many files in parallel and adds them.
+    /// Sets the on-disk cache [`Workspace::index_files`] reads from.
+    pub fn set_index_cache(&mut self, cache: Option<Arc<IndexCache>>) {
+        self.index_cache = cache;
+    }
+
     pub fn index_files(&mut self, files: Vec<(String, Arc<str>, FileKind)>) {
-        let indexed = indexer::index_files(files, self.opts());
+        let indexed = indexer::index_files_cached(files, self.opts(), self.index_cache.as_deref());
         for f in indexed {
             self.add_indexed(f);
         }

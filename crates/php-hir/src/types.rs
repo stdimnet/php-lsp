@@ -7,7 +7,7 @@ use std::sync::Arc;
 ///
 /// Class and function names are case insensitive in PHP; use [`Fqn::key`]
 /// for lookups.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Fqn(Arc<str>);
 
 impl Fqn {
@@ -61,14 +61,14 @@ impl fmt::Display for Fqn {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ShapeEntry {
     pub key: String,
     pub ty: Type,
     pub optional: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Mixed,
     Void,

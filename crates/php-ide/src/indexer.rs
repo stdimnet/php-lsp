@@ -15,6 +15,8 @@ pub struct IndexedFile {
     pub text: Arc<str>,
     pub kind: FileKind,
     pub symbols: Arc<FileSymbols>,
+    /// Built while indexing (in parallel); `None` builds it when added.
+    pub line_index: Option<Arc<crate::LineIndex>>,
 }
 
 pub(crate) fn extract_symbols(path: &str, text: &str, opts: ExtractOptions) -> FileSymbols {
@@ -33,12 +35,26 @@ pub(crate) fn parse_source(path: &str, text: &str, version: php_syntax::PhpVersi
 
 /// Parses and analyses files in parallel.
 pub fn index_files(files: Vec<(String, Arc<str>, FileKind)>, opts: ExtractOptions) -> Vec<IndexedFile> {
+    index_files_cached(files, opts, None)
+}
+
+/// Like [`index_files`]; files whose text is unchanged since `cache` was
+/// written are not parsed again.
+pub fn index_files_cached(
+    files: Vec<(String, Arc<str>, FileKind)>,
+    opts: ExtractOptions,
+    cache: Option<&crate::IndexCache>,
+) -> Vec<IndexedFile> {
     files
         .into_par_iter()
         .map(|(path, text, kind)| {
-            let opts = php_hir::ExtractOptions { stub: kind == FileKind::Stub, ..opts };
-            let symbols = Arc::new(extract_symbols(&path, &text, opts));
-            IndexedFile { path: path.into(), text, kind, symbols }
+            let opts = crate::index_cache::opts_for(opts, kind);
+            let symbols = match cache {
+                Some(c) => c.symbols(&path, &text, kind, || extract_symbols(&path, &text, opts)),
+                None => Arc::new(extract_symbols(&path, &text, opts)),
+            };
+            let line_index = Some(Arc::new(crate::LineIndex::new(&text)));
+            IndexedFile { path: path.into(), text, kind, symbols, line_index }
         })
         .collect()
 }
