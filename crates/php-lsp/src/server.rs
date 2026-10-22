@@ -81,6 +81,8 @@ pub struct Server {
     generation: u32,
     indexing: bool,
     cancel_indexing: Arc<std::sync::atomic::AtomicBool>,
+    /// Held while the index cache is written (shutdown waits for it).
+    cache_writer: Arc<std::sync::Mutex<()>>,
     loaded_stubs: Vec<String>,
     tool_runs: HashMap<(FileId, php_tools::Tool), u32>,
     tool_diags: HashMap<FileId, HashMap<php_tools::Tool, Vec<php_tools::ToolDiagnostic>>>,
@@ -156,6 +158,7 @@ impl Server {
             generation: 0,
             indexing: false,
             cancel_indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_writer: Arc::new(std::sync::Mutex::new(())),
             loaded_stubs: Vec::new(),
             tool_runs: HashMap::new(),
             tool_diags: HashMap::new(),
@@ -198,6 +201,8 @@ impl Server {
                     self.respond_error(req.id, ErrorCode::InvalidRequest, "server is shutting down");
                 } else if req.method == lsp::request::Shutdown::METHOD {
                     self.shutdown_requested = true;
+                    // let a running cache write finish
+                    drop(self.cache_writer.lock());
                     self.respond(req.id, Value::Null);
                 } else {
                     self.on_request(req);
@@ -584,6 +589,7 @@ impl Server {
         self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
         self.cancel_indexing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.cancel_indexing.clone();
+        let cache_writer = self.cache_writer.clone();
         if !self.indexing {
             self.indexing = true;
             self.notify_raw("indexingStarted", Value::Null);
@@ -633,6 +639,7 @@ impl Server {
                 }
             }
             let cached = cache.as_ref().map_or(0, |c| c.hits());
+            let writing = cache_writer.lock();
             let _ = tx.send(Task::IndexingDone {
                 generation,
                 count,
@@ -643,6 +650,7 @@ impl Server {
             if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
                 let _ = c.save();
             }
+            drop(writing);
         });
     }
 

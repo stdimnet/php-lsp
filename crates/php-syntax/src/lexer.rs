@@ -498,7 +498,7 @@ impl<'a> Lexer<'a> {
         if self.starts_with(b"?->") && self.version >= PhpVersion::PHP_8_0 {
             return Some((NULLSAFE_ARROW, 3));
         }
-        if self.starts_with(b"|>") && self.version >= PhpVersion::PHP_8_5 {
+        if self.starts_with(b"|>") {
             return Some((PIPE_GT, 2));
         }
         let two: &[(&[u8], SyntaxKind)] = &[

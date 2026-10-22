@@ -114,8 +114,9 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   method body / readonly / named argument rules, duplicate keys and declarations,
   incompatible / final overrides, colliding traits, attribute targets, enum rules, property
   hooks and asymmetric visibility, constant expressions, namespace placement, deprecations
-  depending on the targeted PHP version and more: 112 of the 130 codes of Intelephense's catalog,
-  compared with the real Intelephense for PHP 7.4 to 8.5 (`editors/compare`)
+  depending on the targeted PHP version, flexible heredoc indentation, PHPDoc syntax and more: all
+  130 codes of Intelephense's catalog, checked case by case against the real Intelephense
+  for PHP 7.4 to 8.5 (`editors/compare`)
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
   hierarchy, code lens, PHPDoc completion, document links (`include`/`require`, URLs),

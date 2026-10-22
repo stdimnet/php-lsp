@@ -173,10 +173,11 @@ impl Checker<'_, '_> {
                 if has_body {
                     self.err(name_range, Code::MethodBodyNotAllowed, "Method body not allowed.");
                 }
-                let class_abstract = class.kind() != CLASS_DECL || has(&modifiers(&class), ABSTRACT_KW);
+                let class_abstract = matches!(class.kind(), INTERFACE_DECL | TRAIT_DECL)
+                    || has(&modifiers(&class), ABSTRACT_KW);
                 if !class_abstract {
                     self.err(
-                        name_range,
+                        find(&mods, ABSTRACT_KW).unwrap_or(name_range),
                         Code::AbstractInNonAbstract,
                         "Abstract method in non abstract class.",
                     );
@@ -214,7 +215,7 @@ impl Checker<'_, '_> {
         let Some(decl) = ast::PropertyDecl::cast(prop.clone()) else { return };
         // static properties of readonly classes are P1058
         if has(&mods, STATIC_KW) && has(&mods, READONLY_KW) {
-            if let Some(r) = find(&mods, STATIC_KW) {
+            if let Some(r) = find(&mods, READONLY_KW) {
                 self.err(r, Code::StaticReadonly, "Static property cannot be readonly.");
             }
         }
@@ -256,8 +257,14 @@ impl Checker<'_, '_> {
             let Some(var) = p.variable() else { continue };
             let promoted = p.modifiers().is_some();
             if promoted && !is_ctor {
+                // the whole parameter, without attributes (like Intelephense)
+                let start = p
+                    .syntax()
+                    .children_with_tokens()
+                    .find(|e| !e.kind().is_trivia() && e.kind() != ATTRIBUTE_GROUP)
+                    .map_or(var.text_range().start(), |e| e.text_range().start());
                 self.err(
-                    var.text_range(),
+                    TextRange::new(start, p.syntax().text_range().end()),
                     Code::PromotionOutsideConstructor,
                     "Cannot declare property promotion outside of constructor.",
                 );

@@ -57,6 +57,8 @@ const BANG_BP: u8 = 38;
 const UNARY_BP: u8 = 42;
 const CLONE_BP: u8 = 46;
 
+/// Left-hand sides parsed as assignments. Calls, constants and literals are
+/// not writable: the checks report them (Intelephense P1024).
 fn is_assignable(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -70,27 +72,19 @@ fn is_assignable(kind: SyntaxKind) -> bool {
             | METHOD_CALL_EXPR
             | CALL_EXPR
             | STATIC_CALL_EXPR
+            | NAME_EXPR
+            | CLASS_CONST_FETCH_EXPR
+            | LITERAL
     )
 }
 
 pub(crate) fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<SyntaxKind> {
     let cp = p.checkpoint();
+    let expr_start = p.current_start();
     let mut lhs = unary(p)?;
     loop {
         let op = p.current();
         if op.is_assign_op() && is_assignable(lhs) {
-            if !matches!(
-                lhs,
-                VARIABLE_EXPR
-                    | DYNAMIC_VARIABLE_EXPR
-                    | INDEX_EXPR
-                    | PROPERTY_FETCH_EXPR
-                    | STATIC_PROPERTY_FETCH_EXPR
-                    | LIST_EXPR
-                    | ARRAY_EXPR
-            ) {
-                p.error_at_current("cannot assign to the result of a call");
-            }
             if op == QUESTION2_EQ {
                 p.require_version_here(PhpVersion::PHP_7_4, "the `??=` operator");
             }
@@ -136,13 +130,17 @@ pub(crate) fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<SyntaxKind> {
             QUESTION2 => p.require_version_here(PhpVersion::PHP_7_0, "the `??` operator"),
             SPACESHIP => p.require_version_here(PhpVersion::PHP_7_0, "the `<=>` operator"),
             STAR2 => p.require_version_here(PhpVersion::PHP_5_6, "the `**` operator"),
-            PIPE_GT => p.require_version_here(PhpVersion::PHP_8_5, "the pipe operator"),
             _ => {}
         }
         p.start_at(cp, node);
         p.bump();
         if expr_bp(p, rbp).is_none() {
             p.error("expected expression");
+        }
+        if op == PIPE_GT {
+            // the whole pipe, like Intelephense
+            let range = rowan::TextRange::new(expr_start, p.prev_end().max(expr_start));
+            p.require_version(PhpVersion::PHP_8_5, "the pipe operator", range);
         }
         p.finish_node();
         lhs = node;

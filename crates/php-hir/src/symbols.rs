@@ -97,6 +97,10 @@ pub struct PropertyDef {
     pub magic: Option<PropertyAccess>,
     /// Promoted constructor parameter.
     pub promoted: bool,
+    /// `private(set)`: the write visibility when it differs.
+    pub set_visibility: Option<Visibility>,
+    /// Names of the property hooks (`get`, `set`), lower case.
+    pub hooks: Vec<String>,
 }
 
 impl PropertyDef {
@@ -511,6 +515,8 @@ impl Cx<'_> {
                             deprecated: None,
                             magic: None,
                             promoted: true,
+                            set_visibility: None,
+                            hooks: Vec::new(),
                         });
                     }
                 }
@@ -540,6 +546,8 @@ impl Cx<'_> {
             Member::Property(prop) => {
                 let kinds: Vec<SyntaxKind> =
                     prop.modifiers().iter().flat_map(|m| m.modifiers().map(|t| t.kind())).collect();
+                let (get_vis, set_vis) =
+                    split_visibility(prop.syntax().children().find(|c| c.kind() == MODIFIER_LIST));
                 let mut ty = prop.ty().map(|t| class_tr.syntax_type(&t));
                 if let Some(t) = stub_type_override(node, self.opts.php_version) {
                     ty = t.map(|t| class_tr.doc_type(&t));
@@ -556,11 +564,23 @@ impl Cx<'_> {
                         .children()
                         .find(|c| c.kind() != PROPERTY_HOOK_LIST)
                         .map(|d| compact_text(&d));
+                    let hooks = el
+                        .syntax()
+                        .descendants()
+                        .filter(|n| n.kind() == PROPERTY_HOOK)
+                        .filter_map(|h| h.children().find(|c| c.kind() == MEMBER_NAME))
+                        .map(|n| ast::text_without_trivia(&n).to_ascii_lowercase())
+                        .collect();
                     def.properties.push(PropertyDef {
                         name,
                         ty: ty.clone(),
                         doc_ty,
-                        visibility: visibility_of(kinds.iter().copied()).unwrap_or(Visibility::Public),
+                        // `private(set) int $x` alone is publicly readable
+                        visibility: get_vis
+                            .or_else(|| {
+                                set_vis.is_none().then(|| visibility_of(kinds.iter().copied())).flatten()
+                            })
+                            .unwrap_or(Visibility::Public),
                         is_static: kinds.contains(&STATIC_KW),
                         is_readonly: kinds.contains(&READONLY_KW) || def.is_readonly,
                         default,
@@ -570,6 +590,8 @@ impl Cx<'_> {
                         deprecated: deprecated.clone(),
                         magic: None,
                         promoted: false,
+                        set_visibility: set_vis,
+                        hooks,
                     });
                 }
             }
@@ -647,6 +669,8 @@ impl Cx<'_> {
                 deprecated: None,
                 magic: Some(access),
                 promoted: false,
+                set_visibility: None,
+                hooks: Vec::new(),
             });
         }
         for m in doc.methods() {
@@ -768,6 +792,28 @@ fn find_variable_range(method: &SyntaxNode, param_range: TextRange) -> Option<Te
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == VARIABLE && param_range.contains_range(t.text_range()))
         .map(|t| t.text_range())
+}
+
+/// Read and write visibility of a modifier list (`public private(set)`).
+fn split_visibility(mods: Option<SyntaxNode>) -> (Option<Visibility>, Option<Visibility>) {
+    let Some(mods) = mods else { return (None, None) };
+    let toks: Vec<SyntaxKind> =
+        mods.children_with_tokens().map(|e| e.kind()).filter(|k| !k.is_trivia()).collect();
+    let (mut get, mut set) = (None, None);
+    for (i, k) in toks.iter().enumerate() {
+        let v = match k {
+            PUBLIC_KW | VAR_KW => Visibility::Public,
+            PROTECTED_KW => Visibility::Protected,
+            PRIVATE_KW => Visibility::Private,
+            _ => continue,
+        };
+        if toks.get(i + 1) == Some(&L_PAREN) {
+            set = Some(v);
+        } else {
+            get = Some(v);
+        }
+    }
+    (get, set)
 }
 
 fn visibility_of(kinds: impl Iterator<Item = SyntaxKind>) -> Option<Visibility> {

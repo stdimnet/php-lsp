@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use php_syntax::ast::{self, AstNode};
-use php_syntax::{PhpVersion, SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange};
+use php_syntax::{PhpVersion, SyntaxKind::*, SyntaxNode, SyntaxToken, TextRange, TextSize};
 
 use crate::diagnostics::{Checker, Diagnostic, DiagnosticCode as Code, Severity};
 
@@ -87,13 +87,78 @@ impl Checker<'_, '_> {
                 );
             }
             FUNCTION_DECL => self.lint_function_name(node),
-            ASSIGN_EXPR if lc => self.lint_assign_target(node),
+            ASSIGN_EXPR if lc => {
+                self.lint_assign_target(node);
+                self.lint_writable(node);
+                if index_ready {
+                    self.lint_reference_to_hooked(node);
+                }
+            }
+            PREFIX_EXPR | POSTFIX_EXPR | FOREACH_VALUE | FOREACH_KEY if lc => self.lint_writable(node),
+            INDEX_EXPR if lc => self.lint_empty_index_read(node),
+            HEREDOC if self.version() >= PhpVersion::PHP_7_3 => self.lint_heredoc_indentation(node),
+            NEW_EXPR if lc && is_first_class_callable(node) && self.version() >= PhpVersion::PHP_8_1 => {
+                if let Some(dots) = dots_of(node) {
+                    self.report(
+                        dots,
+                        Severity::Error,
+                        "P1053",
+                        "Cannot create closure for new expression.".into(),
+                    );
+                }
+            }
+            METHOD_CALL_EXPR
+                if lc
+                    && token(node, NULLSAFE_ARROW).is_some()
+                    && is_first_class_callable(node)
+                    && self.version() >= PhpVersion::PHP_8_1 =>
+            {
+                if let Some(dots) = dots_of(node) {
+                    self.report(
+                        dots,
+                        Severity::Error,
+                        "P1054",
+                        "Cannot combine nullsafe operator with closure creation.".into(),
+                    );
+                }
+            }
+            METHOD_DECL | CLASS_CONST_DECL if lc && self.version() >= PhpVersion::PHP_8_4 => {
+                if let Some(r) = set_visibility(node) {
+                    self.report(
+                        r,
+                        Severity::Error,
+                        "P1066",
+                        "Cannot use private(set), protected(set), public(set) on non-property.".into(),
+                    );
+                }
+            }
+            BIN_EXPR if lc && token(node, PIPE_GT).is_some() && self.version() >= PhpVersion::PHP_8_5 => {
+                if let Some(rhs) = node.children().filter(|c| crate::infer::is_expr(c.kind())).nth(1) {
+                    if rhs.kind() == ARROW_FN_EXPR {
+                        self.report(
+                            rhs.text_range(),
+                            Severity::Error,
+                            "P1092",
+                            "Arrow functions on the right hand side of |> must be parenthesized.".into(),
+                        );
+                    }
+                }
+            }
+            NAMESPACE_DECL if lc && self.version() < PhpVersion::PHP_8_0 => {
+                self.lint_namespace_keywords(node)
+            }
             SOURCE_FILE if lc => self.lint_namespaces(node),
             CONST_ELEMENT | PROPERTY_ELEMENT | PARAM | ENUM_CASE | ATTRIBUTE if lc => {
+                if node.kind() == PARAM {
+                    self.lint_static_param(node);
+                }
                 self.lint_const_expr(node)
             }
             NAMED_TYPE if lc => self.lint_type_context(node),
             UNION_TYPE if lc && self.version() >= PhpVersion::PHP_8_0 => self.lint_redundant_types(node),
+            INTERSECTION_TYPE if lc && self.version() >= PhpVersion::PHP_8_1 => {
+                self.lint_redundant_types(node)
+            }
             PROPERTY_DECL if lc => self.lint_property_rules(node),
             EXPR_STMT if index_ready && self.version() >= PhpVersion::PHP_8_5 => self.lint_no_discard(node),
             UNSET_STMT if lc && index_ready => self.lint_unset_hooked(node),
@@ -442,23 +507,43 @@ impl Checker<'_, '_> {
     fn lint_redundant_types(&mut self, union: &SyntaxNode) {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for member in union.children().filter(|c| c.kind() == NAMED_TYPE) {
-            let text = ast::text_without_trivia(&member);
+        for member in union.children().filter(|c| matches!(c.kind(), NAMED_TYPE | PAREN_TYPE)) {
+            if member.kind() == PAREN_TYPE {
+                // `(A&B)|(B&A)`
+                let mut parts: Vec<String> = member
+                    .descendants()
+                    .filter(|n| n.kind() == NAMED_TYPE)
+                    .map(|n| self.type_key(&n))
+                    .collect();
+                parts.sort();
+                if !seen.insert(parts.join("&")) {
+                    out.push(member.text_range());
+                }
+                continue;
+            }
+            if !seen.insert(self.type_key(&member)) {
+                out.push(member.text_range());
+            }
+        }
+        for r in out {
+            self.report(r, Severity::Error, "P1065", "Redundant type.".into());
+        }
+    }
+
+    /// A named type, normalised for comparisons.
+    fn type_key(&self, member: &SyntaxNode) -> String {
+        {
+            let text = ast::text_without_trivia(member);
             let key = match text.to_ascii_lowercase().as_str() {
                 t @ ("int" | "float" | "string" | "bool" | "false" | "true" | "null" | "array" | "object"
                 | "mixed" | "iterable" | "callable" | "void" | "never" | "self" | "static"
                 | "parent") => t.to_string(),
                 _ => self
                     .sema
-                    .resolve_class_name(&text, &member)
+                    .resolve_class_name(&text, member)
                     .map_or(text.to_ascii_lowercase(), |f| f.as_str().to_ascii_lowercase()),
             };
-            if !seen.insert(key) {
-                out.push(member.text_range());
-            }
-        }
-        for r in out {
-            self.report(r, Severity::Error, "P1065", "Redundant type.".into());
+            key
         }
     }
 
@@ -570,6 +655,37 @@ impl Checker<'_, '_> {
                 out.push((h.text_range(), "P1074", "Invalid property hook signature.".into()));
             }
         }
+        // P1072: a default value for a virtual property
+        if modern && has_hook_list {
+            for el in prop.children().filter(|c| c.kind() == PROPERTY_ELEMENT) {
+                let (Some(eq), Some(var)) = (token(&el, EQ), token(&el, VARIABLE)) else { continue };
+                let name = var.text()[1..].to_string();
+                let Some(value) = el.children().find(|c| crate::infer::is_expr(c.kind())) else { continue };
+                // `set => expr` writes the backing value
+                let short_set = el.descendants().filter(|n| n.kind() == PROPERTY_HOOK).any(|h| {
+                    h.children()
+                        .find(|c| c.kind() == MEMBER_NAME)
+                        .is_some_and(|m| ast::text_without_trivia(&m).eq_ignore_ascii_case("set"))
+                        && token(&h, FAT_ARROW).is_some()
+                });
+                let backed = short_set
+                    || el.descendants().any(|n| {
+                        n.kind() == PROPERTY_FETCH_EXPR
+                            && n.first_child().is_some_and(|o| ast::text_without_trivia(&o) == "$this")
+                            && n.children()
+                                .find_map(ast::MemberName::cast)
+                                .and_then(|m| m.text())
+                                .is_some_and(|m| m == name)
+                    });
+                if !backed {
+                    out.push((
+                        TextRange::new(eq.text_range().start(), value.text_range().end()),
+                        "P1072",
+                        format!("Virtual property ${name} cannot have a default value."),
+                    ));
+                }
+            }
+        }
         if class.kind() == INTERFACE_DECL && !has_hook_list {
             out.push((prop.text_range(), "P1082", "Interfaces may only contain hooked properties.".into()));
         }
@@ -615,6 +731,195 @@ impl Checker<'_, '_> {
             .is_some_and(|p| p.descendants().any(|n| n.kind() == PROPERTY_HOOK_LIST))
     }
 
+    // ------------------------------------------------------------------ writes
+
+    /// P1024: assignments, `++` / `--` and `foreach` targets that cannot be
+    /// written (calls, constants, literals).
+    fn lint_writable(&mut self, node: &SyntaxNode) {
+        let targets: Vec<SyntaxNode> = match node.kind() {
+            ASSIGN_EXPR => {
+                let Some(lhs) = node.first_child() else { return };
+                if matches!(lhs.kind(), ARRAY_EXPR | LIST_EXPR) {
+                    destructure_targets(&lhs)
+                } else {
+                    vec![lhs]
+                }
+            }
+            PREFIX_EXPR | POSTFIX_EXPR => {
+                if !node.children_with_tokens().any(|e| matches!(e.kind(), PLUS2 | MINUS2)) {
+                    return;
+                }
+                node.children().filter(|c| crate::infer::is_expr(c.kind())).collect()
+            }
+            _ => {
+                let Some(e) = node.children().find(|c| crate::infer::is_expr(c.kind())) else { return };
+                if matches!(e.kind(), ARRAY_EXPR | LIST_EXPR) {
+                    destructure_targets(&e)
+                } else {
+                    vec![e]
+                }
+            }
+        };
+        for t in targets {
+            if matches!(
+                t.kind(),
+                CALL_EXPR
+                    | METHOD_CALL_EXPR
+                    | STATIC_CALL_EXPR
+                    | LITERAL
+                    | NAME_EXPR
+                    | CLASS_CONST_FETCH_EXPR
+            ) {
+                self.report(t.text_range(), Severity::Error, "P1024", "Expression is not writable.".into());
+            }
+        }
+    }
+
+    /// P1026: `$a[]` where a value is read.
+    fn lint_empty_index_read(&mut self, node: &SyntaxNode) {
+        if node.children().filter(|c| crate::infer::is_expr(c.kind())).count() != 1
+            || token(node, L_BRACK).is_none()
+        {
+            return;
+        }
+        // climb through accesses based on this one (`$a[]['k'] = 1`, `$a[]->p = 1`)
+        let mut cur = node.clone();
+        while let Some(p) = cur.parent() {
+            let based_on = p.first_child().as_ref() == Some(&cur)
+                && matches!(p.kind(), INDEX_EXPR | PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR);
+            let element = matches!(p.kind(), ARRAY_ELEMENT | ARRAY_EXPR | LIST_EXPR);
+            if !(based_on || element) {
+                break;
+            }
+            cur = p;
+        }
+        let Some(parent) = cur.parent() else { return };
+        let written = match parent.kind() {
+            ASSIGN_EXPR => {
+                parent.first_child().as_ref() == Some(&cur)
+                    || parent.children_with_tokens().any(|e| e.kind() == AMP)
+            }
+            FOREACH_VALUE | FOREACH_KEY | ARG | UNSET_STMT | ISSET_EXPR | GLOBAL_STMT | STATIC_VAR => true,
+            PREFIX_EXPR => parent.children_with_tokens().any(|e| matches!(e.kind(), AMP | PLUS2 | MINUS2)),
+            POSTFIX_EXPR => true,
+            _ => false,
+        };
+        if !written {
+            self.report(node.text_range(), Severity::Error, "P1026", "Key expected in read context.".into());
+        }
+    }
+
+    /// P1073 `$r = &$o->hooked`.
+    fn lint_reference_to_hooked(&mut self, node: &SyntaxNode) {
+        if !node.children_with_tokens().any(|e| e.kind() == AMP) {
+            return;
+        }
+        let Some(fetch) = node.children().filter(|c| crate::infer::is_expr(c.kind())).nth(1) else { return };
+        if fetch.kind() != PROPERTY_FETCH_EXPR {
+            return;
+        }
+        let Some(name) = fetch.children().find_map(ast::MemberName::cast).and_then(|m| m.text()) else {
+            return;
+        };
+        let Some(obj) = fetch.first_child() else { return };
+        let classes = self.sema.infer().expr_type(&obj).class_names();
+        let [class] = classes.as_slice() else { return };
+        let index = self.sema.index();
+        let Some(found) = index.find_property(class, &name) else { return };
+        if self.property_hooked(found.file, found.def.range) {
+            let msg = format!("Cannot indirectly modify property {}::${name}.", found.owner.fqn);
+            self.report(node.text_range(), Severity::Error, "P1073", msg);
+        }
+    }
+
+    // ------------------------------------------------------------------ heredoc
+
+    /// P1027 / P1028: the body of a flexible heredoc / nowdoc must be indented
+    /// at least like the closing marker, with the same whitespace.
+    fn lint_heredoc_indentation(&mut self, node: &SyntaxNode) {
+        let (Some(start), Some(end)) = (token(node, HEREDOC_START), token(node, HEREDOC_END)) else { return };
+        let end_text = end.text();
+        let indent: &str = &end_text[..end_text.len() - end_text.trim_start_matches([' ', '\t']).len()];
+        if indent.is_empty() {
+            return;
+        }
+        let text = &self.sema.text;
+        let body_start = usize::from(start.text_range().end());
+        let body_end = usize::from(end.text_range().start()).saturating_sub(1).max(body_start);
+        let body_range = TextRange::new(start.text_range().end(), TextSize::from(body_end as u32));
+        if indent.contains(' ') && indent.contains('\t') {
+            let r = TextRange::new(end.text_range().start() - TextSize::from(1), end.text_range().end());
+            let r = if body_end > body_start { r } else { end.text_range() };
+            self.report(
+                r,
+                Severity::Error,
+                "P1028",
+                "Invalid indentation. Mixed spaces and tabs are not allowed.".into(),
+            );
+            return;
+        }
+        let ch = indent.chars().next().unwrap_or(' ');
+        for line in text[body_start..body_end].split('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let lead: &str = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+            if lead.starts_with(indent) {
+                continue;
+            }
+            if lead.chars().any(|c| c != ch) {
+                self.report(
+                    body_range,
+                    Severity::Error,
+                    "P1028",
+                    "Invalid indentation. Mixed spaces and tabs are not allowed.".into(),
+                );
+                return;
+            }
+            {
+                self.report(
+                    body_range,
+                    Severity::Error,
+                    "P1027",
+                    format!(
+                        "Unexpected indentation level. Expected at least {}. Found {}.",
+                        indent.len(),
+                        lead.len()
+                    ),
+                );
+                return;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ declarations
+
+    /// P1081: `static` on a parameter.
+    fn lint_static_param(&mut self, param: &SyntaxNode) {
+        let Some(mods) = param.children().find(|c| c.kind() == MODIFIER_LIST) else { return };
+        if let Some(t) = token(&mods, STATIC_KW) {
+            self.report(t.text_range(), Severity::Error, "P1081", "Static modifier not allowed.".into());
+        }
+    }
+
+    /// P1040: reserved words in namespace names before PHP 8.
+    fn lint_namespace_keywords(&mut self, ns: &SyntaxNode) {
+        let Some(name) = ns.children().find(|c| c.kind() == QUALIFIED_NAME) else { return };
+        let reserved = name
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == IDENT || t.kind().is_keyword())
+            .any(|t| RESERVED_WORDS.contains(&t.text().to_ascii_lowercase().as_str()));
+        if reserved {
+            self.report(
+                name.text_range(),
+                Severity::Error,
+                "P1040",
+                "Namespace names can only contain keywords in PHP 8+.".into(),
+            );
+        }
+    }
+
     // ------------------------------------------------------------------ results
 
     /// P1126: the result of a `#[\NoDiscard]` function is not used.
@@ -658,6 +963,120 @@ impl Checker<'_, '_> {
             );
         }
     }
+}
+
+/// PHP's reserved words (not allowed in namespace names before PHP 8).
+const RESERVED_WORDS: &[&str] = &[
+    "abstract",
+    "and",
+    "array",
+    "as",
+    "break",
+    "callable",
+    "case",
+    "catch",
+    "class",
+    "clone",
+    "const",
+    "continue",
+    "declare",
+    "default",
+    "die",
+    "do",
+    "echo",
+    "else",
+    "elseif",
+    "empty",
+    "enddeclare",
+    "endfor",
+    "endforeach",
+    "endif",
+    "endswitch",
+    "endwhile",
+    "eval",
+    "exit",
+    "extends",
+    "final",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "function",
+    "global",
+    "goto",
+    "if",
+    "implements",
+    "include",
+    "include_once",
+    "instanceof",
+    "insteadof",
+    "interface",
+    "isset",
+    "list",
+    "match",
+    "namespace",
+    "new",
+    "or",
+    "print",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "require",
+    "require_once",
+    "return",
+    "static",
+    "switch",
+    "throw",
+    "trait",
+    "try",
+    "unset",
+    "use",
+    "var",
+    "while",
+    "xor",
+    "yield",
+];
+
+/// The variables of a destructuring pattern (`[$a, [$b]] = ...`).
+fn destructure_targets(pattern: &SyntaxNode) -> Vec<SyntaxNode> {
+    let mut out = Vec::new();
+    for el in pattern.children().filter(|c| c.kind() == ARRAY_ELEMENT) {
+        // `'key' => $value`: only the value is written
+        let Some(value) = el.children().filter(|c| crate::infer::is_expr(c.kind())).last() else { continue };
+        if matches!(value.kind(), ARRAY_EXPR | LIST_EXPR) {
+            out.extend(destructure_targets(&value));
+        } else {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// The `...` of a first-class callable.
+fn dots_of(call: &SyntaxNode) -> Option<TextRange> {
+    let list = call.children().find(|c| c.kind() == ARG_LIST)?;
+    list.descendants_with_tokens().find(|e| e.kind() == DOT3).map(|e| e.text_range())
+}
+
+/// `private(set)` in the modifiers of a declaration.
+fn set_visibility(decl: &SyntaxNode) -> Option<TextRange> {
+    let mods = decl.children().find(|c| c.kind() == MODIFIER_LIST)?;
+    let toks: Vec<SyntaxToken> = mods
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    toks.iter().enumerate().find_map(|(i, t)| {
+        (matches!(t.kind(), PUBLIC_KW | PROTECTED_KW | PRIVATE_KW)
+            && toks.get(i + 1).is_some_and(|n| n.kind() == L_PAREN))
+        .then(|| {
+            TextRange::new(
+                t.text_range().start(),
+                toks.get(i + 3).map_or(t.text_range().end(), |e| e.text_range().end()),
+            )
+        })
+    })
 }
 
 /// `strlen(...)`: allowed in constant expressions since PHP 8.5.

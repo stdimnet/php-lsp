@@ -285,6 +285,16 @@ pub(crate) fn semantic_diagnostics(sema: &Sema) -> Vec<Diagnostic> {
     out
 }
 
+/// The parameter declaring the variable at `var` (without attributes).
+fn param_range(root: &SyntaxNode, var: TextRange) -> TextRange {
+    let Some(param) = root.covering_element(var).ancestors().find(|n| n.kind() == PARAM) else { return var };
+    let start = param
+        .children_with_tokens()
+        .find(|e| !e.kind().is_trivia() && e.kind() != ATTRIBUTE_GROUP)
+        .map_or(var.start(), |e| e.text_range().start());
+    TextRange::new(start, param.text_range().end())
+}
+
 fn is_statement(kind: php_syntax::SyntaxKind) -> bool {
     format!("{kind:?}").ends_with("_STMT")
         || matches!(
@@ -889,6 +899,15 @@ impl Checker<'_, '_> {
             return;
         }
         let Some(params) = node.children().find_map(ast::ParamList::cast) else { return };
+        // magic methods have fixed signatures
+        let magic = node.kind() == METHOD_DECL
+            && node.children().find(|c| c.kind() == MEMBER_NAME).is_some_and(|n| {
+                let n = ast::text_without_trivia(&n);
+                n.starts_with("__") && !n.eq_ignore_ascii_case("__construct")
+            });
+        if magic {
+            return;
+        }
         for p in params.params() {
             let (Some(var), Some(name)) = (p.variable(), p.name()) else { continue };
             if p.ty().is_some() || p.default_value().is_some() || documented(&name) {
@@ -966,7 +985,7 @@ impl Checker<'_, '_> {
             });
             if !used {
                 let mut d = Diagnostic::new(
-                    var.text_range(),
+                    param_range(&self.sema.root, var.text_range()),
                     Severity::Hint,
                     DiagnosticCode::UnusedSymbol,
                     format!("Symbol '${name}' is declared but not used."),
@@ -1633,6 +1652,16 @@ impl Checker<'_, '_> {
             .filter(|t| t.kind() == DOC_COMMENT && t.text().contains('@'))
             .collect();
         for tok in docs {
+            // P1129: types that do not parse
+            for (start, end) in php_hir::phpdoc_check::syntax_errors(tok.text()) {
+                let base = tok.text_range().start();
+                self.push(Diagnostic::new(
+                    TextRange::new(base + TextSize::from(start as u32), base + TextSize::from(end as u32)),
+                    Severity::Information,
+                    DiagnosticCode::Catalog("P1129"),
+                    "PHPDoc parse error. Unexpected token.",
+                ));
+            }
             for r in crate::doc_types::doc_type_refs(&tok) {
                 if templates.contains(&r.name) {
                     continue;
@@ -1868,8 +1897,10 @@ impl Checker<'_, '_> {
                 && !(v.param && scope.kind() == CLOSURE_EXPR && followed_by_used_param(scope, name, &vars));
             if self.config.unused_symbols && v.reads.is_empty() && reportable && !template {
                 for r in &v.def_ranges {
+                    // a parameter is reported with its type (like Intelephense)
+                    let r = if v.param { param_range(&self.sema.root, *r) } else { *r };
                     let mut d = Diagnostic::new(
-                        *r,
+                        r,
                         Severity::Hint,
                         DiagnosticCode::UnusedSymbol,
                         format!("Symbol '${name}' is declared but not used."),

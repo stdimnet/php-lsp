@@ -7,6 +7,7 @@
 
 pub mod names;
 pub mod phpdoc;
+pub mod phpdoc_check;
 pub mod symbols;
 pub mod types;
 

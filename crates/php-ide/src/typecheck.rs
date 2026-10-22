@@ -87,7 +87,12 @@ impl Checker<'_, '_> {
             }
             (Type::Object, a) => matches!(
                 a,
-                Type::Named(..) | Type::Object | Type::Closure(..) | Type::Static | Type::SelfType
+                Type::Named(..)
+                    | Type::Object
+                    | Type::Closure(..)
+                    | Type::Static
+                    | Type::SelfType
+                    | Type::Parent
             ),
             (Type::ClassString(_), a) => matches!(a, Type::String | Type::Literal(_) | Type::ClassString(_)),
             (Type::Resource, a) => matches!(a, Type::Resource),
