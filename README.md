@@ -19,7 +19,7 @@ It can be used in three ways:
 | `php-hir`    | Semantic model: namespaces/imports, PHPDoc (incl. PHPStan/Psalm types), type model, declared symbols |
 | `php-index`  | Global symbol index with inheritance aware member lookup (traits, parents, interfaces, mixins) |
 | `php-stubs`  | JetBrains phpstorm-stubs (Apache-2.0) embedded in compressed form |
-| `php-fmt`    | Whitespace-only formatter (PSR-12 / PER), never changes tokens, idempotent |
+| `php-fmt`    | Whitespace-only formatter in Intelephense's style (PSR-12 / PER), never changes tokens, idempotent |
 | `php-tools`  | External tools: PHPStan, Psalm, PHP_CodeSniffer, php-cs-fixer, phpcbf, PHPUnit |
 | `php-ide`    | IDE features as a Rust API (`Workspace`): completion, hover, navigation, references, symbols, ... |
 | `php-lsp`    | LSP server and `php-lsp` binary |
@@ -121,7 +121,22 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
   hierarchy, code lens, PHPDoc completion, document links (`include`/`require`, URLs),
   file rename → class rename + PSR-4 namespace update (`workspace/willRenameFiles`),
-  HTML in templates (tag / attribute / closing tag completion, linked editing of tag names)
+  HTML in templates (tag / attribute / closing tag completion, linked editing of tag names).
+  Compared with Intelephense on Laravel, Symfony, WordPress and PHP-Parser:
+  - the formatter produces Intelephense's output for 97 % of the PHP files (keeps
+    alignment, one statement per line, multi-line lists one element per line, blank lines
+    around `namespace` / `use`, empty bodies as `{}`); templates mixing HTML and PHP are
+    left unchanged (Intelephense also formats their HTML)
+  - find references returns 97.6–99.9 % of Intelephense's locations: a method with the
+    methods it overrides / implements and those overriding it (also through traits), a
+    parameter with its `@param` tag and the same parameter of related methods, `new Foo()`
+    for constructors, `$this` within its method, global variables across functions,
+    whole qualified names
+  - rename (Intelephense premium, not available without a licence) is checked for
+    consistency instead (`examples/rename_check.rs`): of ~2100 renames in the four
+    projects 99.5 % add no diagnostic and are undone exactly by renaming back. Renames
+    follow closure `use` clauses, `@param` / `@var` tags, promoted constructor
+    parameters and import aliases (renamed in their file only)
 - [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
   `cancelIndexing`, `indexingStarted/Ended`, initialization options, Node.js launcher,
   tested inside the real Intelephense VS Code extension (`editors/vscode-test`)
@@ -163,7 +178,9 @@ cargo run -p php-syntax --example fuzz_truncate -- some/file.php
 cargo run --release -p php-ide --example index_project -- path/to/php/project ClassName
 cargo run --release -p php-ide --example diagnose_project -- path/to/php/project [CODE,CODE]
 cargo run --release -p php-ide --example fuzz_ide -- some/*.php   # IDE features on truncated files
+cargo run --release -p php-ide --example rename_check -- path/to/php/project  # rename round trips
 cargo run --release -p php-fmt --example fmt_corpus -- path/to/php/project
 node editors/compare/compare.js path/to/php/project              # differences to Intelephense
+REFACTOR=1 node editors/compare/compare.js path/to/php/project   # formatting and references
 xvfb-run -a node editors/vscode-test/run.js                      # inside the real VS Code
 ```

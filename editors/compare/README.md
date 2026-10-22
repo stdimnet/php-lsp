@@ -8,7 +8,19 @@ a project and reports where they differ:
 - hover and go to definition at sampled positions (member names, calls,
   variables, class names),
 - member completion after `->` (share of Intelephense's labels php-lsp also
-  offers).
+  offers),
+- with `REFACTOR=1`: formatting (files with identical results), find
+  references (share of Intelephense's locations), rename and code actions.
+  Without a licence Intelephense offers neither rename nor code actions
+  (`renameProvider: false`), so these only count php-lsp's results; rename is
+  checked by `php-ide`'s `rename_check` example instead.
+
+Options (environment variables): `PHPV=8.3.0` PHP version, `EXACT=1` compare
+diagnostic ranges and messages, `STATIC=1` also complete after `Name::`,
+`ARROWS=N` completion positions per file, `MAXITEMS=N` completion limit,
+`MISSES=1` / `DEFS=1` store every completion / definition difference in the
+report, `FMTTABS=1` format with tabs, `FORMATDUMP=dir` write both formatted
+versions of differing files; `--php-lsp <binary>` compares another build.
 
 Intelephense is taken from the extension package that
 `../vscode-test/run.js` downloads (run that once first). It is only executed
@@ -20,5 +32,5 @@ node compare.js /path/to/project --files 150 --out report.json
 ```
 
 Expected differences: php-lsp does not report undefined members on classes
-whose ancestors are unknown (e.g. tests without `vendor/`), and it has no
-type checking of arguments (Intelephense `P1006`) yet.
+whose ancestors are unknown (e.g. tests without `vendor/`); Intelephense
+counts string literals naming a function (`'env'`) as references.

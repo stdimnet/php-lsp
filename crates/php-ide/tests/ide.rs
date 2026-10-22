@@ -429,6 +429,76 @@ fn rename_symbols() {
     assert!(ws.prepare_rename(id, TextSize::from(text.find("this").unwrap() as u32)).is_err());
 }
 
+/// Cases found by the rename consistency check (`examples/rename_check.rs`).
+#[test]
+fn rename_keeps_code_valid() {
+    let rename = |text: &str, at: &str, new: &str| -> Result<String, String> {
+        let mut ws = Workspace::new(Config::default());
+        let id = ws.set_file("file:///r.php", text.to_string());
+        let at = TextSize::from(text.find(at).unwrap() as u32 + 1);
+        ws.rename(id, at, new).map(|c| apply(text, &c, id)).map_err(|e| e.0)
+    };
+    // closures importing the variable
+    let text = "<?php
+$v = 1;
+$f = function () use ($v) { return $v; };
+echo $v;
+";
+    assert_eq!(
+        rename(text, "$v = 1", "$w").unwrap(),
+        "<?php
+$w = 1;
+$f = function () use ($w) { return $w; };
+echo $w;
+"
+    );
+    assert_eq!(rename(text, "$v; }", "$w").unwrap(), rename(text, "$v = 1", "$w").unwrap());
+    // an import alias is renamed in this file only
+    let text = "<?php
+use Monolog\\Formatter\\JsonFormatter as BaseFormatter;
+/** @var BaseFormatter $f */
+class F extends BaseFormatter {}
+";
+    assert_eq!(
+        rename(text, "BaseFormatter {}", "Json").unwrap(),
+        "<?php
+use Monolog\\Formatter\\JsonFormatter as Json;
+/** @var Json $f */
+class F extends Json {}
+"
+    );
+    // promoted parameters keep their `@param` tags
+    let text = "<?php
+class E {
+    /** @param int $id The id. */
+    public function __construct(public $id) {}
+}
+";
+    assert!(rename(text, "$id)", "$key").unwrap().contains("@param int $key The id."));
+    // a promoted parameter used as variable in the constructor
+    let text = "<?php\nclass L {\n    public function __construct(private string $locale) { $this->d = $locale; }\n    function f() { return $this->locale; }\n}\n";
+    assert_eq!(
+        rename(text, "$locale; }", "$lang").unwrap(),
+        "<?php\nclass L {\n    public function __construct(private string $lang) { $this->d = $lang; }\n    function f() { return $this->lang; }\n}\n"
+    );
+    // inline `@var` tags and the `@param` of a closure's outer function
+    let text = "<?php\n/** @param int $n */\nfunction f($n) {\n    /** @var int $m */\n    $m = $n;\n    return fn () => array_map(function () use ($n) { return $n; }, []);\n}\n";
+    assert_eq!(
+        rename(text, "$m = ", "$k").unwrap(),
+        "<?php\n/** @param int $n */\nfunction f($n) {\n    /** @var int $k */\n    $k = $n;\n    return fn () => array_map(function () use ($n) { return $n; }, []);\n}\n"
+    );
+    assert!(rename(text, "$n; }", "$z")
+        .unwrap()
+        .starts_with("<?php\n/** @param int $z */\nfunction f($z) {"));
+    // `::class` and magic methods cannot be renamed
+    let text = "<?php
+class A { function __construct() {} }
+$a = A::class;
+";
+    assert!(rename(text, "lass;", "x").is_err());
+    assert!(rename(text, "_construct", "x").is_err());
+}
+
 #[test]
 fn code_actions_fix_things() {
     let models = "<?php\nnamespace App\\Models;\ninterface Shape { public function area(): float; }\nclass User { private string $name; }\n";
@@ -2036,4 +2106,52 @@ fn definition_parity() {
     assert_eq!(g.len(), 1, "{g:?}");
     let g = goto("<?php\n/** @method static int conf<|>igure() */\nclass F {}");
     assert_eq!(g.len(), 1, "{g:?}");
+}
+
+/// References as Intelephense reports them.
+#[test]
+fn references_parity() {
+    let refs = |text: &str| -> Vec<String> {
+        let f = fixture(text);
+        f.ws.references(f.file, f.offset, true)
+            .iter()
+            .map(|r| {
+                let file = f.ws.file(r.file).unwrap();
+                let line = file.text[..usize::from(r.range.start())].matches('\n').count();
+                format!("{}:{}", line, &file.text[r.range])
+            })
+            .collect()
+    };
+    // a method together with the methods it overrides / that override it
+    let text = "<?php\ninterface I { public function run(); }\nclass A implements I { public function run() {} }\nclass B extends A { public function run() {} }\nfunction f(A $a) { $a->ru<|>n(); }\n";
+    assert_eq!(refs(text), vec!["1:run", "2:run", "3:run", "4:run"]);
+    // `new` calls the constructor
+    let text = "<?php\nclass A { public function __con<|>struct() {} }\n$a = new A();\n";
+    assert_eq!(refs(text), vec!["1:__construct", "2:A"]);
+    // `$this` in its method only
+    let text =
+        "<?php\nclass A {\n function f() { $this->g(); $t<|>his->h(); }\n function g() { $this; }\n}\n";
+    assert_eq!(refs(text), vec!["2:$this", "2:$this"]);
+    // parameters: `@param` and the same parameter of related methods
+    let text = "<?php\nclass A {\n /** @param int $x */\n function f($x) { return $x<|>; }\n}\nclass B extends A {\n function f($x) { return $x; }\n}\n";
+    assert_eq!(refs(text), vec!["2:$x", "3:$x", "3:$x", "6:$x", "6:$x"]);
+    // trait methods of implementing classes, overridden properties
+    let text = "<?php\ninterface I { function all(); }\ntrait T { function all() {} }\nclass C implements I { use T; }\nfunction f(C $c) { $c->al<|>l(); }\n";
+    assert_eq!(refs(text), vec!["1:all", "2:all", "4:all"]);
+    let text = "<?php\nclass A { protected $ops = []; }\nclass B extends A { protected $o<|>ps = [1]; }\n";
+    assert_eq!(refs(text), vec!["1:$ops", "2:$ops"]);
+    // classes in `@method` parameter types
+    let text = "<?php\nclass Fi<|>le {}\n/** @method void open(File $f, int $n) */\nclass B {}\n";
+    assert_eq!(refs(text), vec!["1:File", "2:File"]);
+    // `@see` tags
+    let text = "<?php\nclass Ut<|>il {}\n/** {@see Util::x()} and @see Util */\nclass B {}\n";
+    assert_eq!(refs(text), vec!["1:Util", "2:Util", "2:Util"]);
+    // global variables
+    let text = "<?php\n$db = 1;\nfunction f() { global $d<|>b; }\nfunction g() { global $db; return $db; }\nfunction h() { $db = 2; }\n";
+    assert_eq!(refs(text), vec!["1:$db", "2:$db", "3:$db", "3:$db"]);
+    // qualified names are reported whole, once
+    let text = "<?php\nnamespace App;\nclass Fo<|>o {}\n$a = new \\App\\Foo();\n";
+    assert_eq!(refs(text), vec!["2:Foo", "3:\\App\\Foo"]);
+    let text = "<?php\nnamespace Foo;\nclass Fo<|>o {}\n$a = new \\Foo\\Foo();\n";
+    assert_eq!(refs(text), vec!["2:Foo", "3:\\Foo\\Foo"]);
 }

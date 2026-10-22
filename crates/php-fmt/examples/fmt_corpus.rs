@@ -27,7 +27,9 @@ fn tokens(text: &str) -> Vec<(SyntaxKind, String)> {
         .filter(|t| t.kind() != SyntaxKind::WHITESPACE)
         .map(|t| {
             // doc comments may be re-indented
-            let text = if t.kind() == SyntaxKind::DOC_COMMENT || t.kind() == SyntaxKind::COMMENT {
+            let text = if t.kind() == SyntaxKind::OPEN_TAG {
+                t.text().trim_end().to_string()
+            } else if t.kind() == SyntaxKind::DOC_COMMENT || t.kind() == SyntaxKind::COMMENT {
                 t.text().split_whitespace().collect::<Vec<_>>().join(" ")
             } else {
                 t.text().to_string()

@@ -89,6 +89,7 @@ class Client {
       if (p) {
         this.pending.delete(msg.id);
         clearTimeout(p.timer);
+        if (msg.error) (this.errors[p.method] ||= []).push(msg.error.message);
         p.resolve(msg.error ? null : msg.result);
       }
       return;
@@ -117,7 +118,7 @@ class Client {
         this.pending.delete(id);
         resolve(undefined);
       }, timeout);
-      this.pending.set(id, { resolve, timer });
+      this.pending.set(id, { resolve, timer, method });
       this.send({ jsonrpc: '2.0', id, method, params });
     });
   }
@@ -145,7 +146,8 @@ class Client {
 
   async start(rootUri, storage) {
     const indexed = this.waitFor((m) => m.method === 'indexingEnded', 600000);
-    await this.request('initialize', {
+    this.errors = {};
+    const init = await this.request('initialize', {
       processId: process.pid,
       rootUri,
       workspaceFolders: [{ uri: rootUri, name: 'project' }],
@@ -158,9 +160,14 @@ class Client {
           completion: { completionItem: { snippetSupport: true } },
           definition: { linkSupport: false },
           publishDiagnostics: {},
+          references: {},
+          rename: { prepareSupport: true },
+          formatting: {},
+          codeAction: { codeActionLiteralSupport: { codeActionKind: { valueSet: ['', 'quickfix', 'refactor', 'source'] } } },
         },
       },
     }, 600000);
+    this.caps = (init && init.capabilities) || {};
     this.notify('initialized', {});
     const t = Date.now();
     await indexed;
@@ -217,6 +224,33 @@ function arrows(text, max) {
   return out;
 }
 
+
+/** Applies LSP text edits to `text`. */
+function applyEdits(text, edits) {
+  const lines = [0];
+  for (let i = 0; i < text.length; i++) if (text[i] === '\n') lines.push(i + 1);
+  const off = (p) => Math.min(text.length, (lines[p.line] ?? text.length) + p.character);
+  const sorted = [...edits].sort((a, b) => off(b.range.start) - off(a.range.start));
+  for (const e of sorted) text = text.slice(0, off(e.range.start)) + e.newText + text.slice(off(e.range.end));
+  return text;
+}
+
+/** Edits of a WorkspaceEdit as a sorted list of `file:line:col-line:col=text`. */
+function editKeys(we, project) {
+  if (!we) return null;
+  const out = [];
+  const add = (uri, edits) => {
+    const f = path.relative(project, decodeURIComponent(uri.replace(/^file:\/\//, '')));
+    for (const e of edits) out.push(`${f}:${e.range.start.line}:${e.range.start.character}-${e.range.end.line}:${e.range.end.character}=${e.newText}`);
+  };
+  for (const [uri, edits] of Object.entries(we.changes || {})) add(uri, edits);
+  for (const dc of we.documentChanges || []) if (dc.edits) add(dc.textDocument.uri, dc.edits);
+  return out.sort();
+}
+
+const locKeys = (locs, project) =>
+  (locs || []).map((l) => `${path.relative(project, decodeURIComponent(l.uri.replace(/^file:\/\//, '')))}:${l.range.start.line}:${l.range.start.character}`).sort();
+
 const hoverText = (h) => {
   if (!h || !h.contents) return '';
   const c = h.contents;
@@ -272,6 +306,19 @@ async function main() {
     hover: { both: 0, onlyTheirs: 0, onlyOurs: 0, examples: [] },
     completion: { positions: 0, theirLabels: 0, matched: 0, examples: [] },
   };
+  // REFACTOR=1: formatting, references, rename and code actions
+  const R = process.env.REFACTOR;
+  if (R) {
+    const caps = (c) => ['referencesProvider', 'renameProvider', 'documentFormattingProvider', 'codeActionProvider'].map((k) => `${k}=${JSON.stringify(c.caps[k] ?? null)}`).join(' ');
+    console.log(`capabilities intelephense: ${caps(theirs)}`);
+    console.log(`capabilities php-lsp: ${caps(ours)}`);
+    report.refactor = {
+      format: { both: 0, same: 0, onlyTheirs: 0, onlyOurs: 0, examples: [] },
+      references: { both: 0, same: 0, onlyTheirs: 0, onlyOurs: 0, theirs: 0, ours: 0, common: 0, examples: [] },
+      rename: { both: 0, same: 0, onlyTheirs: 0, onlyOurs: 0, examples: [] },
+      codeAction: { positions: 0, theirTitles: 0, matched: 0, ourTitles: 0, examples: [] },
+    };
+  }
   const diagBucket = (code) => (report.diagnostics[code] ||= { both: 0, onlyTheirs: 0, onlyOurs: 0, examples: [] });
   const example = (list, item) => list.length < 40 && list.push(item);
 
@@ -381,6 +428,96 @@ async function main() {
       }
     }
 
+    if (R) {
+      const rf = report.refactor;
+      const fparams = { textDocument: { uri }, options: { tabSize: 4, insertSpaces: !process.env.FMTTABS } };
+      const [ft, fy] = await Promise.all([theirs.request('textDocument/formatting', fparams, 60000), ours.request('textDocument/formatting', fparams, 60000)]);
+      if (ft && fy) {
+        rf.format.both++;
+        const [a, b] = [applyEdits(text, ft), applyEdits(text, fy)];
+        if (a === b) rf.format.same++;
+        else {
+          // FORMATDUMP=dir: both results for diffing
+          if (process.env.FORMATDUMP) {
+            for (const [who, t] of [['intelephense', a], ['php-lsp', b]]) {
+              const f = path.join(process.env.FORMATDUMP, who, rel);
+              fs.mkdirSync(path.dirname(f), { recursive: true });
+              fs.writeFileSync(f, t);
+            }
+          }
+          const la = a.split('\n');
+          const lb = b.split('\n');
+          const i = la.findIndex((l, i) => l !== lb[i]);
+          (rf.format.diffs ||= []).push({ file: rel, line: i + 1, theirs: la.slice(i, i + 3), ours: lb.slice(i, i + 3) });
+          example(rf.format.examples, `~ ${rel}:${i + 1}: intelephense ${JSON.stringify(la[i])} php-lsp ${JSON.stringify(lb[i])}`);
+        }
+      } else if (ft) rf.format.onlyTheirs++;
+      else if (fy) rf.format.onlyOurs++;
+
+      for (const p of probes(text, Math.max(3, Math.floor(opts.probes / 3)))) {
+        const position = positionAt(text, p.offset);
+        const at = `${rel}:${position.line + 1}:${position.character + 1} ${p.kind} ${p.word}`;
+        const rp = { textDocument: { uri }, position, context: { includeDeclaration: true } };
+        const [xt, xy] = await Promise.all([theirs.request('textDocument/references', rp, 60000), ours.request('textDocument/references', rp, 60000)]);
+        const [kt, ky] = [locKeys(xt, opts.project), locKeys(xy, opts.project)];
+        if (kt.length && ky.length) {
+          rf.references.both++;
+          const sy = new Set(ky);
+          const common = kt.filter((k) => sy.has(k)).length;
+          rf.references.theirs += kt.length;
+          rf.references.ours += ky.length;
+          rf.references.common += common;
+          if (common === kt.length && common === ky.length) rf.references.same++;
+          else {
+            const st = new Set(kt);
+            (rf.references.diffs ||= []).push({ at, theirs: kt.length, ours: ky.length, common, missing: kt.filter((k) => !sy.has(k)).slice(0, 10), extra: ky.filter((k) => !st.has(k)).slice(0, 10) });
+            example(rf.references.examples, `~ ${at}: ${kt.length} vs ${ky.length} (common ${common})`);
+          }
+        } else if (kt.length) {
+          rf.references.onlyTheirs++;
+          example(rf.references.examples, `- ${at}: ${kt.length}`);
+        } else if (ky.length) {
+          rf.references.onlyOurs++;
+          example(rf.references.examples, `+ ${at}: ${ky.length}`);
+        }
+
+        if (p.word === '$this') continue;
+        const np = { textDocument: { uri }, position, newName: p.kind === 'variable' ? '$renamedX' : 'renamedX' };
+        const [wt, wy] = await Promise.all([theirs.request('textDocument/rename', np, 60000), ours.request('textDocument/rename', np, 60000)]);
+        const [et, ey] = [editKeys(wt, opts.project), editKeys(wy, opts.project)];
+        if (et && et.length && ey && ey.length) {
+          rf.rename.both++;
+          if (et.join('\n') === ey.join('\n')) rf.rename.same++;
+          else {
+            const [st, sy] = [new Set(et), new Set(ey)];
+            (rf.rename.diffs ||= []).push({ at, missing: et.filter((k) => !sy.has(k)).slice(0, 10), extra: ey.filter((k) => !st.has(k)).slice(0, 10) });
+            example(rf.rename.examples, `~ ${at}: ${et.length} vs ${ey.length} edits`);
+          }
+        } else if (et && et.length) {
+          rf.rename.onlyTheirs++;
+          example(rf.rename.examples, `- ${at}`);
+        } else if (ey && ey.length) {
+          rf.rename.onlyOurs++;
+          example(rf.rename.examples, `+ ${at}`);
+        }
+      }
+
+      for (const d of listT.slice(0, 10)) {
+        const cp = { textDocument: { uri }, range: d.range, context: { diagnostics: [d] } };
+        const [at, ay] = await Promise.all([theirs.request('textDocument/codeAction', cp), ours.request('textDocument/codeAction', cp)]);
+        const titles = (r) => new Set((r || []).map((a) => a.title));
+        const [tt, ty] = [titles(at), titles(ay)];
+        if (!tt.size && !ty.size) continue;
+        rf.codeAction.positions++;
+        rf.codeAction.theirTitles += tt.size;
+        rf.codeAction.ourTitles += ty.size;
+        const missing = [...tt].filter((t) => !ty.has(t));
+        rf.codeAction.matched += tt.size - missing.length;
+        if (missing.length || [...ty].some((t) => !tt.has(t)))
+          (rf.codeAction.diffs ||= []).push({ at: `${rel}:${d.range.start.line + 1} ${d.code}`, missing, extra: [...ty].filter((t) => !tt.has(t)) });
+      }
+    }
+
     for (const c of [theirs, ours]) c.notify('textDocument/didClose', { textDocument: { uri } });
     if ((n + 1) % 25 === 0) console.log(`${n + 1}/${files.length}`);
   }
@@ -394,6 +531,16 @@ async function main() {
   console.log(`definition: same ${d.same}, different ${d.different}, only intelephense ${d.onlyTheirs}, only php-lsp ${d.onlyOurs}`);
   console.log(`hover: both ${report.hover.both}, only intelephense ${report.hover.onlyTheirs}, only php-lsp ${report.hover.onlyOurs}`);
   console.log(`completion recall: ${c.theirLabels ? ((100 * c.matched) / c.theirLabels).toFixed(1) : '-'}% of ${c.theirLabels} labels at ${c.positions} positions`);
+  if (R) {
+    const rf = report.refactor;
+    console.log(`formatting: both ${rf.format.both} (same ${rf.format.same}), only intelephense ${rf.format.onlyTheirs}, only php-lsp ${rf.format.onlyOurs}`);
+    const r = rf.references;
+    console.log(`references: both ${r.both} (same ${r.same}, ${r.common}/${r.theirs} of intelephense's found, ${r.ours} ours), only intelephense ${r.onlyTheirs}, only php-lsp ${r.onlyOurs}`);
+    console.log(`rename: both ${rf.rename.both} (same ${rf.rename.same}), only intelephense ${rf.rename.onlyTheirs}, only php-lsp ${rf.rename.onlyOurs}`);
+    const a = rf.codeAction;
+    console.log(`code actions: ${a.matched}/${a.theirTitles} of intelephense's titles at ${a.positions} diagnostics, ${a.ourTitles} ours`);
+    for (const c of [theirs, ours]) for (const [m, e] of Object.entries(c.errors)) console.log(`  ${c.name} errors ${m}: ${e.length} (${[...new Set(e)].slice(0, 3).join(' | ')})`);
+  }
   if (opts.out) {
     fs.writeFileSync(opts.out, JSON.stringify(report, null, 2));
     console.log(`report: ${opts.out}`);
@@ -401,7 +548,11 @@ async function main() {
   fs.rmSync(storage, { recursive: true, force: true });
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
+
+module.exports = { Client, intelephenseServer, uriOf, applyEdits };

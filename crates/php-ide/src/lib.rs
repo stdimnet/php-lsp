@@ -458,10 +458,33 @@ impl Workspace {
         sema::Sema::new(self, id).map(|s| navigation::goto_implementation(&s, offset)).unwrap_or_default()
     }
 
+    /// References like Intelephense reports them: names cover the whole
+    /// (qualified) name, built-in declarations are left out.
     pub fn references(&self, id: FileId, offset: TextSize, include_declaration: bool) -> Vec<Reference> {
-        sema::Sema::new(self, id)
+        let refs = sema::Sema::new(self, id)
             .map(|s| navigation::references(&s, offset, include_declaration))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        refs.into_iter()
+            .filter(|r| self.index().file_kind(r.file) != Some(php_index::FileKind::Stub))
+            .map(|mut r| {
+                if let Some(f) = self.file(r.file) {
+                    let start = usize::from(r.range.start());
+                    let bytes = f.text.as_bytes();
+                    let mut s = start;
+                    // `\Foo\Bar`: back over the namespace segments
+                    while s > 0
+                        && (bytes[s - 1].is_ascii_alphanumeric()
+                            || matches!(bytes[s - 1], b'_' | b'\\' | 0x80..))
+                    {
+                        s -= 1;
+                    }
+                    if s < start && f.text[s..start].contains('\\') && !f.text[..start].ends_with('$') {
+                        r.range = TextRange::new(TextSize::from(s as u32), r.range.end());
+                    }
+                }
+                r
+            })
+            .collect()
     }
 
     /// Opening and closing tag names of the HTML element at `offset`.

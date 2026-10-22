@@ -105,6 +105,10 @@ fn tag_name(rest: &str) -> &str {
     &rest[..end]
 }
 
+fn lead_ws(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
 /// Class names used in type positions of a doc comment token.
 pub(crate) fn doc_type_refs(token: &SyntaxToken) -> Vec<DocTypeRef> {
     let text = token.text();
@@ -141,6 +145,33 @@ pub(crate) fn doc_type_refs(token: &SyntaxToken) -> Vec<DocTypeRef> {
             words.pop(); // method name
             if words.first().is_some_and(|w| w.eq_ignore_ascii_case("static")) && words.len() > 1 {
                 words.remove(0);
+            }
+            // parameter types: `@method void f(Foo $a, int $b = 1)`
+            if let Some(open) = body_trim.find('(') {
+                let params = &body_trim[open + 1..];
+                let mut depth = 0i32;
+                let mut start = 0;
+                for (i, c) in params.char_indices() {
+                    match c {
+                        '(' | '<' | '{' | '[' => depth += 1,
+                        ')' | '>' | '}' | ']' if depth > 0 => depth -= 1,
+                        ',' | ')' if depth == 0 => {
+                            let param = &params[start..i];
+                            let lead = param.len() - param.trim_start().len();
+                            let (t, _) = php_hir::phpdoc::split_type(param.trim_start());
+                            if !t.is_empty() && !t.starts_with('$') && !t.starts_with('.') {
+                                let at =
+                                    base + line_off + body_start + lead_ws(body) + open + 1 + start + lead;
+                                scan_names(t, at, &mut out);
+                            }
+                            start = i + 1;
+                            if c == ')' {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             match words.first() {
                 Some(w) => (*w, body_trim.find(w).unwrap_or(0)),
