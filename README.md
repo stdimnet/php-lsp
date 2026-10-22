@@ -110,7 +110,8 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   Intelephense's codes, messages and severities: undefined symbols, argument count and
   types (P1006), implementations, deprecations, unused symbols and parameters, missing
   returns, possibly undefined variables, unreachable code, member visibility, modifier /
-  method body / readonly / named argument rules, duplicate keys and declarations and more
+  method body / readonly / named argument rules, duplicate keys and declarations,
+  incompatible / final overrides, colliding traits, attribute and enum rules and more
   (compared with the real Intelephense with `editors/compare`)
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
@@ -134,7 +135,7 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
     `{{ }}` / `@if(...)` / `@foreach(...)`; variable types come from the controllers' `view()`
     / `->with()` / `compact()` calls, `$loop` is typed; directive snippets, HTML completion,
     view names in `@include` / `@extends`; folding of directive blocks, outline of sections /
-    stacks / slots, highlighted directives (semantic tokens). Twig is not supported: VS Code
+    stacks / slots, highlighted directives (semantic tokens), formatting of `@php` blocks. Twig is not supported: VS Code
     sends `.twig` files (language `twig`) to no PHP server
   - **Symfony:** typed `$container->get(Foo::class)` and Doctrine `getRepository()`, route
     names (`#[Route(name: ...)]`, YAML) and Twig templates for `redirectToRoute()`,

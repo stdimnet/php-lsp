@@ -30,7 +30,7 @@ fn is_arrayish(t: &Type) -> bool {
 impl Checker<'_, '_> {
     /// Whether a value of type `arg` may be passed as `param`; `None` when
     /// it cannot be decided.
-    fn accepts(&self, param: &Type, arg: &Type, strict: bool) -> bool {
+    pub(crate) fn accepts(&self, param: &Type, arg: &Type, strict: bool) -> bool {
         let index = self.sema.index();
         // names we do not know (template parameters of functions, pseudo
         // types like `uppercase-string`, missing dependencies)

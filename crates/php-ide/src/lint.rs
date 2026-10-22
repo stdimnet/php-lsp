@@ -86,6 +86,29 @@ impl Checker<'_, '_> {
             }
             _ => {}
         }
+        if index_ready && matches!(node.kind(), CLASS_DECL | ENUM_DECL | INTERFACE_DECL | TRAIT_DECL) {
+            self.lint_class(node);
+        }
+        if index_ready
+            && matches!(
+                node.kind(),
+                CLASS_DECL
+                    | ENUM_DECL
+                    | INTERFACE_DECL
+                    | TRAIT_DECL
+                    | FUNCTION_DECL
+                    | METHOD_DECL
+                    | PROPERTY_DECL
+                    | CLASS_CONST_DECL
+                    | PARAM
+                    | ANON_CLASS
+                    | CLOSURE_EXPR
+                    | ARROW_FN_EXPR
+                    | ENUM_CASE
+            )
+        {
+            self.lint_attributes(node);
+        }
         if node.kind() == METHOD_DECL || node.kind() == FUNCTION_DECL {
             self.lint_doc_params(node);
             if index_ready {

@@ -894,7 +894,7 @@ impl<'s, 'a> Infer<'s, 'a> {
         }
         if let Some((t, anchor)) = narrowed {
             if best.as_ref().is_none_or(|(p, _)| *p <= anchor) {
-                return t;
+                return self.intersect_narrowed(t, best.map(|(_, b)| b));
             }
         }
         // inside a loop, assignments later in the loop reach the next iteration
@@ -1290,6 +1290,19 @@ impl<'s, 'a> Infer<'s, 'a> {
             }
         }
         None
+    }
+
+    /// `$x instanceof B` where `$x` is an unrelated `A` (one of them an
+    /// interface): the value is both, `A&B`.
+    fn intersect_narrowed(&self, narrowed: Type, before: Option<Type>) -> Type {
+        let (Type::Named(b, _), Some(Type::Named(a, args))) = (&narrowed, &before) else { return narrowed };
+        let index = self.sema.index();
+        let interface =
+            |c: &Fqn| index.class(c).is_some_and(|(_, d)| d.kind == ast::ClassLikeKind::Interface);
+        if index.is_subtype(b, a) || index.is_subtype(a, b) || !(interface(a) || interface(b)) {
+            return narrowed;
+        }
+        Type::Intersection(vec![Type::Named(a.clone(), args.clone()), narrowed])
     }
 
     fn instanceof_condition(&self, cond: &SyntaxNode, name: &str) -> Option<Type> {

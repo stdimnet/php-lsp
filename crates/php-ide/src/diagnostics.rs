@@ -69,6 +69,19 @@ pub enum DiagnosticCode {
     UnknownParamName,
     TypeMismatch,
     DocTypeIncompatible,
+    IncompatibleMethod,
+    FinalOverride,
+    /// `class A extends FinalClass`
+    FinalExtend,
+    NotAnAttribute,
+    AttributeRepeated,
+    CollidingTraitMethods,
+    EnumCaseValue,
+    EnumCaseUnexpectedValue,
+    DuplicateEnumValue,
+    EnumMagicMethod,
+    EnumProperty,
+    HookedReadonly,
     UndefinedConstant,
     UndefinedVariable,
     UndefinedMethod,
@@ -135,6 +148,18 @@ impl DiagnosticCode {
             DiagnosticCode::UnknownParamName => "P1130",
             DiagnosticCode::TypeMismatch => "P1006",
             DiagnosticCode::DocTypeIncompatible => "P1131",
+            DiagnosticCode::IncompatibleMethod => "P1038",
+            DiagnosticCode::FinalOverride => "P1039",
+            DiagnosticCode::FinalExtend => "P1094",
+            DiagnosticCode::NotAnAttribute => "P1086",
+            DiagnosticCode::AttributeRepeated => "P1088",
+            DiagnosticCode::CollidingTraitMethods => "P1093",
+            DiagnosticCode::EnumCaseValue => "P1050",
+            DiagnosticCode::EnumCaseUnexpectedValue => "P1052",
+            DiagnosticCode::DuplicateEnumValue => "P1103",
+            DiagnosticCode::EnumMagicMethod => "P1096",
+            DiagnosticCode::EnumProperty => "P1097",
+            DiagnosticCode::HookedReadonly => "P1079",
         }
     }
 }
@@ -350,9 +375,9 @@ fn def_reaches(
             ELSE_CLAUSE => false,
             CASE_CLAUSE | DEFAULT_CLAUSE | CATCH_CLAUSE | MATCH_ARM => true,
             // the body only (`for` initializers and the first condition always run)
-            WHILE_STMT | FOREACH_STMT => {
-                !cond_child() && child.kind() != FOREACH_VALUE && child.kind() != FOREACH_KEY
-            }
+            // `while (true)` runs its body at least once
+            WHILE_STMT => !cond_child() && !always_true(&anc),
+            FOREACH_STMT => !cond_child() && child.kind() != FOREACH_VALUE && child.kind() != FOREACH_KEY,
             FOR_STMT => is_statement(child.kind()) || child.kind() == STMT_LIST,
             BIN_EXPR => {
                 let short_circuit = anc
@@ -372,6 +397,10 @@ fn def_reaches(
         if matches!(anc.kind(), IF_STMT | ELSE_IF_CLAUSE) && fills_if_missing(&anc, name) {
             continue;
         }
+        // `switch` with `default` where every clause defines it (or falls through / exits)
+        if matches!(anc.kind(), CASE_CLAUSE | DEFAULT_CLAUSE) && switch_defines(sema, &anc, defs, read) {
+            continue;
+        }
         // `if (...) { $x = 1; } else { $x = 2; }`
         let if_stmt = anc.ancestors().find(|a| a.kind() == IF_STMT);
         if let Some(if_stmt) = if_stmt.filter(|i| {
@@ -385,6 +414,35 @@ fn def_reaches(
         return false;
     }
     true
+}
+
+/// The condition of a `while` is `true` / `1`.
+fn always_true(stmt: &SyntaxNode) -> bool {
+    stmt.children().find(|c| crate::infer::is_expr(c.kind())).is_some_and(|c| {
+        let t = ast::text_without_trivia(&c);
+        t.eq_ignore_ascii_case("true") || t == "1"
+    })
+}
+
+/// The `switch` around `clause` has a `default` and each clause defines the
+/// variable (at one of `defs`), falls through (empty) or always exits.
+fn switch_defines(sema: &Sema, clause: &SyntaxNode, defs: &[TextSize], read: TextSize) -> bool {
+    let Some(switch) = clause.ancestors().find(|a| a.kind() == SWITCH_STMT) else { return false };
+    if switch.text_range().contains(read) {
+        return false;
+    }
+    let clauses: Vec<SyntaxNode> = switch
+        .descendants()
+        .filter(|n| matches!(n.kind(), CASE_CLAUSE | DEFAULT_CLAUSE))
+        .filter(|c| c.ancestors().find(|a| a.kind() == SWITCH_STMT).as_ref() == Some(&switch))
+        .collect();
+    clauses.iter().any(|c| c.kind() == DEFAULT_CLAUSE)
+        && clauses.iter().all(|c| {
+            let stmts: Vec<SyntaxNode> = c.children().filter(|s| is_statement(s.kind())).collect();
+            stmts.is_empty()
+                || defs.iter().any(|d| c.text_range().contains(*d))
+                || stmts.iter().any(|s| always_exits(sema, s))
+        })
 }
 
 /// A read inside `if (isset($x) ...) { ... }` / `!empty($x)` / `$x ?? ...`.

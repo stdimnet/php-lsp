@@ -849,6 +849,77 @@ pub(crate) fn in_code(blade: &Blade, offset: TextSize) -> bool {
     blade.regions.iter().any(|r| r.start() < offset && offset <= r.end())
 }
 
+/// Formats the PHP code of `@php … @endphp` blocks (those intersecting
+/// `within`, when given): the code is indented one unit deeper than the line
+/// holding `@php` (or kept flush with it when written that way), the rest of the template stays as it is. Blocks with
+/// syntax errors or multi-line strings (whose content would change) are left
+/// alone.
+pub(crate) fn format(
+    text: &str,
+    within: Option<TextRange>,
+    options: &php_fmt::FormatOptions,
+) -> Vec<(TextRange, String)> {
+    let blade = virtual_php(text);
+    let unit = if options.use_tabs { "\t".to_string() } else { " ".repeat(options.indent_size) };
+    let mut out = Vec::new();
+    for pair in blade.directives.windows(2) {
+        let [(php, a), (endphp, b)] = pair else { continue };
+        if a != "php" || b != "endphp" {
+            continue;
+        }
+        // between `@php` and the `@` of `@endphp`
+        let (start, end) = (usize::from(php.end()), usize::from(endphp.start()) - 1);
+        let code = &text[start..end];
+        if !code.contains('\n') || code.trim().is_empty() {
+            continue; // `@php $x = 1; @endphp` on one line stays
+        }
+        let block = TextRange::new(php.start(), endphp.end());
+        if within.is_some_and(|r| r.intersect(block).is_none()) {
+            continue;
+        }
+        let Some(formatted) = format_code(code.trim(), options) else { continue };
+        let line_start = text[..usize::from(php.start())].rfind('\n').map_or(0, |n| n + 1);
+        let base: String = text[line_start..].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        // code flush with `@php` (Laravel's own views) stays flush
+        let first = code.trim_start_matches(['\r', '\n']);
+        let flush = code.starts_with(['\r', '\n'])
+            && first.starts_with(base.as_str())
+            && !first[base.len()..].starts_with([' ', '\t']);
+        let indent = if flush { base.clone() } else { format!("{base}{unit}") };
+        let mut new_text = String::from("\n");
+        for line in formatted.lines() {
+            if !line.is_empty() {
+                new_text.push_str(&indent);
+                new_text.push_str(line);
+            }
+            new_text.push('\n');
+        }
+        new_text.push_str(&base);
+        if new_text != code {
+            out.push((range(start, end), new_text));
+        }
+    }
+    out
+}
+
+/// `code` formatted as a PHP file (without the `<?php` line).
+fn format_code(code: &str, options: &php_fmt::FormatOptions) -> Option<String> {
+    let file = format!("<?php\n{code}\n");
+    let edits = php_fmt::format(&file, options).ok()?;
+    let formatted = php_fmt::apply(&file, &edits);
+    let parse = php_syntax::parse(&formatted, options.php_version);
+    let multiline = parse.syntax_node().descendants_with_tokens().any(|e| {
+        e.as_token().is_some_and(|t| {
+            !matches!(t.kind(), php_syntax::SyntaxKind::WHITESPACE | php_syntax::SyntaxKind::OPEN_TAG)
+                && t.text().contains('\n')
+        })
+    });
+    if multiline {
+        return None;
+    }
+    Some(formatted.strip_prefix("<?php")?.trim_matches('\n').to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

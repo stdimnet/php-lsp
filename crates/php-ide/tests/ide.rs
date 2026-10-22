@@ -1051,6 +1051,64 @@ function dc(int $a, array $b, Base $c, ?int $d, \Closure $e): string { return ''
     assert_eq!(d, vec!["P1131 Documented type is not compatible with the declared type."; 2]);
 }
 
+#[test]
+fn catalog_round_two() {
+    let src = r#"<?php
+class Base {
+    public function a(int $x): ?Base { return null; }
+    public function b(string $s, int $o = 0): string { return $s; }
+    final public function c(): void {}
+    public function d(Base $b): static { return $this; }
+}
+final class Locked {}
+class Child extends Base {
+    public function a(int $x, int $y): Base { return $this; }
+    public function b(string $s, int $o = 0, int ...$rest): string { return $s; }
+    public function c(): void {}
+    public function d(object $b): static { return $this; }
+}
+class Fine extends Base {
+    public function a(int|string $x, int $y = 0): Child { return new Child(); }
+}
+class Bad extends Locked {}
+trait T1 { function go(): int { return 1; } }
+trait T2 { function go(): int { return 2; } }
+class Collide { use T1, T2; }
+class Resolved { use T1, T2 { T1::go insteadof T2; } }
+class Plain {}
+#[Plain]
+function attr_target() {}
+#[Attribute]
+class Once {}
+#[Once, Once]
+function twice() {}
+enum Backed: string { case A = 'a'; case B; case C = 'a'; public function __get($n) {} }
+enum Pure { case X = 1; }
+"#;
+    let d = diags(src);
+    let codes: Vec<&str> = d.iter().map(|x| &x[..5]).collect();
+    for (code, n) in [
+        ("P1038", 1),
+        ("P1039", 1),
+        ("P1094", 1),
+        ("P1093", 1),
+        ("P1086", 1),
+        ("P1088", 1),
+        ("P1050", 1),
+        ("P1052", 1),
+        ("P1103", 1),
+        ("P1096", 1),
+    ] {
+        assert_eq!(codes.iter().filter(|c| **c == code).count(), n, "{code} in {d:#?}");
+    }
+    assert!(
+        d.contains(&"P1038 Method 'Child::a' is not compatible with method 'Base::a'.".to_string()),
+        "{d:#?}"
+    );
+    assert!(d.contains(&"P1094 Class Bad cannot extend final class Locked.".to_string()), "{d:#?}");
+    assert!(d.contains(&"P1052 Case X of non-backed enum Pure must not have a value.".to_string()), "{d:#?}");
+}
+
 /// False positives found in the third comparison run.
 #[test]
 fn comparison_regressions() {
@@ -1237,4 +1295,50 @@ fn intelephense_parity() {
         "<?php\n{classes}class U {{ const TYPE_A = 1; /** @var U::TYPE_* */ public int $t = 1; }}\n"
     ));
     assert!(d.is_empty(), "{d:?}");
+}
+
+#[test]
+fn blade_php_blocks_are_formatted() {
+    let mut ws = Workspace::new(Config::default());
+    let text = "<div>\n    @php\n$items=[1,2];\n        if($x){\n$y=1;\n}\n    @endphp\n    {{  $x  }}\n    @php $a=1; @endphp\n    @php\n$s = 'a\nb';\n    @endphp\n</div>\n";
+    let id = ws.set_file("file:///v.blade.php", text.to_string());
+    let edits = ws.format(id, None, &Default::default()).unwrap();
+    let mut out = text.to_string();
+    for e in edits.iter().rev() {
+        out.replace_range(usize::from(e.range.start())..usize::from(e.range.end()), &e.new_text);
+    }
+    assert_eq!(
+        out,
+        "<div>\n    @php\n        $items = [1, 2];\n        if ($x) {\n            $y = 1;\n        }\n    @endphp\n    {{  $x  }}\n    @php $a=1; @endphp\n    @php\n$s = 'a\nb';\n    @endphp\n</div>\n"
+    );
+    // idempotent
+    ws.set_file("file:///v.blade.php", out.clone());
+    assert!(ws.format(id, None, &Default::default()).unwrap().is_empty());
+    // range formatting only touches blocks inside the range
+    ws.set_file("file:///v.blade.php", text.to_string());
+    let r = php_ide::TextRange::new(TextSize::from(0), TextSize::from(3));
+    assert!(ws.format(id, Some(r), &Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn instanceof_unrelated_interface_intersects() {
+    let d = diags(
+        "<?php\ninterface A { public function a(); }\ninterface B { public function b(); }\nfunction g(A $a) {}\nfunction f(A $x) {\n    if (!$x instanceof B) {\n        return;\n    }\n    g($x);\n    $x->a();\n    $x->b();\n}\n",
+    );
+    assert!(d.iter().all(|m| !m.starts_with("P1006") && !m.starts_with("P1013")), "{d:#?}");
+    assert_eq!(
+        type_at(
+            "<?php\ninterface A {}\ninterface B {}\nfunction f(A $x) { if ($x instanceof B) { $x<|>; } }"
+        ),
+        "A&B"
+    );
+}
+
+#[test]
+fn switch_default_and_infinite_loop_define() {
+    let d = diags(
+        "<?php\nfunction f($m) {\n    switch ($m) {\n        case 'a':\n            $q = 1;\n            break;\n        case 'b':\n        default:\n            $q = 2;\n    }\n    return $q;\n}\nfunction g($f) {\n    while (true) {\n        $r = fgets($f);\n        if (!$r) {\n            break;\n        }\n    }\n    return $r;\n}\nfunction h($m) {\n    switch ($m) {\n        case 'a':\n            $s = 1;\n            break;\n        case 'b':\n            break;\n        default:\n            $s = 2;\n    }\n    return $s;\n}\n",
+    );
+    let p: Vec<&String> = d.iter().filter(|m| m.starts_with("P1116")).collect();
+    assert_eq!(p, vec!["P1116 Possible undefined variable '$s'."], "{d:#?}");
 }

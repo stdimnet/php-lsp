@@ -31,6 +31,7 @@ mod inlay_hints;
 mod line_index;
 mod links;
 mod lint;
+mod lint_types;
 mod navigation;
 pub mod plugins;
 mod refactor;
@@ -524,12 +525,13 @@ impl Workspace {
         options: &FormatOptions,
     ) -> Option<Vec<TextEdit>> {
         let file = self.file(id)?;
-        if blade::is_blade(&file.path) {
-            // the formatter does not know Blade
-            return Some(Vec::new());
-        }
         let mut options = options.clone();
         options.php_version = self.config.php_version;
+        if blade::is_blade(&file.path) {
+            // only the code of `@php` blocks; the template stays as it is
+            let edits = blade::format(&file.text, range, &options);
+            return Some(edits.into_iter().map(|(range, new_text)| TextEdit { range, new_text }).collect());
+        }
         let edits = match range {
             Some(r) => php_fmt::format_range(&file.text, r, &options),
             None => php_fmt::format(&file.text, &options),
