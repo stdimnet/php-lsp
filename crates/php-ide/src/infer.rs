@@ -5,6 +5,7 @@ use php_hir::symbols::{FunctionDef, TypeResolver};
 use php_hir::{Fqn, Type};
 use php_syntax::ast::{self, AstNode};
 use php_syntax::{SyntaxKind, SyntaxKind::*, SyntaxNode, TextSize};
+use std::collections::HashMap;
 
 use crate::sema::Sema;
 
@@ -180,11 +181,27 @@ impl<'s, 'a> Infer<'s, 'a> {
                 let Some(class) = node.children().find(|c| c.kind() != ARG_LIST) else { return Type::Object };
                 if class.kind() == NAME_EXPR {
                     let text = ast::text_without_trivia(&class);
-                    return self
-                        .sema
-                        .resolve_class_name(&text, &class)
-                        .map(|c| Type::Named(c, Vec::new()))
-                        .unwrap_or(Type::Object);
+                    let Some(fqn) = self.sema.resolve_class_name(&text, &class) else { return Type::Object };
+                    // class templates bound by the constructor arguments
+                    let index = self.sema.index();
+                    if let (Some((_, def)), Some(args)) =
+                        (index.class(&fqn), node.children().find(|c| c.kind() == ARG_LIST))
+                    {
+                        if !def.templates.is_empty() {
+                            if let Some(ctor) = index.find_method(&fqn, "__construct") {
+                                let bound = self.bind_templates(&ctor.def.params, Some(&args));
+                                if !bound.is_empty() {
+                                    let targs = def
+                                        .templates
+                                        .iter()
+                                        .map(|t| bound.get(&t.name).cloned().unwrap_or(Type::Mixed))
+                                        .collect();
+                                    return Type::Named(fqn, targs);
+                                }
+                            }
+                        }
+                    }
+                    return Type::Named(fqn, Vec::new());
                 }
                 // `new $class` with `$class` a class-string
                 let t = self.expr_type(&class);
@@ -453,27 +470,152 @@ impl<'s, 'a> Infer<'s, 'a> {
         if f.templates.is_empty() {
             return ret;
         }
-        let arg_nodes: Vec<SyntaxNode> =
-            args.map(|a| a.children().filter(|c| c.kind() == ARG).collect()).unwrap_or_default();
-        let subst = |name: &str| -> Option<Type> {
-            for (i, p) in f.params.iter().enumerate() {
-                let pt = p.effective_type()?;
-                let arg = arg_nodes.get(i)?.children().find(|c| is_expr(c.kind()))?;
-                match &pt {
-                    Type::Template(t) if &**t == name => return Some(self.expr_type(&arg)),
-                    Type::ClassString(Some(inner)) if matches!(&**inner, Type::Template(t) if &**t == name) =>
-                    {
-                        let at = self.expr_type(&arg);
-                        if let Type::ClassString(Some(c)) = at {
-                            return Some(*c);
-                        }
-                    }
-                    _ => {}
+        let bound = self.bind_templates(&f.params, args);
+        ret.substitute(&|name: &str| bound.get(name).cloned())
+    }
+
+    /// The return type of a function without a declared or documented one:
+    /// the union of its `return` expressions (like Intelephense).
+    fn inferred_return(&self, file: php_index::FileId, range: php_syntax::TextRange) -> Type {
+        thread_local! {
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        if let Some(t) = self.sema.return_cache.borrow().get(&(file, range)) {
+            return t.clone();
+        }
+        if DEPTH.with(|d| d.get()) >= 3 {
+            return Type::Mixed;
+        }
+        // placeholder against recursion
+        self.sema.return_cache.borrow_mut().insert((file, range), Type::Mixed);
+        DEPTH.with(|d| d.set(d.get() + 1));
+        let other;
+        let sema = if file == self.sema.file {
+            self.sema
+        } else {
+            other = Sema::new(self.sema.ws, file);
+            match &other {
+                Some(s) => s,
+                None => {
+                    DEPTH.with(|d| d.set(d.get() - 1));
+                    return Type::Mixed;
                 }
             }
-            None
         };
-        ret.substitute(&subst)
+        let t = sema
+            .root
+            .covering_element(range)
+            .ancestors()
+            .find(|n| matches!(n.kind(), METHOD_DECL | FUNCTION_DECL) && n.text_range() == range)
+            .map_or(Type::Mixed, |func| {
+                let own = |n: &SyntaxNode| {
+                    n.ancestors()
+                        .find(|a| {
+                            matches!(a.kind(), FUNCTION_DECL | METHOD_DECL | CLOSURE_EXPR | ARROW_FN_EXPR)
+                        })
+                        .as_ref()
+                        == Some(&func)
+                };
+                // generators return a Generator
+                if func.descendants().any(|n| matches!(n.kind(), YIELD_EXPR | YIELD_FROM_EXPR) && own(&n)) {
+                    return Type::Mixed;
+                }
+                let infer = sema.infer();
+                let types: Vec<Type> = func
+                    .descendants()
+                    .filter(|n| n.kind() == RETURN_STMT && own(n))
+                    .filter_map(|r| expr_children(&r).next())
+                    .map(|e| infer.expr_type(&e))
+                    .collect();
+                if types.is_empty() || types.iter().any(Type::is_mixed) {
+                    Type::Mixed
+                } else {
+                    Type::union(types)
+                }
+            });
+        DEPTH.with(|d| d.set(d.get() - 1));
+        self.sema.return_cache.borrow_mut().insert((file, range), t.clone());
+        t
+    }
+
+    /// Template parameters bound by the argument types of a call.
+    fn bind_templates(
+        &self,
+        params: &[php_hir::symbols::ParamDef],
+        args: Option<&SyntaxNode>,
+    ) -> HashMap<String, Type> {
+        let mut out = HashMap::new();
+        let arg_nodes: Vec<SyntaxNode> =
+            args.map(|a| a.children().filter(|c| c.kind() == ARG).collect()).unwrap_or_default();
+        for (i, p) in params.iter().enumerate() {
+            let (Some(pt), Some(arg)) =
+                (p.effective_type(), arg_nodes.get(i).and_then(|a| a.children().find(|c| is_expr(c.kind()))))
+            else {
+                continue;
+            };
+            if !pt_has_template(&pt) {
+                continue;
+            }
+            let at = self.expr_type(&arg);
+            self.bind(&pt, &at, &mut out, 0);
+        }
+        out
+    }
+
+    /// Unifies a parameter type with an argument type.
+    fn bind(&self, param: &Type, arg: &Type, out: &mut HashMap<String, Type>, depth: u8) {
+        if depth > 6 || arg.is_mixed() {
+            return;
+        }
+        match (param, arg) {
+            (Type::Template(t), a) => {
+                out.entry(t.to_string()).or_insert_with(|| a.clone());
+            }
+            (Type::Union(ps), a) => {
+                for p in ps {
+                    if matches!(p, Type::Null) {
+                        continue;
+                    }
+                    let before = out.len();
+                    self.bind(p, a, out, depth + 1);
+                    if out.len() > before {
+                        break;
+                    }
+                }
+            }
+            (Type::ClassString(Some(inner)), Type::ClassString(Some(c))) => {
+                self.bind(inner, c, out, depth + 1)
+            }
+            (Type::Array(pk, pv) | Type::Iterable(pk, pv), a)
+                if matches!(a, Type::Array(..) | Type::List(_) | Type::Iterable(..) | Type::Shape(_)) =>
+            {
+                if let (Some(pk), Type::Array(Some(ak), _) | Type::Iterable(Some(ak), _)) = (pk, a) {
+                    self.bind(pk, ak, out, depth + 1);
+                }
+                if let (Some(pv), Some(av)) = (pv, a.iterable_value()) {
+                    self.bind(pv, &av, out, depth + 1);
+                }
+            }
+            (Type::List(Some(pv)), a) => {
+                if let Some(av) = a.iterable_value() {
+                    self.bind(pv, &av, out, depth + 1);
+                }
+            }
+            (Type::Named(pc, pargs), Type::Named(ac, aargs)) if !pargs.is_empty() => {
+                let index = self.sema.index();
+                let args = if pc.eq_ignore_case(ac) {
+                    Some(aargs.clone())
+                } else {
+                    index.ancestor_args(ac, aargs, pc)
+                };
+                if let Some(args) = args {
+                    for (p, a) in pargs.iter().zip(args.iter()) {
+                        self.bind(p, a, out, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Argument summary for plugins.
@@ -535,6 +677,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                 return t;
             }
             return match found {
+                Some((file, f)) if f.effective_return_type().is_none() => self.inferred_return(file, f.range),
                 Some((_, f)) => self.function_return(f, args.as_ref()),
                 None => Type::Mixed,
             };
@@ -582,10 +725,21 @@ impl<'s, 'a> Infer<'s, 'a> {
                 continue;
             }
             let Some(m) = self.sema.index().find_method(&class, &name) else { continue };
-            let mut t = self.function_return(m.def, args.as_ref());
+            let mut t = if m.def.effective_return_type().is_none() && !m.def.is_magic {
+                self.inferred_return(m.file, m.def.range)
+            } else {
+                self.function_return(m.def, args.as_ref())
+            };
             // class level generics, also through `@extends Base<T>` chains
             let targs = self.receiver_args(receiver_ty.as_ref(), &class);
             t = self.sema.index().substitute_templates(&t, &class, &targs, &m.owner.fqn);
+            // `@return static` keeps the receiver's generic arguments
+            if !targs.is_empty() {
+                t = t.map(&mut |x| {
+                    matches!(x, Type::Static | Type::SelfType)
+                        .then(|| Type::Named(class.clone(), targs.clone()))
+                });
+            }
             out.push(self.resolve_rel(&t, Some(&m.owner.fqn), Some(&class)));
         }
         if out.is_empty() {
@@ -1031,6 +1185,16 @@ impl<'s, 'a> Infer<'s, 'a> {
         let t = match (declared, doc_ty) {
             (_, Some(d)) if !d.is_mixed() => d,
             (Some(d), _) => d,
+            // `fn ($value) => ...` passed to `filter(callable(TValue): bool $cb)`
+            (None, _) if matches!(func.kind(), CLOSURE_EXPR | ARROW_FN_EXPR) => {
+                let index = func
+                    .children()
+                    .find_map(ast::ParamList::cast)
+                    .and_then(|l| l.params().position(|q| q.syntax() == p.syntax()));
+                index.and_then(|i| self.callback_param_type(func, i)).unwrap_or(Type::Mixed)
+            }
+            // a method of an anonymous class implementing an interface
+            (None, None) => self.inherited_param_type(func, &name).unwrap_or(Type::Mixed),
             _ => Type::Mixed,
         };
         if p.is_variadic() {
@@ -1140,13 +1304,76 @@ impl<'s, 'a> Infer<'s, 'a> {
     }
 
     /// `@param` type of parameter `name` in a method overridden by `func`.
+    /// The type of parameter `index` of a closure / arrow function from the
+    /// `callable(...)` type of the parameter it is passed to.
+    fn callback_param_type(&self, func: &SyntaxNode, index: usize) -> Option<Type> {
+        let arg = func.parent().filter(|a| a.kind() == ARG)?;
+        let list = arg.parent().filter(|l| l.kind() == ARG_LIST)?;
+        let call = list.parent().filter(|c| matches!(c.kind(), METHOD_CALL_EXPR | STATIC_CALL_EXPR))?;
+        let position = list.children().filter(|c| c.kind() == ARG).position(|a| a == arg)?;
+        let named = arg
+            .children()
+            .find(|c| c.kind() == NAME)
+            .filter(|_| arg.children_with_tokens().any(|e| e.kind() == COLON))
+            .map(|n| ast::text_without_trivia(&n));
+        let name = Self::member_name(&call)?;
+        let receiver_ty =
+            call.first_child().filter(|_| call.kind() == METHOD_CALL_EXPR).map(|r| self.expr_type(&r));
+        let mut out = Vec::new();
+        for class in self.receiver_classes(&call) {
+            let Some(m) = self.sema.index().find_method(&class, &name) else { continue };
+            let param = match &named {
+                Some(n) => m.def.params.iter().find(|p| &p.name == n),
+                None => m.def.params.get(position),
+            };
+            let Some(pty) = param.and_then(|p| p.effective_type()) else { continue };
+            let Some(Type::Closure(params, _)) =
+                pty.members().into_iter().find(|t| matches!(t, Type::Closure(..))).cloned()
+            else {
+                continue;
+            };
+            let Some(t) = params.get(index) else { continue };
+            // `callable($this)`: the receiver itself
+            if matches!(t, Type::Static | Type::SelfType) {
+                if let Some(r) = &receiver_ty {
+                    out.push(r.clone());
+                    continue;
+                }
+            }
+            let targs = self.receiver_args(receiver_ty.as_ref(), &class);
+            let t = self.sema.index().substitute_templates(t, &class, &targs, &m.owner.fqn);
+            let t = self.resolve_rel(&t, Some(&m.owner.fqn), Some(&class));
+            if !t.is_mixed() && !matches!(t, Type::Template(_)) {
+                out.push(t);
+            }
+        }
+        (!out.is_empty()).then(|| Type::union(out))
+    }
+
+    /// The declared or documented type of the parameter in the overridden
+    /// method (anonymous classes implementing an interface).
+    fn inherited_param_type(&self, func: &SyntaxNode, name: &str) -> Option<Type> {
+        if func.kind() != METHOD_DECL {
+            return None;
+        }
+        let class = func.ancestors().find(|n| n.kind() == ANON_CLASS)?;
+        let fqn = self.sema.class_fqn(&class)?;
+        let method = func.children().find_map(ast::MemberName::cast).and_then(|m| m.text())?;
+        self.sema
+            .index()
+            .ancestors(&fqn)
+            .into_iter()
+            .filter(|(_, c)| c.fqn != fqn)
+            .find_map(|(_, c)| c.method(&method)?.params.iter().find(|p| p.name == name)?.effective_type())
+    }
+
     fn inherited_param_doc(&self, func: &SyntaxNode, name: &str) -> Option<Type> {
         if func.kind() != METHOD_DECL {
             return None;
         }
-        let class = func
-            .ancestors()
-            .find(|n| matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL))?;
+        let class = func.ancestors().find(|n| {
+            matches!(n.kind(), CLASS_DECL | INTERFACE_DECL | TRAIT_DECL | ENUM_DECL | ANON_CLASS)
+        })?;
         let fqn = self.sema.class_fqn(&class)?;
         let method = func
             .children()
@@ -1458,4 +1685,16 @@ pub(crate) fn is_superglobal(name: &str) -> bool {
         name,
         "_GET" | "_POST" | "_SERVER" | "_REQUEST" | "_COOKIE" | "_FILES" | "_ENV" | "_SESSION" | "GLOBALS"
     )
+}
+
+/// Whether a type mentions a template parameter.
+fn pt_has_template(t: &Type) -> bool {
+    let mut found = false;
+    t.map(&mut |x| {
+        if matches!(x, Type::Template(_)) {
+            found = true;
+        }
+        None
+    });
+    found
 }

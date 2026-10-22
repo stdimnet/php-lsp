@@ -630,6 +630,12 @@ impl Cx<'_> {
             }
             Member::TraitUse(t) => {
                 def.traits.extend(t.names().map(|n| class_tr.scope.resolve_class(&n.text())));
+                // `/** @use Trait<TKey, TValue> */ use Trait;`
+                if let Some(doc) = ast::doc_comment(t.syntax()).map(|d| DocBlock::parse(d.text())) {
+                    for g in doc.generic_supertypes("use") {
+                        def.generic_supertypes.push(class_tr.doc_type(&g));
+                    }
+                }
                 let aliases = t.syntax().descendants().filter(|n| n.kind() == TRAIT_ALIAS);
                 for alias in aliases {
                     let names: Vec<String> = alias

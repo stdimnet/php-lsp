@@ -208,10 +208,10 @@ function probes(text, max) {
   return Array.from({ length: max }, (_, i) => found[Math.floor(i * step)]);
 }
 
-/** Positions right after `->` for completion. */
+/** Positions right after `->` (and `Name::` with STATIC=1) for completion. */
 function arrows(text, max) {
   const out = [];
-  const re = /\$[A-Za-z_]\w*->/g;
+  const re = process.env.STATIC ? /\$[A-Za-z_]\w*->|\b[A-Z]\w*::/g : /\$[A-Za-z_]\w*->/g;
   let m;
   while ((m = re.exec(text)) && out.length < max) out.push(m.index + m[0].length);
   return out;
@@ -249,7 +249,7 @@ const sameTarget = (a, b) =>
 
 async function main() {
   const opts = parseArgs();
-  const settings = { environment: { phpVersion: process.env.PHPV || '8.4.0' }, diagnostics: { enable: true }, telemetry: { enabled: false } };
+  const settings = { environment: { phpVersion: process.env.PHPV || '8.4.0' }, diagnostics: { enable: true }, telemetry: { enabled: false }, completion: { maxItems: Number(process.env.MAXITEMS || 100) } };
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'php-lsp-compare-'));
   const theirs = new Client('intelephense', process.execPath, [intelephenseServer(opts.intelephense), '--stdio'], settings);
   const ours = new Client('php-lsp', opts.phpLsp, ['--stdio'], settings);
@@ -343,7 +343,7 @@ async function main() {
       }
     }
 
-    for (const offset of arrows(text, 3)) {
+    for (const offset of arrows(text, Number(process.env.ARROWS || 3))) {
       const position = positionAt(text, offset);
       const params = { textDocument: { uri }, position, context: { triggerKind: 2, triggerCharacter: '>' } };
       const [ct, cy] = await Promise.all([theirs.request('textDocument/completion', params), ours.request('textDocument/completion', params)]);
@@ -355,6 +355,17 @@ async function main() {
       const missing = [...lt].filter((l) => !ly.has(l));
       report.completion.matched += lt.size - missing.length;
       if (missing.length) example(report.completion.examples, `- ${rel}:${position.line + 1}:${position.character + 1}: ${missing.slice(0, 8).join(', ')}`);
+      // MISSES=1: every difference with the line, for analysis
+      if (process.env.MISSES && (missing.length || [...ly].some((l) => !lt.has(l)))) {
+        (report.completion.misses ||= []).push({
+          file: rel,
+          line: position.line + 1,
+          col: position.character + 1,
+          text: text.split('\n')[position.line].trim(),
+          missing,
+          extra: [...ly].filter((l) => !lt.has(l)),
+        });
+      }
     }
 
     for (const c of [theirs, ours]) c.notify('textDocument/didClose', { textDocument: { uri } });

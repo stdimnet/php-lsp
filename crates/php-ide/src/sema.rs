@@ -27,6 +27,8 @@ pub(crate) struct Sema<'a> {
     pub expr_cache:
         std::cell::RefCell<std::collections::HashMap<(TextRange, php_syntax::SyntaxKind), php_hir::Type>>,
     pub var_cache: std::cell::RefCell<std::collections::HashMap<(String, TextSize), php_hir::Type>>,
+    /// Return types inferred from the body of functions without one.
+    pub return_cache: std::cell::RefCell<std::collections::HashMap<(FileId, TextRange), php_hir::Type>>,
 }
 
 impl<'a> Sema<'a> {
@@ -49,6 +51,7 @@ impl<'a> Sema<'a> {
             in_loop_carried: std::cell::Cell::new(false),
             expr_cache: Default::default(),
             var_cache: Default::default(),
+            return_cache: Default::default(),
         })
     }
 

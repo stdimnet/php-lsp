@@ -266,7 +266,7 @@ impl Cx<'_, '_> {
         };
         match left.kind() {
             DOC_COMMENT | COMMENT if left.text().starts_with("/**") => {
-                if !self.docblock(&left) {
+                if !self.docblock(&left) && !self.doc_members(&left) {
                     self.doc_tags(&left);
                 }
                 return;
@@ -396,11 +396,24 @@ impl Cx<'_, '_> {
     fn visible(&self, owner: &Fqn, vis: Visibility, caller: Option<&Fqn>) -> bool {
         match vis {
             Visibility::Public => true,
-            Visibility::Private => caller.is_some_and(|c| c.eq_ignore_case(owner)),
+            // private trait members belong to the class using the trait
+            Visibility::Private => {
+                caller.is_some_and(|c| c.eq_ignore_case(owner) || self.uses_trait(c, owner, 0))
+            }
             Visibility::Protected => caller.is_some_and(|c| {
                 self.sema.index().is_subtype(c, owner) || self.sema.index().is_subtype(owner, c)
             }),
         }
+    }
+
+    /// `class` uses `trait` itself (directly or through its own traits).
+    fn uses_trait(&self, class: &Fqn, trait_name: &Fqn, depth: u8) -> bool {
+        let Some((_, def)) = self.sema.index().class(class) else { return false };
+        depth < 8
+            && def
+                .traits
+                .iter()
+                .any(|t| t.eq_ignore_case(trait_name) || self.uses_trait(t, trait_name, depth + 1))
     }
 
     fn method_item(&self, f: &FunctionDef, owner: &Fqn, range: TextRange) -> CompletionItem {
@@ -425,6 +438,52 @@ impl Cx<'_, '_> {
         };
         item.sort_text = Some(format!("{rank}{}", f.name.to_ascii_lowercase()));
         item
+    }
+
+    /// `use T { m as alias; }` of `class` and its ancestors: (alias, method, trait).
+    fn trait_aliases(&self, class: &Fqn) -> Vec<(String, &'_ FunctionDef, Fqn)> {
+        let index = self.sema.index();
+        let mut out = Vec::new();
+        for (_, c) in index.ancestors(class) {
+            for (method, trait_name, alias) in &c.trait_aliases {
+                let traits: Vec<&Fqn> = match trait_name {
+                    Some(t) => vec![t],
+                    None => c.traits.iter().collect(),
+                };
+                if let Some((def, t)) = traits
+                    .into_iter()
+                    .find_map(|t| index.class(t).and_then(|(_, d)| d.method(method)).map(|d| (d, t.clone())))
+                {
+                    out.push((alias.clone(), def, t));
+                }
+            }
+        }
+        out
+    }
+
+    fn alias_items(
+        &mut self,
+        class: &Fqn,
+        prefix: &str,
+        range: TextRange,
+        statics_only: bool,
+        seen: &mut HashSet<String>,
+    ) {
+        let mut items = Vec::new();
+        for (alias, def, owner) in self.trait_aliases(class) {
+            if statics_only && !def.is_static || !matches_prefix(&alias, prefix) {
+                continue;
+            }
+            if !seen.insert(format!("m{}", alias.to_ascii_lowercase())) {
+                continue;
+            }
+            let mut item = self.method_item(def, &owner, range);
+            item.label = alias.clone();
+            item.insert_text = item.insert_text.replacen(&def.name, &alias, 1);
+            item.sort_text = Some(format!("1{}", alias.to_ascii_lowercase()));
+            items.push(item);
+        }
+        self.items.extend(items);
     }
 
     fn instance_members(&mut self, receiver: &SyntaxNode, prefix: &str, range: TextRange) {
@@ -464,6 +523,7 @@ impl Cx<'_, '_> {
                 }
                 self.items.push(item);
             }
+            self.alias_items(&class, prefix, range, false, &mut seen);
             // enum instances
             if let Some((_, c)) = self.sema.index().class(&class) {
                 if c.kind == ClassLikeKind::Enum {
@@ -531,6 +591,31 @@ impl Cx<'_, '_> {
                     }
                     let item = self.method_item(m.def, &m.owner.fqn, range);
                     self.items.push(item);
+                }
+                self.alias_items(class, bare, range, !relative, &mut seen);
+                // enums implement `UnitEnum` / `BackedEnum` implicitly
+                if let Some((_, def)) =
+                    self.sema.index().class(class).filter(|(_, d)| d.kind == ClassLikeKind::Enum)
+                {
+                    let iface = Fqn::new(if def.backing_type.is_some() { "BackedEnum" } else { "UnitEnum" });
+                    let names: &[&str] =
+                        if def.backing_type.is_some() { &["cases", "from", "tryFrom"] } else { &["cases"] };
+                    for name in names {
+                        if !matches_prefix(name, bare) || !seen.insert(name.to_ascii_lowercase()) {
+                            continue;
+                        }
+                        let item = match self.sema.index().find_method(&iface, name) {
+                            Some(m) => self.method_item(m.def, &m.owner.fqn, range),
+                            // without stubs
+                            None => {
+                                let mut item = CompletionItem::new(*name, CompletionKind::Method, range);
+                                item.insert_text = format!("{name}($0)");
+                                item.is_snippet = true;
+                                item
+                            }
+                        };
+                        self.items.push(item);
+                    }
                 }
                 if matches_prefix("class", bare) {
                     let mut item = CompletionItem::new("class", CompletionKind::Keyword, range);
@@ -645,7 +730,8 @@ impl Cx<'_, '_> {
         let mut seen = HashSet::new();
         for (_, c) in index.all_classes() {
             let name = c.fqn.short();
-            if !matches_prefix(name, short_prefix) {
+            // anonymous classes have no usable name
+            if name.starts_with("class@anonymous") || !matches_prefix(name, short_prefix) {
                 continue;
             }
             if qualified
@@ -864,6 +950,87 @@ impl Cx<'_, '_> {
         true
     }
 
+    /// `@see Foo::` in a doc comment: all members of `Foo` (like Intelephense).
+    fn doc_members(&mut self, token: &SyntaxToken) -> bool {
+        let text = token.text();
+        let rel = usize::from(self.offset - token.text_range().start()).min(text.len());
+        let before = &text[..rel];
+        let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+        let tag = line.split_whitespace().find(|w| w.starts_with('@')).unwrap_or("");
+        let type_tag =
+            ["@var", "@param", "@return", "@property", "@throws", "@type"].iter().any(|t| tag.starts_with(t));
+        let word_start = before.len()
+            - before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let prefix = &before[word_start..];
+        let Some(head) = before[..word_start].strip_suffix("::") else { return false };
+        let name_start = head.len()
+            - head
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '\\')
+                .map(char::len_utf8)
+                .sum::<usize>();
+        let name = &head[name_start..];
+        if name.is_empty() {
+            return false;
+        }
+        let start = token.text_range().start() + TextSize::from(word_start as u32);
+        let range = TextRange::new(start, self.offset);
+        // in a type (`@var Foo::`) Intelephense offers type names
+        if type_tag {
+            for t in BUILTIN_TYPES {
+                if matches_prefix(t, prefix) {
+                    let mut item = CompletionItem::new(*t, CompletionKind::Keyword, range);
+                    item.sort_text = Some(format!("0{t}"));
+                    self.items.push(item);
+                }
+            }
+            self.names(NameContext::Type, prefix, range);
+            return true;
+        }
+        let Some(anchor) = token.parent() else { return false };
+        let Some(class) = self.sema.resolve_class_name(name, &anchor) else { return false };
+        let index = self.sema.index();
+        let members = index.members(&class);
+        let bare = prefix.trim_start_matches('$');
+        let mut items = Vec::new();
+        // private members only of the class itself
+        let caller = self.caller_class();
+        let shown = |owner: &Fqn, v: Visibility| self.visible(owner, v, caller.as_ref());
+        for m in members.methods.iter().filter(|m| shown(&m.owner.fqn, m.def.visibility)) {
+            if matches_prefix(&m.def.name, bare) {
+                let mut item = CompletionItem::new(m.def.name.clone(), CompletionKind::Method, range);
+                item.detail = Some(render::function_signature(m.def, true));
+                items.push(item);
+            }
+        }
+        for p in members.properties.iter().filter(|p| shown(&p.owner.fqn, p.def.visibility)) {
+            if matches_prefix(&p.def.name, bare) {
+                let mut item =
+                    CompletionItem::new(format!("${}", p.def.name), CompletionKind::Property, range);
+                item.detail = p.def.effective_type().map(|t| t.to_string());
+                items.push(item);
+            }
+        }
+        for c in &members.constants {
+            if matches_prefix(&c.def.name, bare) {
+                items.push(CompletionItem::new(c.def.name.clone(), CompletionKind::Constant, range));
+            }
+        }
+        for c in &members.cases {
+            if matches_prefix(&c.def.name, bare) {
+                items.push(CompletionItem::new(c.def.name.clone(), CompletionKind::EnumMember, range));
+            }
+        }
+        self.items.extend(items);
+        true
+    }
+
     fn doc_tags(&mut self, token: &SyntaxToken) {
         let text = token.text();
         let rel = usize::from(self.offset - token.text_range().start());
@@ -904,6 +1071,12 @@ fn prev_significant(token: &SyntaxToken) -> Option<SyntaxToken> {
     }
     None
 }
+
+/// Type keywords offered in PHPDoc types.
+const BUILTIN_TYPES: &[&str] = &[
+    "array", "bool", "callable", "false", "float", "int", "iterable", "mixed", "never", "null", "object",
+    "resource", "self", "string", "true", "void",
+];
 
 /// An edit inserting `use <what>;` into `scope`.
 pub(crate) fn use_edit(sema: &Sema, scope: &NamespaceScope, what: &str) -> TextEdit {

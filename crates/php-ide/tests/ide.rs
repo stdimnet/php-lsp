@@ -1950,3 +1950,66 @@ fn catalog_round_four() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Completion gaps found against Intelephense (fourth comparison).
+#[test]
+fn completion_parity() {
+    let generics = r#"<?php
+/**
+ * @template TKey
+ * @template TValue
+ */
+trait Enumerates {
+    /** @param callable(TValue, TKey): mixed $cb
+     *  @return $this */
+    public function each(callable $cb) { return $this; }
+}
+/**
+ * @template TKey
+ * @template TValue
+ */
+class Coll {
+    /** @use Enumerates<TKey, TValue> */
+    use Enumerates;
+    /** @param iterable<TKey, TValue> $items */
+    public function __construct($items = []) {}
+    /** @param callable(TValue, TKey): bool $cb
+     *  @return static */
+    public function filter(callable $cb) { return $this; }
+    /** @param callable($this): mixed $cb */
+    public function pipe(callable $cb) {}
+}
+class Event { public function finish() {} }
+class Maker { public function make() { return new Event(); } }
+/** @return Event[] */
+function events() { return []; }
+"#;
+    let types = |body: &str| type_at(&format!("{generics}{body}"));
+    assert_eq!(types("(new Coll(events()))->filter(fn ($v) => $v<|>);"), "Event");
+    assert_eq!(
+        types("(new Coll(events()))->filter(fn ($v) => true)->each(function ($e) { $e<|>; });"),
+        "Event"
+    );
+    assert!(types("(new Coll(events()))->pipe(fn ($c) => $c<|>);").starts_with("Coll<"));
+    // return types inferred from the body
+    assert_eq!(types("$e = (new Maker())->make(); $e<|>;"), "Event");
+
+    let members = r#"<?php
+trait Macroable { public function __call($m, $a) {} private static function helper() {} }
+class Uses { use Macroable { __call as macroCall; } public function f() { self::<|> } }
+"#;
+    let l = completion_labels(members);
+    assert!(l.contains(&"macroCall".to_string()) && l.contains(&"helper".to_string()), "{l:?}");
+    let l = completion_labels("<?php\nenum Suit: string { case H = 'h'; }\nSuit::<|>");
+    for want in ["H", "cases", "from", "tryFrom", "class"] {
+        assert!(l.contains(&want.to_string()), "{want} {l:?}");
+    }
+    // `@see Foo::` in doc comments
+    let l = completion_labels(
+        "<?php\nclass Foo { public $bar; public function baz() {} }\n/** @see Foo::<|> */\nfunction f() {}",
+    );
+    assert!(l.contains(&"baz".to_string()) && l.contains(&"$bar".to_string()), "{l:?}");
+    // anonymous classes inherit the parameter types of the interface
+    let t = type_at("<?php\nclass Model {}\ninterface Cast { /** @param Model $m */ public function get($m); }\n$c = new class implements Cast { public function get($m) { $m<|>; } };");
+    assert_eq!(t, "Model");
+}
