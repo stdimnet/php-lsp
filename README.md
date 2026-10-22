@@ -4,12 +4,23 @@ A PHP language server written in pure Rust. Goal: every Intelephense feature (pr
 included), completely free, plus extras like refactorings, framework support and tool
 integration.
 
-It can be used in three ways:
+It can be used in these ways:
 
-1. **As a Rust library.** `php-ide` gives you a plain Rust API with no JSON-RPC involved.
-2. **As a standalone language server.** The `php-lsp` binary talks LSP over stdio or a socket.
-3. **As a drop-in replacement for Intelephense.** It accepts the same CLI flags and reads the
+1. **As a standalone language server.** The `php-lsp` binary talks LSP over stdio or a socket.
+2. **As a drop-in replacement for Intelephense.** It accepts the same CLI flags and reads the
    `intelephense.*` settings, so existing editor configurations keep working.
+3. **As a library** for other software:
+   - Rust: `php-ide` (plain Rust API, no JSON-RPC) or `php_lsp::Embedded` (the whole server
+     in process),
+   - C and every language with a C FFI: `libphplsp` (`.so` / `.dylib` / `.dll`, `.a`),
+   - JavaScript: the WebAssembly npm package `php-lsp-wasm` (Node.js, browsers, workers).
+
+**Documentation: [docs/](docs/README.md)** (installation, editors, configuration, features,
+all diagnostics, formatting, library APIs, LSP reference, plugins, architecture,
+development).
+
+Release builds for Linux, macOS and Windows (x86_64 and aarch64), the C library and the npm
+package are produced by `.github/workflows/release.yml` on every `v*` tag.
 
 ## Crates
 
@@ -22,7 +33,9 @@ It can be used in three ways:
 | `php-fmt`    | Whitespace-only formatter in Intelephense's style (PSR-12 / PER), never changes tokens, idempotent |
 | `php-tools`  | External tools: PHPStan, Psalm, PHP_CodeSniffer, php-cs-fixer, phpcbf, PHPUnit |
 | `php-ide`    | IDE features as a Rust API (`Workspace`): completion, hover, navigation, references, symbols, ... |
-| `php-lsp`    | LSP server and `php-lsp` binary |
+| `php-lsp`    | LSP server and `php-lsp` binary, `Embedded` for in-process use |
+| `php-lsp-ffi`| C library `libphplsp` with header, C example and Python binding |
+| `php-lsp-wasm`| WebAssembly / npm package |
 
 ## Usage
 
@@ -52,12 +65,14 @@ for symbol in ws.document_symbols(file) {
 }
 ```
 
-To embed the LSP server, pass any `lsp_server::Connection` to `php_lsp::Server::initialize`.
-This works with stdio, TCP or an in-memory connection.
+To embed the LSP server, pass any `lsp_server::Connection` to `php_lsp::Server::initialize`,
+or use `php_lsp::Embedded` to exchange JSON messages directly. See
+[Rust library](docs/library-rust.md), [C library](docs/library-c.md) and
+[WebAssembly](docs/library-wasm.md).
 
 ### Settings
 
-The server reads settings from `initializationOptions`, `workspace/didChangeConfiguration` and
+All settings are described in [docs/configuration.md](docs/configuration.md). The server reads settings from `initializationOptions`, `workspace/didChangeConfiguration` and
 `workspace/configuration`. Both the `intelephense` and the `php-lsp` sections are supported;
 when both set the same key, `php-lsp` wins.
 
@@ -75,6 +90,7 @@ when both set the same key, `php-lsp` wins.
 | `inlayHint.*`             | `parameterNames`, `returnTypes`, `parameterTypes` (all `true`) |
 | `format.enable`           | `true` |
 | `format.braces`           | `psr12` (`allman`, `k&r`) |
+| `format.html`             | `true` (also format the HTML, CSS and JavaScript of templates) |
 | `diagnostics.run`         | `onType` (`onSave`) |
 | `environment.includePaths`| `[]` (extra directories indexed like `vendor/`) |
 
@@ -115,7 +131,7 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   incompatible / final overrides, colliding traits, attribute targets, enum rules, property
   hooks and asymmetric visibility, constant expressions, namespace placement, deprecations
   depending on the targeted PHP version, flexible heredoc indentation, PHPDoc syntax and more: all
-  130 codes of Intelephense's catalog, checked case by case against the real Intelephense
+  131 codes of Intelephense's catalog, checked case by case against the real Intelephense
   for PHP 7.4 to 8.5 (`editors/compare`)
 - [x] **Phase 4, editing:** rename, code actions (import, implement methods, remove unused
   imports, PHPDoc, getters/setters, sort imports), formatter, implementations, call/type
@@ -125,8 +141,10 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   Compared with Intelephense on Laravel, Symfony, WordPress and PHP-Parser:
   - the formatter produces Intelephense's output for 97 % of the PHP files (keeps
     alignment, one statement per line, multi-line lists one element per line, blank lines
-    around `namespace` / `use`, empty bodies as `{}`); templates mixing HTML and PHP are
-    left unchanged (Intelephense also formats their HTML)
+    around `namespace` / `use`, empty bodies as `{}`). Templates mixing HTML and PHP are
+    formatted like Intelephense too: a port of js-beautify (HTML, CSS, JavaScript, with
+    Intelephense's patches) gives identical output on 846 WordPress templates and 129 Blade
+    views; WordPress overall: 284 of 300 files identical
   - find references returns 97.6–99.9 % of Intelephense's locations: a method with the
     methods it overrides / implements and those overriding it (also through traits), a
     parameter with its `@param` tag and the same parameter of related methods, `new Foo()`
@@ -154,7 +172,8 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
     `{{ }}` / `@if(...)` / `@foreach(...)`; variable types come from the controllers' `view()`
     / `->with()` / `compact()` calls, `$loop` is typed; directive snippets, HTML completion,
     view names in `@include` / `@extends`; folding of directive blocks, outline of sections /
-    stacks / slots, highlighted directives (semantic tokens), formatting of `@php` blocks
+    stacks / slots, highlighted directives (semantic tokens), HTML formatting like
+    Intelephense (`@php` blocks formatted as PHP)
   - **Twig** (for editors that send `.twig` files; the Intelephense VS Code extension does
     not): variable types from the controllers' `render()` / `renderView()` calls and
     `#[Template]`, `{% set %}` and `{% for %}`, `loop`, `app`; hover, completion and go to
@@ -171,6 +190,8 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
 
 ## Development
 
+See [docs/development.md](docs/development.md).
+
 ```sh
 cargo test --workspace
 cargo run --release -p php-syntax --example parse_corpus -- path/to/php/project
@@ -183,4 +204,10 @@ cargo run --release -p php-fmt --example fmt_corpus -- path/to/php/project
 node editors/compare/compare.js path/to/php/project              # differences to Intelephense
 REFACTOR=1 node editors/compare/compare.js path/to/php/project   # formatting and references
 xvfb-run -a node editors/vscode-test/run.js                      # inside the real VS Code
+crates/php-lsp-wasm/build.sh && node crates/php-lsp-wasm/tests/node.mjs  # WebAssembly
 ```
+
+## Licence
+
+MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)); bundled
+third-party code: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

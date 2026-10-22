@@ -177,6 +177,11 @@ impl Server {
         &self.workspace
     }
 
+    /// Adds a framework plugin (see [`php_ide::plugins::Plugin`]).
+    pub fn register_plugin(&mut self, plugin: std::sync::Arc<dyn php_ide::plugins::Plugin>) {
+        self.workspace.register_plugin(plugin);
+    }
+
     /// Runs until the client sends `exit`.
     pub fn run(mut self) -> Result<()> {
         // `initialize_finish` already consumed the `initialized` notification

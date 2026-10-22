@@ -94,6 +94,11 @@ impl Embedded {
         self.server.workspace()
     }
 
+    /// Adds a framework plugin (see [`php_ide::plugins::Plugin`]).
+    pub fn register_plugin(&mut self, plugin: std::sync::Arc<dyn php_ide::plugins::Plugin>) {
+        self.server.register_plugin(plugin);
+    }
+
     fn run_tasks(&mut self) {
         while let Ok(task) = self.server.task_rx.try_recv() {
             self.server.on_task(task);
