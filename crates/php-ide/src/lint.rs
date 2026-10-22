@@ -57,6 +57,7 @@ impl Checker<'_, '_> {
 
     pub(crate) fn lint(&mut self, node: &SyntaxNode, index_ready: bool) {
         let lc = self.config.language_constraints;
+        self.lint_compat(node, index_ready);
         match node.kind() {
             METHOD_DECL if lc => self.lint_method(node),
             PROPERTY_DECL if lc => self.lint_property(node),
@@ -211,7 +212,8 @@ impl Checker<'_, '_> {
             return;
         }
         let Some(decl) = ast::PropertyDecl::cast(prop.clone()) else { return };
-        if has(&mods, STATIC_KW) {
+        // static properties of readonly classes are P1058
+        if has(&mods, STATIC_KW) && has(&mods, READONLY_KW) {
             if let Some(r) = find(&mods, STATIC_KW) {
                 self.err(r, Code::StaticReadonly, "Static property cannot be readonly.");
             }
@@ -501,6 +503,7 @@ impl Checker<'_, '_> {
         let Some(call) = list.parent() else { return };
         let Some(params) = self.callee_params(&call) else { return };
         self.check_argument_types(&call, &params);
+        self.check_by_ref_args(&call, &params);
         if names.is_empty() {
             return;
         }

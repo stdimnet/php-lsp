@@ -7,6 +7,9 @@
 //
 //   node compare.js <project dir> [--files N] [--probes N] [--out report.json]
 //        [--intelephense path/to/intelephense.js] [--php-lsp path/to/php-lsp]
+//
+// PHPV=8.5.0 sets the targeted PHP version, EXACT=1 compares diagnostics by
+// range, severity and message (and stores both lists in the report).
 'use strict';
 
 const cp = require('child_process');
@@ -246,7 +249,7 @@ const sameTarget = (a, b) =>
 
 async function main() {
   const opts = parseArgs();
-  const settings = { environment: { phpVersion: '8.4.0' }, diagnostics: { enable: true }, telemetry: { enabled: false } };
+  const settings = { environment: { phpVersion: process.env.PHPV || '8.4.0' }, diagnostics: { enable: true }, telemetry: { enabled: false } };
   const storage = fs.mkdtempSync(path.join(os.tmpdir(), 'php-lsp-compare-'));
   const theirs = new Client('intelephense', process.execPath, [intelephenseServer(opts.intelephense), '--stdio'], settings);
   const ours = new Client('php-lsp', opts.phpLsp, ['--stdio'], settings);
@@ -280,9 +283,14 @@ async function main() {
     const [dt, dy] = [diag(theirs), diag(ours)];
     for (const c of [theirs, ours]) c.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'php', version: 1, text } });
     const [mt, my] = await Promise.all([dt, dy]);
-    const key = (d) => `${d.code}:${d.range.start.line}`;
+    // EXACT=1 compares whole ranges instead of start lines
+    const key = (d) =>
+      process.env.EXACT
+        ? `${d.code}:${JSON.stringify(d.range)}:${d.severity}:${d.message}`
+        : `${d.code}:${d.range.start.line}`;
     const listT = (mt ? mt.params.diagnostics : []).filter((d) => d.source !== 'php-lsp-tools');
     const listY = my ? my.params.diagnostics : [];
+    if (process.env.EXACT) (report.exact ||= []).push({ file: rel, theirs: listT, ours: listY });
     const keysY = new Set(listY.map(key));
     const keysT = new Set(listT.map(key));
     for (const d of listT) {
@@ -290,14 +298,16 @@ async function main() {
       if (keysY.has(key(d))) b.both++;
       else {
         b.onlyTheirs++;
-        example(b.examples, `- intelephense ${rel}:${d.range.start.line + 1}: ${d.message}`);
+        const at = process.env.EXACT ? JSON.stringify(d.range) + ' s' + d.severity : '';
+        example(b.examples, `- intelephense ${rel}:${d.range.start.line + 1}: ${d.message} ${at}`);
       }
     }
     for (const d of listY) {
       if (keysT.has(key(d))) continue;
       const b = diagBucket(d.code);
       b.onlyOurs++;
-      example(b.examples, `+ php-lsp ${rel}:${d.range.start.line + 1}: ${d.message}`);
+      const at = process.env.EXACT ? JSON.stringify(d.range) + ' s' + d.severity : '';
+      example(b.examples, `+ php-lsp ${rel}:${d.range.start.line + 1}: ${d.message} ${at}`);
     }
 
     for (const p of probes(text, opts.probes)) {

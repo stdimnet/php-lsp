@@ -51,12 +51,14 @@ fn modifiers(p: &mut Parser) {
     p.start(MODIFIER_LIST);
     while p.current().is_modifier() {
         let is_visibility = matches!(p.current(), PUBLIC_KW | PROTECTED_KW | PRIVATE_KW);
+        let start = p.current_start();
         p.bump();
         if is_visibility && p.at(L_PAREN) && p.nth_at_contextual(1, "set") && p.nth_at(2, R_PAREN) {
-            p.require_version_here(PhpVersion::PHP_8_4, "asymmetric visibility");
             p.bump();
             p.bump();
             p.bump();
+            let range = TextRange::new(start, p.prev_end());
+            p.require_version(PhpVersion::PHP_8_4, "asymmetric visibility", range);
         }
     }
     p.finish_node();
@@ -149,7 +151,14 @@ fn function_decl(p: &mut Parser) {
     attributes(p);
     p.bump();
     p.eat(AMP);
-    name(p);
+    // `function exit()` is reported by the checks ("not allowed")
+    if matches!(p.current(), EXIT_KW | DIE_KW) {
+        p.start(NAME);
+        p.bump_remap(IDENT);
+        p.finish_node();
+    } else {
+        name(p);
+    }
     param_list(p);
     opt_return_type(p);
     block(p);
@@ -397,7 +406,7 @@ fn property(p: &mut Parser) {
 }
 
 fn property_hooks(p: &mut Parser) {
-    p.require_version_here(PhpVersion::PHP_8_4, "property hooks");
+    let start = p.current_start();
     p.start(PROPERTY_HOOK_LIST);
     p.bump();
     while !p.at(R_CURLY) && !p.at(EOF) {
@@ -429,6 +438,8 @@ fn property_hooks(p: &mut Parser) {
         }
     }
     p.expect(R_CURLY);
+    let range = TextRange::new(start, p.prev_end().max(start));
+    p.require_version(PhpVersion::PHP_8_4, "property hooks", range);
     p.finish_node();
 }
 

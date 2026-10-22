@@ -237,7 +237,7 @@ impl<'t> Parser<'t> {
                 return;
             }
         }
-        self.errors.push(SyntaxError { message: msg, range });
+        self.errors.push(SyntaxError { message: msg, range, required: None });
     }
 
     /// Wraps the current token in an `ERROR` node.
@@ -255,6 +255,9 @@ impl<'t> Parser<'t> {
     pub(crate) fn require_version(&mut self, version: PhpVersion, feature: &str, range: TextRange) {
         if self.version < version {
             self.push_error(format!("PHP {version} or newer is required for {feature}"), range);
+            if let Some(last) = self.errors.last_mut() {
+                last.required = Some(version);
+            }
         }
     }
 

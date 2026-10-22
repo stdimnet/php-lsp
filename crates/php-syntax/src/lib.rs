@@ -50,6 +50,8 @@ pub type GreenNode = rowan::GreenNode;
 pub struct SyntaxError {
     pub message: String,
     pub range: TextRange,
+    /// Set when the syntax needs a newer PHP version than the target.
+    pub required: Option<PhpVersion>,
 }
 
 /// The result of parsing: a syntax tree that always covers the whole input,
@@ -106,7 +108,11 @@ fn parse_from(text: &str, version: PhpVersion, php_code: bool) -> Parse {
     let (green, parse_errors) = p.finish();
     let mut errors: Vec<SyntaxError> = lex_errors
         .into_iter()
-        .map(|e| SyntaxError { message: e.msg, range: TextRange::at(e.offset.into(), e.len.into()) })
+        .map(|e| SyntaxError {
+            message: e.msg,
+            range: TextRange::at(e.offset.into(), e.len.into()),
+            required: None,
+        })
         .collect();
     errors.extend(parse_errors);
     errors.sort_by_key(|e| e.range.start());

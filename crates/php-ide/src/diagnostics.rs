@@ -89,11 +89,14 @@ pub enum DiagnosticCode {
     UndefinedClassConstant,
     AbstractInstantiation,
     MissingImplementation,
+    /// A catalog code without a dedicated variant (`"P1084"`).
+    Catalog(&'static str),
 }
 
 impl DiagnosticCode {
     pub fn as_str(self) -> &'static str {
         match self {
+            DiagnosticCode::Catalog(code) => code,
             DiagnosticCode::SyntaxError => "P1001",
             DiagnosticCode::UnusedSymbol => "P1003",
             DiagnosticCode::ArgumentCount => "P1005",
@@ -248,12 +251,17 @@ pub(crate) fn syntax_diagnostics(config: &Config, parse: &php_syntax::Parse) -> 
     let mut out = Vec::new();
     if config.diagnostics.enable && config.diagnostics.syntax {
         for e in parse.errors() {
-            out.push(Diagnostic::new(
-                e.range,
-                Severity::Error,
-                DiagnosticCode::SyntaxError,
-                e.message.clone(),
-            ));
+            out.push(match e.required {
+                Some(v) => Diagnostic::new(
+                    e.range,
+                    Severity::Error,
+                    DiagnosticCode::Catalog("P1022"),
+                    format!("PHP {v}+ syntax found. Targeting PHP {}.", config.php_version),
+                ),
+                None => {
+                    Diagnostic::new(e.range, Severity::Error, DiagnosticCode::SyntaxError, e.message.clone())
+                }
+            });
         }
     }
     out
@@ -857,7 +865,12 @@ impl Checker<'_, '_> {
         };
         if node.kind() == PROPERTY_DECL {
             let Some(decl) = ast::PropertyDecl::cast(node.clone()) else { return };
-            if decl.ty().is_some() {
+            // asymmetric visibility without a type is P1067
+            let asymmetric = node
+                .children()
+                .filter(|c| c.kind() == MODIFIER_LIST)
+                .any(|m| m.children_with_tokens().any(|e| e.kind() == L_PAREN));
+            if decl.ty().is_some() || asymmetric {
                 return;
             }
             for el in decl.elements() {

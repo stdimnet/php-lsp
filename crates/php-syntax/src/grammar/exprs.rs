@@ -172,8 +172,9 @@ fn unary(p: &mut Parser) -> Option<SyntaxKind> {
             prefix(p, PREFIX_EXPR, UNARY_BP)
         }
         CAST => {
-            if p.current_text().to_ascii_lowercase().contains("unset") {
-                p.error_at_current("the (unset) cast is no longer supported");
+            // `(unset)` is reported as deprecated, like Intelephense does
+            if p.current_text().to_ascii_lowercase().contains("void") {
+                p.require_version_here(PhpVersion::PHP_8_5, "(void) casts");
             }
             prefix(p, CAST_EXPR, UNARY_BP)
         }
@@ -394,8 +395,9 @@ fn postfix(p: &mut Parser, cp: Checkpoint, mut lhs: SyntaxKind) -> SyntaxKind {
                 p.finish_node();
                 lhs = INDEX_EXPR;
             }
+            // in PHP 8 only directly after the expression (reported as deprecated)
             L_CURLY
-                if p.version < PhpVersion::PHP_8_0
+                if (p.version < PhpVersion::PHP_8_0 || p.current_range().start() == p.prev_end())
                     && matches!(
                         lhs,
                         VARIABLE_EXPR | INDEX_EXPR | PROPERTY_FETCH_EXPR | STATIC_PROPERTY_FETCH_EXPR

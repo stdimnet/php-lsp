@@ -1342,3 +1342,215 @@ fn switch_default_and_infinite_loop_define() {
     let p: Vec<&String> = d.iter().filter(|m| m.starts_with("P1116")).collect();
     assert_eq!(p, vec!["P1116 Possible undefined variable '$s'."], "{d:#?}");
 }
+
+/// Catalog checks compared with the real Intelephense (one snippet per case,
+/// expected codes and messages taken from its output for that PHP version).
+#[test]
+fn catalog_round_three() {
+    const CODES: &[&str] = &[
+        "P1022", "P1023", "P1025", "P1031", "P1032", "P1033", "P1034", "P1045", "P1048", "P1049", "P1051",
+        "P1055", "P1058", "P1059", "P1060", "P1061", "P1062", "P1063", "P1064", "P1065", "P1067", "P1068",
+        "P1069", "P1071", "P1074", "P1076", "P1082", "P1083", "P1084", "P1085", "P1087", "P1089", "P1090",
+        "P1091", "P1099", "P1100", "P1102", "P1105", "P1106", "P1107", "P1110", "P1114", "P1115", "P1117",
+        "P1126", "P1134",
+    ];
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("8.5", "<?php\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.5", "<?php\nclass H3 { public static private(set) int $s; }\n", &[]),
+        ("8.5", "<?php\nclass H2 { public private(set) $u; }\n", &["P1067 A property with asymmetric visibility must have a type."]),
+        ("8.5", "<?php\nclass H4 { private public(set) int $t; }\n", &["P1068 Set visibility must be equal to or less than get visibility."]),
+        ("8.5", "<?php\n#[Attribute(Attribute::TARGET_CLASS)] class OnlyClass {} #[OnlyClass] function at() {}\n", &["P1087 Attribute \"OnlyClass\" has invalid target."]),
+        ("8.5", "<?php\n$k = `ls`;\n", &["P1085 The backtick (`) operator is deprecated, use shell_exec() instead"]),
+        ("8.5", "<?php\nfunction r(&$x) { $x = 1; } r(1);\n", &["P1114 Only variables should be passed by reference."]),
+        ("8.5", "<?php\nclass C1 { case X; }\n", &["P1049 Enum case can only be used in an enum."]),
+        ("8.5", "<?php\n$a = 1; switch ($a) { case 1; break; }\n", &["P1083 Case statements followed by a semicolon (;) are deprecated, use a colon (:) instead."]),
+        ("8.5", "<?php\n$g = (integer) 1; $h = (boolean) 1; $i = (double) 1; $j = (binary) 1;\n", &["P1084 Non-canonical cast (binary) is deprecated. Use (string) instead.", "P1084 Non-canonical cast (boolean) is deprecated. Use (bool) instead.", "P1084 Non-canonical cast (double) is deprecated. Use (float) instead.", "P1084 Non-canonical cast (integer) is deprecated. Use (int) instead."]),
+        ("8.5", "<?php\nclass Ca extends Cb {} class Cb extends Ca {}\n", &["P1134 'Ca' has a circular reference.", "P1134 'Cb' has a circular reference."]),
+        ("8.5", "<?php\nclass CC { const F = function () {}; }\n", &["P1090 Closures in constant expressions must be static."]),
+        ("8.5", "<?php\ntrait TP { public int $x = 1; } class CP { use TP; public string $x = 'a'; }\n", &["P1110 In the composition of type 'CP', properties 'CP::$x' and 'TP::$x' are not compatible."]),
+        ("8.5", "<?php\nfunction foo() { return 1; } class A1 { const Z = [1, foo()]; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("8.5", "<?php\nclass K1 { const int A = 1; } class K2 extends K1 { const string A = 'x'; }\n", &["P1102 Class constant K2::A is not compatible with K1::A."]),
+        ("8.5", "<?php\n$d = 'x'; $e = $d{0};\n", &["P1034 Array or string offset access with curly braces deprecated in PHP 7.4. Targeting PHP 8.5."]),
+        ("8.5", "<?php\n$d = 'x'; $f = \"a ${d} b\"; $g = \"a ${d['x']} b\";\n", &["P1063 Using ${} in strings is deprecated.", "P1063 Using ${} in strings is deprecated."]),
+        ("8.5", "<?php\nfunction t2(int|int $a) { return $a; }\n", &["P1065 Redundant type."]),
+        ("8.5", "<?php\n[] = [1];\n", &["P1025 Empty array destructure."]),
+        ("8.5", "<?php\nenum E2: int { case A = 'x'; }\n", &[]),
+        ("8.5", "<?php\nenum E1: float { case A = 1.0; }\n", &["P1051 Enum backing type must be int or string."]),
+        ("8.5", "<?php\nfunction die() {}\n", &["P1100 Defining a function named \"die\" is not allowed."]),
+        ("8.5", "<?php\nfunction exit() {}\n", &["P1100 Defining a function named \"exit\" is not allowed."]),
+        ("8.5", "<?php\nclass HS { public int $x { set(int $a, int $b) {} } }\n", &["P1074 Invalid property hook signature."]),
+        ("8.5", "<?php\nclass HU { public int $x { set => $value; } } $h = new HU(); unset($h->x);\n", &["P1076 Cannot unset hooked property HU::$x."]),
+        ("8.5", "<?php\ninterface I1 { public int $x; }\n", &["P1082 Interfaces may only contain hooked properties."]),
+        ("8.5", "<?php\n#[\\NoDiscard] function nd(): int { return 1; } nd();\n", &["P1126 The return value of nd() is expected to be consumed."]),
+        ("8.5", "<?php\nnamespace N;\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.5", "<?php\necho 1;\nnamespace Foo;\n", &["P1105 Namespace declaration must be the first statement in script or immediately after declare statement."]),
+        ("8.5", "<?php\nnamespace A { }\nnamespace B;\n", &["P1106 Cannot mix bracketed and unbracketed namespace declarations."]),
+        ("8.5", "<?php\nnamespace A { }\necho 1;\n", &["P1107 No code may exist outside of bracketed namespace."]),
+        ("8.5", "<?php\nfunction t1(null $a) { return $a; }\n", &[]),
+        ("8.5", "<?php\n$a = (real) 1;\n", &["P1031 '(real)' cast deprecated in PHP 7.4. Targeting PHP 8.5."]),
+        ("8.5", "<?php\nfunction t3(int|mixed $a) { return $a; }\n", &[]),
+        ("8.5", "<?php\nclass Iterable {}\n", &["P1023 'Iterable' is a reserved word and cannot be used to name a class, interface, trait or namespace."]),
+        ("8.5", "<?php\nreadonly class RC {} class NotRo extends RC {}\n", &["P1059 Non-readonly class cannot extend readonly class."]),
+        ("8.5", "<?php\nclass Plain {} readonly class Ro2 extends Plain {}\n", &["P1060 Readonly class cannot extend non-readonly class."]),
+        ("8.5", "<?php\nclass Readonly1 { readonly function m() {} }\n", &["P1045 Cannot use 'readonly' as method modifier."]),
+        ("8.5", "<?php\nclass P1 { public readonly int $p; } class P2 extends P1 { public int $p; }\n", &["P1061 Cannot redeclare readonly property as non-readonly."]),
+        ("8.5", "<?php\nreadonly class RC { public static int $s; }\n", &["P1058 Readonly class cannot declare static properties."]),
+        ("8.5", "<?php\nclass SV { public private(set) int $x { get => 1; } }\n", &["P1071 Cannot specify set visibility for a get only virtual property $x."]),
+        ("8.5", "<?php\nfunction sa(): null|false { return null; }\n", &[]),
+        ("8.5", "<?php\nclass S1 { static const X = 1; }\n", &[]),
+        ("8.5", "<?php\n$s = 'abc'; $s[] = 'd';\n", &["P1115 Cannot use [] operator on string."]),
+        ("8.5", "<?php\n$c = 1 ? 2 : 3 ? 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.5."]),
+        ("8.5", "<?php\n$a = 1 ?: 2 ?: 3;\n$b = (1 ? 2 : 3) ? 4 : 5;\n$c = 1 ? 2 : (3 ? 4 : 5);\n$d = 1 ? (2 ? 3 : 4) : 5;\n$e = 1 ? 2 ? 3 : 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.5."]),
+        ("8.5", "<?php\ntrait T { const X = 1; }\n", &[]),
+        ("8.5", "<?php\nclass TC { public void $x; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("8.5", "<?php\n$b = (unset) 1;\n", &["P1032 '(unset)' cast deprecated in PHP 7.2. Targeting PHP 8.5."]),
+        ("8.5", "<?php\n$v = (void) 1;\n", &["P1117 (void) cast cannot be used in this context."]),
+        ("8.5", "<?php\nfunction t4(): void|int { return 1; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("8.4", "<?php\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.4", "<?php\nclass H3 { public static private(set) int $s; }\n", &["P1069 Static property cannot have asymmetric visibility."]),
+        ("8.4", "<?php\nclass H2 { public private(set) $u; }\n", &["P1067 A property with asymmetric visibility must have a type."]),
+        ("8.4", "<?php\nclass H4 { private public(set) int $t; }\n", &["P1068 Set visibility must be equal to or less than get visibility."]),
+        ("8.4", "<?php\n#[Attribute(Attribute::TARGET_CLASS)] class OnlyClass {} #[OnlyClass] function at() {}\n", &["P1087 Attribute \"OnlyClass\" has invalid target."]),
+        ("8.4", "<?php\nfunction r(&$x) { $x = 1; } r(1);\n", &["P1114 Only variables should be passed by reference."]),
+        ("8.4", "<?php\nclass C1 { case X; }\n", &["P1049 Enum case can only be used in an enum."]),
+        ("8.4", "<?php\nclass Ca extends Cb {} class Cb extends Ca {}\n", &["P1134 'Ca' has a circular reference.", "P1134 'Cb' has a circular reference."]),
+        ("8.4", "<?php\nclass CC { const F = function () {}; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("8.4", "<?php\ntrait TP { public int $x = 1; } class CP { use TP; public string $x = 'a'; }\n", &["P1110 In the composition of type 'CP', properties 'CP::$x' and 'TP::$x' are not compatible."]),
+        ("8.4", "<?php\nfunction foo() { return 1; } class A1 { const Z = [1, foo()]; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("8.4", "<?php\nclass K1 { const int A = 1; } class K2 extends K1 { const string A = 'x'; }\n", &["P1102 Class constant K2::A is not compatible with K1::A."]),
+        ("8.4", "<?php\n$d = 'x'; $e = $d{0};\n", &["P1034 Array or string offset access with curly braces deprecated in PHP 7.4. Targeting PHP 8.4."]),
+        ("8.4", "<?php\n$d = 'x'; $f = \"a ${d} b\"; $g = \"a ${d['x']} b\";\n", &["P1063 Using ${} in strings is deprecated.", "P1063 Using ${} in strings is deprecated."]),
+        ("8.4", "<?php\nfunction t2(int|int $a) { return $a; }\n", &["P1065 Redundant type."]),
+        ("8.4", "<?php\n[] = [1];\n", &["P1025 Empty array destructure."]),
+        ("8.4", "<?php\nenum E1: float { case A = 1.0; }\n", &["P1051 Enum backing type must be int or string."]),
+        ("8.4", "<?php\nfunction die() {}\n", &["P1100 Defining a function named \"die\" is not allowed."]),
+        ("8.4", "<?php\nfunction exit() {}\n", &["P1100 Defining a function named \"exit\" is not allowed."]),
+        ("8.4", "<?php\nclass HS { public int $x { set(int $a, int $b) {} } }\n", &["P1074 Invalid property hook signature."]),
+        ("8.4", "<?php\nclass HU { public int $x { set => $value; } } $h = new HU(); unset($h->x);\n", &["P1076 Cannot unset hooked property HU::$x."]),
+        ("8.4", "<?php\ninterface I1 { public int $x; }\n", &["P1082 Interfaces may only contain hooked properties."]),
+        ("8.4", "<?php\nnamespace N;\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.4", "<?php\necho 1;\nnamespace Foo;\n", &["P1105 Namespace declaration must be the first statement in script or immediately after declare statement."]),
+        ("8.4", "<?php\nnamespace A { }\nnamespace B;\n", &["P1106 Cannot mix bracketed and unbracketed namespace declarations."]),
+        ("8.4", "<?php\nnamespace A { }\necho 1;\n", &["P1107 No code may exist outside of bracketed namespace."]),
+        ("8.4", "<?php\n$a = (real) 1;\n", &["P1031 '(real)' cast deprecated in PHP 7.4. Targeting PHP 8.4."]),
+        ("8.4", "<?php\nclass Iterable {}\n", &["P1023 'Iterable' is a reserved word and cannot be used to name a class, interface, trait or namespace."]),
+        ("8.4", "<?php\nreadonly class RC {} class NotRo extends RC {}\n", &["P1059 Non-readonly class cannot extend readonly class."]),
+        ("8.4", "<?php\nclass Plain {} readonly class Ro2 extends Plain {}\n", &["P1060 Readonly class cannot extend non-readonly class."]),
+        ("8.4", "<?php\nclass Readonly1 { readonly function m() {} }\n", &["P1045 Cannot use 'readonly' as method modifier."]),
+        ("8.4", "<?php\nclass P1 { public readonly int $p; } class P2 extends P1 { public int $p; }\n", &["P1061 Cannot redeclare readonly property as non-readonly."]),
+        ("8.4", "<?php\nreadonly class RC { public static int $s; }\n", &["P1058 Readonly class cannot declare static properties."]),
+        ("8.4", "<?php\nclass SV { public private(set) int $x { get => 1; } }\n", &["P1071 Cannot specify set visibility for a get only virtual property $x."]),
+        ("8.4", "<?php\n$s = 'abc'; $s[] = 'd';\n", &["P1115 Cannot use [] operator on string."]),
+        ("8.4", "<?php\n$c = 1 ? 2 : 3 ? 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.4."]),
+        ("8.4", "<?php\n$a = 1 ?: 2 ?: 3;\n$b = (1 ? 2 : 3) ? 4 : 5;\n$c = 1 ? 2 : (3 ? 4 : 5);\n$d = 1 ? (2 ? 3 : 4) : 5;\n$e = 1 ? 2 ? 3 : 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.4."]),
+        ("8.4", "<?php\nclass TC { public void $x; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("8.4", "<?php\n$b = (unset) 1;\n", &["P1032 '(unset)' cast deprecated in PHP 7.2. Targeting PHP 8.4."]),
+        ("8.4", "<?php\n$v = (void) 1;\n", &["P1022 PHP 8.5+ syntax found. Targeting PHP 8.4."]),
+        ("8.4", "<?php\nfunction t4(): void|int { return 1; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("8.0", "<?php\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.0", "<?php\nclass H3 { public static private(set) int $s; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nclass H2 { public private(set) $u; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nclass H4 { private public(set) int $t; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\n#[Attribute(Attribute::TARGET_CLASS)] class OnlyClass {} #[OnlyClass] function at() {}\n", &["P1087 Attribute \"OnlyClass\" has invalid target."]),
+        ("8.0", "<?php\nfunction r(&$x) { $x = 1; } r(1);\n", &["P1114 Only variables should be passed by reference."]),
+        ("8.0", "<?php\nclass C1 { case X; }\n", &["P1049 Enum case can only be used in an enum."]),
+        ("8.0", "<?php\nclass Ca extends Cb {} class Cb extends Ca {}\n", &["P1134 'Ca' has a circular reference.", "P1134 'Cb' has a circular reference."]),
+        ("8.0", "<?php\nclass CC { const F = function () {}; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("8.0", "<?php\ntrait TP { public int $x = 1; } class CP { use TP; public string $x = 'a'; }\n", &["P1110 In the composition of type 'CP', properties 'CP::$x' and 'TP::$x' are not compatible."]),
+        ("8.0", "<?php\nfunction foo() { return 1; } class A1 { const Z = [1, foo()]; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("8.0", "<?php\nclass K1 { const int A = 1; } class K2 extends K1 { const string A = 'x'; }\n", &["P1022 PHP 8.3+ syntax found. Targeting PHP 8.0.", "P1022 PHP 8.3+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\n$d = 'x'; $e = $d{0};\n", &["P1034 Array or string offset access with curly braces deprecated in PHP 7.4. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nfunction t2(int|int $a) { return $a; }\n", &["P1065 Redundant type."]),
+        ("8.0", "<?php\n[] = [1];\n", &["P1025 Empty array destructure."]),
+        ("8.0", "<?php\nfunction die() {}\n", &["P1100 Defining a function named \"die\" is not allowed."]),
+        ("8.0", "<?php\nfunction exit() {}\n", &["P1100 Defining a function named \"exit\" is not allowed."]),
+        ("8.0", "<?php\nclass HS { public int $x { set(int $a, int $b) {} } }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nclass HU { public int $x { set => $value; } } $h = new HU(); unset($h->x);\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0.", "P1076 Cannot unset hooked property HU::$x."]),
+        ("8.0", "<?php\ninterface I1 { public int $x; }\n", &["P1082 Interfaces may only contain hooked properties."]),
+        ("8.0", "<?php\nnamespace N;\nfunction assert($x) { return $x; }\n", &["P1100 Defining a function named \"assert\" is not allowed."]),
+        ("8.0", "<?php\necho 1;\nnamespace Foo;\n", &["P1105 Namespace declaration must be the first statement in script or immediately after declare statement."]),
+        ("8.0", "<?php\nnamespace A { }\nnamespace B;\n", &["P1106 Cannot mix bracketed and unbracketed namespace declarations."]),
+        ("8.0", "<?php\nnamespace A { }\necho 1;\n", &["P1107 No code may exist outside of bracketed namespace."]),
+        ("8.0", "<?php\nfunction t1(null $a) { return $a; }\n", &["P1064 'null' cannot be used as a standalone type."]),
+        ("8.0", "<?php\n$a = (real) 1;\n", &["P1031 '(real)' cast deprecated in PHP 7.4. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nclass Iterable {}\n", &["P1023 'Iterable' is a reserved word and cannot be used to name a class, interface, trait or namespace."]),
+        ("8.0", "<?php\nclass SV { public private(set) int $x { get => 1; } }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 8.0.", "P1022 PHP 8.4+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\n$s = 'abc'; $s[] = 'd';\n", &["P1115 Cannot use [] operator on string."]),
+        ("8.0", "<?php\n$c = 1 ? 2 : 3 ? 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.0."]),
+        ("8.0", "<?php\n$a = 1 ?: 2 ?: 3;\n$b = (1 ? 2 : 3) ? 4 : 5;\n$c = 1 ? 2 : (3 ? 4 : 5);\n$d = 1 ? (2 ? 3 : 4) : 5;\n$e = 1 ? 2 ? 3 : 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 8.0."]),
+        ("8.0", "<?php\ntrait T { const X = 1; }\n", &["P1055 Traits cannot have constants."]),
+        ("8.0", "<?php\nclass TC { public void $x; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("8.0", "<?php\n$b = (unset) 1;\n", &["P1032 '(unset)' cast deprecated in PHP 7.2. Targeting PHP 8.0."]),
+        ("8.0", "<?php\n$v = (void) 1;\n", &["P1022 PHP 8.5+ syntax found. Targeting PHP 8.0."]),
+        ("8.0", "<?php\nfunction t4(): void|int { return 1; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("7.4", "<?php\nfunction assert($x) { return $x; }\n", &["P1099 Defining a custom assert() function is deprecated."]),
+        ("7.4", "<?php\nclass H3 { public static private(set) int $s; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nclass H2 { public private(set) $u; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nclass H4 { private public(set) int $t; }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nfunction r(&$x) { $x = 1; } r(1);\n", &["P1114 Only variables should be passed by reference."]),
+        ("7.4", "<?php\nclass C1 { case X; }\n", &["P1049 Enum case can only be used in an enum."]),
+        ("7.4", "<?php\nclass Ca extends Cb {} class Cb extends Ca {}\n", &["P1134 'Ca' has a circular reference.", "P1134 'Cb' has a circular reference."]),
+        ("7.4", "<?php\nclass CC { const F = function () {}; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("7.4", "<?php\ntrait TP { public int $x = 1; } class CP { use TP; public string $x = 'a'; }\n", &["P1110 In the composition of type 'CP', properties 'CP::$x' and 'TP::$x' are not compatible."]),
+        ("7.4", "<?php\nfunction foo() { return 1; } class A1 { const Z = [1, foo()]; }\n", &["P1089 Constant expression contains invalid operations."]),
+        ("7.4", "<?php\nclass K1 { const int A = 1; } class K2 extends K1 { const string A = 'x'; }\n", &["P1022 PHP 8.3+ syntax found. Targeting PHP 7.4.", "P1022 PHP 8.3+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n$d = 'x'; $e = $d{0};\n", &["P1034 Array or string offset access with curly braces deprecated in PHP 7.4. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nfunction t2(int|int $a) { return $a; }\n", &["P1022 PHP 8.0+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n[] = [1];\n", &["P1025 Empty array destructure."]),
+        ("7.4", "<?php\nfunction die() {}\n", &["P1100 Defining a function named \"die\" is not allowed."]),
+        ("7.4", "<?php\nfunction exit() {}\n", &["P1100 Defining a function named \"exit\" is not allowed."]),
+        ("7.4", "<?php\nclass HS { public int $x { set(int $a, int $b) {} } }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nclass HU { public int $x { set => $value; } } $h = new HU(); unset($h->x);\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4.", "P1076 Cannot unset hooked property HU::$x."]),
+        ("7.4", "<?php\ninterface I1 { public int $x; }\n", &["P1082 Interfaces may only contain hooked properties."]),
+        ("7.4", "<?php\nnamespace N;\nfunction assert($x) { return $x; }\n", &["P1099 Defining a custom assert() function is deprecated."]),
+        ("7.4", "<?php\necho 1;\nnamespace Foo;\n", &["P1105 Namespace declaration must be the first statement in script or immediately after declare statement."]),
+        ("7.4", "<?php\nnamespace A { }\nnamespace B;\n", &["P1106 Cannot mix bracketed and unbracketed namespace declarations."]),
+        ("7.4", "<?php\nnamespace A { }\necho 1;\n", &["P1107 No code may exist outside of bracketed namespace."]),
+        ("7.4", "<?php\nfunction t1(null $a) { return $a; }\n", &["P1022 PHP 8.2+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n$a = (real) 1;\n", &["P1031 '(real)' cast deprecated in PHP 7.4. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nfunction t3(int|mixed $a) { return $a; }\n", &["P1022 PHP 8.0+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nclass Iterable {}\n", &["P1023 'Iterable' is a reserved word and cannot be used to name a class, interface, trait or namespace."]),
+        ("7.4", "<?php\nclass SV { public private(set) int $x { get => 1; } }\n", &["P1022 PHP 8.4+ syntax found. Targeting PHP 7.4.", "P1022 PHP 8.4+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nfunction sa(): null|false { return null; }\n", &["P1022 PHP 8.0+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n$s = 'abc'; $s[] = 'd';\n", &["P1115 Cannot use [] operator on string."]),
+        ("7.4", "<?php\n$c = 1 ? 2 : 3 ? 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n$a = 1 ?: 2 ?: 3;\n$b = (1 ? 2 : 3) ? 4 : 5;\n$c = 1 ? 2 : (3 ? 4 : 5);\n$d = 1 ? (2 ? 3 : 4) : 5;\n$e = 1 ? 2 ? 3 : 4 : 5;\n", &["P1033 Nested ternary expressions (without parentheses) deprecated in PHP 7.4. Targeting PHP 7.4."]),
+        ("7.4", "<?php\ntrait T { const X = 1; }\n", &["P1055 Traits cannot have constants."]),
+        ("7.4", "<?php\nclass TC { public void $x; }\n", &["P1048 Type 'void' cannot be used in this context."]),
+        ("7.4", "<?php\n$b = (unset) 1;\n", &["P1032 '(unset)' cast deprecated in PHP 7.2. Targeting PHP 7.4."]),
+        ("7.4", "<?php\n$v = (void) 1;\n", &["P1022 PHP 8.5+ syntax found. Targeting PHP 7.4."]),
+        ("7.4", "<?php\nfunction t4(): void|int { return 1; }\n", &["P1022 PHP 8.0+ syntax found. Targeting PHP 7.4."]),
+    ];
+    let mut failures = Vec::new();
+    let mut workspaces: std::collections::HashMap<&str, Workspace> = std::collections::HashMap::new();
+    for (version, text, expected) in cases {
+        let ws = workspaces.entry(version).or_insert_with(|| {
+            let mut ws = Workspace::new(Config { php_version: version.parse().unwrap(), ..Default::default() });
+            ws.load_stubs();
+            ws
+        });
+        let id = ws.set_file("file:///c.php", text.to_string());
+        let mut got: Vec<String> = ws
+            .diagnostics(id)
+            .into_iter()
+            .filter(|d| CODES.contains(&d.code.as_str()))
+            .map(|d| format!("{} {}", d.code.as_str(), d.message))
+            .collect();
+        got.sort();
+        if got != *expected {
+            failures.push(format!(
+                "{version} {text:?}
+  expected {expected:?}
+  got      {got:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.join(
+            "
+"
+        )
+    );
+}

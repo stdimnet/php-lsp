@@ -31,6 +31,7 @@ mod inlay_hints;
 mod line_index;
 mod links;
 mod lint;
+mod lint_compat;
 mod lint_types;
 mod navigation;
 pub mod plugins;

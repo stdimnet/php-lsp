@@ -70,6 +70,8 @@ pub struct FunctionDef {
     pub templates: Vec<TemplateTag>,
     /// The body reads its arguments dynamically (`func_get_args()`).
     pub dynamic_args: bool,
+    /// `#[\NoDiscard]`: the result must be used.
+    pub no_discard: bool,
 }
 
 impl FunctionDef {
@@ -319,6 +321,7 @@ impl Cx<'_> {
             doc,
             templates,
             dynamic_args: uses_dynamic_args(node),
+            no_discard: has_attribute(node, scope, "NoDiscard"),
         })
     }
 
@@ -531,6 +534,7 @@ impl Cx<'_> {
                     deprecated,
                     templates,
                     dynamic_args: uses_dynamic_args(node),
+                    no_discard: has_attribute(node, class_tr.scope, "NoDiscard"),
                 });
             }
             Member::Property(prop) => {
@@ -683,6 +687,7 @@ impl Cx<'_> {
                 deprecated: None,
                 templates: Vec::new(),
                 dynamic_args: false,
+                no_discard: false,
             });
         }
     }
@@ -859,6 +864,15 @@ impl TypeResolver<'_> {
             _ => Type::Mixed,
         }
     }
+}
+
+/// `node` carries the attribute `name` (resolved in `scope`).
+fn has_attribute(node: &SyntaxNode, scope: &NamespaceScope, name: &str) -> bool {
+    node.children()
+        .filter(|c| c.kind() == ATTRIBUTE_GROUP)
+        .flat_map(|g| g.children().filter(|a| a.kind() == ATTRIBUTE).collect::<Vec<_>>())
+        .filter_map(|a| a.children().find(|c| c.kind() == QUALIFIED_NAME))
+        .any(|q| scope.resolve_class(&ast::text_without_trivia(&q)).as_str().eq_ignore_ascii_case(name))
 }
 
 // ------------------------------------------------------------------ stub attributes

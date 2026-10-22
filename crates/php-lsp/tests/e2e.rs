@@ -159,7 +159,7 @@ fn php_version_from_intelephense_settings() {
     );
     c.open(uri, "<?php enum A {}\n");
     let d = c.wait_notification("textDocument/publishDiagnostics");
-    assert!(d["diagnostics"][0]["message"].as_str().unwrap().contains("enums"));
+    assert!(d["diagnostics"][0]["message"].as_str().unwrap().contains("PHP 8.1+ syntax found"));
     c.notify(
         "workspace/didChangeConfiguration",
         json!({"settings": {"intelephense.environment.phpVersion": "8.3"}}),
