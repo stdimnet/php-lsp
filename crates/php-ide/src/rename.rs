@@ -5,7 +5,7 @@ use php_syntax::{TextRange, TextSize};
 
 use crate::classify::{classify, Definition};
 use crate::completion::TextEdit;
-use crate::navigation::references;
+use crate::navigation::references_with;
 use crate::sema::Sema;
 
 /// Edits for several files.
@@ -123,10 +123,10 @@ pub(crate) fn rename(sema: &Sema, offset: TextSize, new_name: &str) -> Result<So
     }
     let old = def.search_name();
     let mut change = SourceChange::default();
-    let mut refs = references(sema, offset, true);
+    let mut refs = references_with(sema, offset, true, true);
     // in a constructor, a promoted parameter is also the property
     if let Some(param) = promoted_param(sema, &def) {
-        refs.extend(references(sema, param, true));
+        refs.extend(references_with(sema, param, true, true));
         refs.sort_by_key(|r| (r.file, r.range.start()));
         refs.dedup();
     }

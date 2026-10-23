@@ -32,5 +32,7 @@ node compare.js /path/to/project --files 150 --out report.json
 ```
 
 Expected differences: php-lsp does not report undefined members on classes
-whose ancestors are unknown (e.g. tests without `vendor/`); Intelephense
-counts string literals naming a function (`'env'`) as references.
+whose ancestors are unknown (e.g. tests without `vendor/`). Find references
+of a method or property: Intelephense misses the overrides in sibling
+classes whose files come after the file declaring the shared ancestor (its
+result depends on the file order; php-lsp reports all of them).

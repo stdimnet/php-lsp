@@ -215,6 +215,15 @@ impl Type {
             Type::SelfType => self_class.map(|c| Type::Named(c.clone(), Vec::new())),
             Type::Static => static_class.or(self_class).map(|c| Type::Named(c.clone(), Vec::new())),
             Type::Parent => parent.map(|c| Type::Named(c.clone(), Vec::new())),
+            // `static<A, B>` / `self<A, B>` from PHPDoc
+            Type::Named(n, args) if n.as_str() == "static" || n.as_str() == "self" => {
+                let class = if n.as_str() == "static" { static_class.or(self_class) } else { self_class };
+                class.map(|c| {
+                    let args =
+                        args.iter().map(|a| a.resolve_relative(self_class, static_class, parent)).collect();
+                    Type::Named(c.clone(), args)
+                })
+            }
             _ => None,
         })
     }

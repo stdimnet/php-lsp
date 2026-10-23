@@ -35,6 +35,7 @@ pub struct Index {
     classes: HashMap<String, Vec<FileId>>,
     functions: HashMap<String, Vec<FileId>>,
     constants: HashMap<String, Vec<FileId>>,
+    globals: HashMap<String, Vec<FileId>>,
 }
 
 /// A class member found through inheritance.
@@ -84,6 +85,12 @@ impl Index {
         for c in &symbols.constants {
             self.constants.entry(const_key(&c.fqn)).or_default().push(file);
         }
+        for g in &symbols.globals {
+            let ids = self.globals.entry(g.name.clone()).or_default();
+            if !ids.contains(&file) {
+                ids.push(file);
+            }
+        }
         self.files.insert(file, Entry { kind, symbols });
     }
 
@@ -105,6 +112,9 @@ impl Index {
         }
         for c in &old.symbols.constants {
             remove(&mut self.constants, const_key(&c.fqn));
+        }
+        for g in &old.symbols.globals {
+            remove(&mut self.globals, g.name.clone());
         }
     }
 
@@ -150,6 +160,22 @@ impl Index {
         for id in self.ranked(ids) {
             if let Some(e) = self.files.get(&id) {
                 out.extend(e.symbols.functions.iter().filter(|f| f.fqn.eq_ignore_case(fqn)).map(|f| (id, f)));
+            }
+        }
+        out
+    }
+
+    /// Classes assigned to the global variable `name` (without `$`) at file
+    /// level in workspace and vendor files.
+    pub fn global_variable_classes(&self, name: &str) -> Vec<Fqn> {
+        let Some(ids) = self.globals.get(name) else { return Vec::new() };
+        let mut out: Vec<Fqn> = Vec::new();
+        for id in self.ranked(ids) {
+            let Some(e) = self.files.get(&id) else { continue };
+            for g in e.symbols.globals.iter().filter(|g| g.name == name) {
+                if !out.iter().any(|c| c.eq_ignore_case(&g.class)) {
+                    out.push(g.class.clone());
+                }
             }
         }
         out

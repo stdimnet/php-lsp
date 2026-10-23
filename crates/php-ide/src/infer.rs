@@ -1011,6 +1011,7 @@ impl<'s, 'a> Infer<'s, 'a> {
                             Box::new(move || match (doc, value) {
                                 (Some(d), _) => self.doc_type(&d, &node),
                                 (None, Some(v)) => self.expr_type(&v),
+                                _ if node.kind() == GLOBAL_STMT => self.global_variable(name),
                                 _ => Type::Mixed,
                             }),
                             &mut best,
@@ -1063,12 +1064,24 @@ impl<'s, 'a> Infer<'s, 'a> {
             if let Some(t) = self.template_variable(name) {
                 return t;
             }
+            if !is_superglobal(name) {
+                let t = self.global_variable(name);
+                if !t.is_mixed() {
+                    return t;
+                }
+            }
         }
         best.map(|(_, t)| t).unwrap_or(if is_superglobal(name) {
             Type::Array(None, None)
         } else {
             Type::Mixed
         })
+    }
+
+    /// A global variable assigned `new Class` at file level in some file.
+    fn global_variable(&self, name: &str) -> Type {
+        let classes = self.sema.index().global_variable_classes(name);
+        Type::union(classes.into_iter().map(|c| Type::Named(c, Vec::new())).collect())
     }
 
     /// Variables of a template passed in by its caller (see plugins).

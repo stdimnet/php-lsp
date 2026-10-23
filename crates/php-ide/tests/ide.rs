@@ -803,6 +803,8 @@ class Collection implements IteratorAggregate {
     public function first() {}
     /** @return static<TKey, TValue> */
     public function filter() {}
+    /** @return static<int, static<int, TValue>> */
+    public function chunk() {}
     /** @var array<TKey, TValue> */
     public array $items = [];
     public function getIterator(): Traversable {}
@@ -831,6 +833,11 @@ class UserRepo extends Repo {}
     check(
         "/** @param Collection<string, User> $c */ function f($c) { $x = $c->items; $x<|>; }",
         "array<string, User>",
+    );
+    // `static<...>` keeps its arguments
+    check(
+        "/** @param Collection<string, User> $l */ function f($l) { foreach ($l->chunk() as $c) { $c<|>; } }",
+        "Collection<int, User>",
     );
 }
 
@@ -2171,4 +2178,19 @@ fn references_parity() {
     assert_eq!(refs(text), vec!["2:Foo", "3:\\App\\Foo"]);
     let text = "<?php\nnamespace Foo;\nclass Fo<|>o {}\n$a = new \\Foo\\Foo();\n";
     assert_eq!(refs(text), vec!["2:Foo", "3:\\Foo\\Foo"]);
+    // like Intelephense: string arguments naming a global function and
+    // `@see f()`, not other strings
+    let text = "<?php\n/** @see myfn() @see myfn */\nfunction my<|>fn() {}\nfunction_exists('myfn');\nadd_filter('x', \"MYFN\");\n$a = 'myfn';\nfoo('myfn' . '');\n";
+    assert_eq!(refs(text), vec!["1:myfn", "2:myfn", "3:myfn", "4:MYFN"]);
+    let text = "<?php\nnamespace App;\nfunction my<|>fn() {}\ncall_user_func('App\\myfn');\n";
+    assert_eq!(refs(text), vec!["2:myfn"]);
+    // promoted constructor parameters: the property, the parameter and
+    // `compact()` arguments
+    let text = "<?php\nclass E {\n public function __construct(private string $da<|>ta) {\n  echo $data;\n  compact('data');\n }\n function f() { return $this->data; }\n}\n";
+    assert_eq!(refs(text), vec!["2:$data", "3:$data", "4:data", "6:data"]);
+    let text = "<?php\nfunction h($da<|>ta) { return compact('data', 'x'); }\n";
+    assert_eq!(refs(text), vec!["1:$data", "1:data"]);
+    // global variables typed by `new` at file level in another file
+    let text = "//- a.php\n<?php\nclass A { function fo<|>o() {} }\nfunction g() { global $x; $x->foo(); }\n//- b.php\n<?php\n$x = new A();\n";
+    assert_eq!(refs(text), vec!["1:foo", "2:foo"]);
 }

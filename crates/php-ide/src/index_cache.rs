@@ -16,7 +16,7 @@ use php_index::FileKind;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the cached data changes shape.
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 const MAGIC: &[u8; 8] = b"PHPLSPIX";
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]

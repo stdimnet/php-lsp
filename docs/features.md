@@ -14,7 +14,7 @@ without a licence key. Features marked *extra* are not in Intelephense.
 | Go to definition / declaration | `textDocument/definition`, `declaration` | Also for strings framework plugins know (`view('home')`, `route('login')`, `config('app.name')`, hook names) |
 | Go to type definition | `textDocument/typeDefinition` | Class of the inferred type |
 | Go to implementation | `textDocument/implementation` | Implementing / extending classes, overriding methods |
-| Find references | `textDocument/references` | Overridden / implementing methods (also through traits), `@param` tags, constructors via `new`, global variables |
+| Find references | `textDocument/references` | Overridden / implementing methods (also through traits), `@param` tags, constructors via `new`, global variables, promoted constructor parameters with their property, `compact('name')`, string arguments naming a global function (`add_filter('x', 'fn')`) and `@see fn()` |
 | Document highlights | `textDocument/documentHighlight` | Read / write accesses |
 | Document symbols | `textDocument/documentSymbol` | Hierarchical outline; Blade sections / stacks / slots, Twig blocks / macros |
 | Workspace symbols | `workspace/symbol` | Fuzzy; members with `Class::member` |
@@ -35,6 +35,8 @@ without a licence key. Features marked *extra* are not in Intelephense.
   (`@template`, `@extends`, `@implements`, `@use`), array shapes,
   `list<T>`, `class-string<T>`, conditional return types, `key-of`,
   `value-of`, literal types, `@phpstan-*` / `@psalm-*` aliases.
+- Global variables: `$x = new Foo()` at file level types `global $x;`
+  and file-level uses of `$x` in other files (like Intelephense).
 - Flow analysis: assignments, `instanceof` / `is_*()` / `null` checks,
   early returns, `assert()`, `match`, `foreach` element types, `list()`
   destructuring, closures with `use`, `static` / `$this` / `self` / `parent`.

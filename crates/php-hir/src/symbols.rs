@@ -196,6 +196,18 @@ pub struct FileSymbols {
     pub classes: Vec<ClassDef>,
     pub functions: Vec<FunctionDef>,
     pub constants: Vec<ConstDef>,
+    /// `$name = new Class(...)` at file level: global variables typed in
+    /// other files (`global $name;`), like Intelephense.
+    #[serde(default)]
+    pub globals: Vec<GlobalVarDef>,
+}
+
+/// A global variable assigned a new object at file level.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GlobalVarDef {
+    /// Without `$`.
+    pub name: String,
+    pub class: Fqn,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +297,10 @@ impl Cx<'_> {
                 CONST_DECL => self.consts(&child),
                 CALL_EXPR => {
                     self.define(&child);
+                    self.walk(&child);
+                }
+                ASSIGN_EXPR => {
+                    self.global_assign(&child);
                     self.walk(&child);
                 }
                 METHOD_DECL | CLOSURE_EXPR | ARROW_FN_EXPR | ANON_CLASS | MEMBER_LIST => {}
@@ -747,6 +763,23 @@ impl Cx<'_> {
         for call in node.descendants().filter(|n| n.kind() == CALL_EXPR) {
             self.define(&call);
         }
+    }
+
+    /// `$name = new Class(...)` (only reached at file level).
+    fn global_assign(&mut self, node: &SyntaxNode) {
+        let mut parts = node.children();
+        let (Some(target), Some(value)) = (parts.next(), parts.next()) else { return };
+        if target.kind() != VARIABLE_EXPR || value.kind() != NEW_EXPR {
+            return;
+        }
+        let Some(var) = target.first_token().filter(|t| t.kind() == VARIABLE) else { return };
+        let Some(class) = value.children().find(|c| c.kind() == NAME_EXPR) else { return };
+        let name = ast::text_without_trivia(&class);
+        if matches!(name.to_ascii_lowercase().as_str(), "static" | "self" | "parent") {
+            return;
+        }
+        let class = self.scope(node).resolve_class(&name);
+        self.out.globals.push(GlobalVarDef { name: var.text()[1..].to_string(), class });
     }
 
     /// `define('NAME', value)` – names are always global or fully qualified.

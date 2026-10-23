@@ -4,8 +4,9 @@ The built-in formatter (`php-fmt`) reproduces Intelephense's output: on
 Laravel, Symfony, WordPress and PHP-Parser 97 % of the files come out
 byte-identical (`REFACTOR=1 editors/compare/compare.js`). It only changes
 whitespace: tokens are never added, removed or reordered (the one exception
-is a trailing `?>` in PHP-only files, removed like PSR-12 asks). Formatting
-twice gives the same result. A file with syntax errors is not formatted.
+is a trailing `?>` in PHP-only files, removed like PSR-12 asks), and never
+merged: `- -$x` keeps its space (Intelephense turns it into the decrement
+`--$x`). Formatting twice gives the same result. A file with syntax errors is not formatted.
 
 ## Rules
 

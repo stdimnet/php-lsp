@@ -740,6 +740,11 @@ impl TypeParser<'_> {
             }
             "key-of" | "value-of" | "int-mask" | "int-mask-of" => Type::Mixed,
             "int" | "integer" => Type::Int,
+            // `static<int, TValue>`: resolved with the receiver's class
+            // (see `Type::resolve_relative`)
+            "static" | "self" | "$this" if !args.is_empty() => {
+                Type::Named(crate::Fqn::new(if lower == "self" { "self" } else { "static" }), args)
+            }
             _ => match builtin_type(name) {
                 Some(t) => t,
                 None => match (self.resolve)(name) {

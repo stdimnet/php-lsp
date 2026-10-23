@@ -498,6 +498,22 @@ impl<'a> Formatter<'a> {
             }
             return self.anchor(c);
         }
+        // the body of an anonymous class: at the depth of the line with
+        // `new class`, also inside an argument list (Intelephense)
+        if token.kind() == L_CURLY && region.is_none() {
+            if let Some(new) = token
+                .parent()
+                .filter(|p| p.kind() == MEMBER_LIST)
+                .and_then(|m| m.parent())
+                .filter(|a| a.kind() == ANON_CLASS)
+                .and_then(|a| a.parent())
+            {
+                let line = self.line_of(new.text_range().start());
+                if line < self.line_of(pos) {
+                    return self.depth_of_line(line);
+                }
+            }
+        }
         let inner = self
             .containers
             .iter()
@@ -525,25 +541,78 @@ impl<'a> Formatter<'a> {
             };
             // the previous token is directly in a `case` body
             let prev_in_case = Self::prev_significant(token).is_some_and(|p| {
+                if p.kind() == L_CURLY {
+                    return false;
+                }
                 let at = p.text_range().start();
+                // (a `}` belongs to the container around the block it closes)
                 self.containers
                     .iter()
-                    .filter(|c| c.open_end <= at && at <= c.close)
+                    .filter(|c| c.open_end <= at && (at < c.close || at == c.close && p.kind() != R_CURLY))
                     .max_by_key(|c| c.open)
                     .is_some_and(|c| c.open_kind == COLON)
             });
-            if prev_in_case && next_sig.is_some_and(|n| matches!(n.kind(), CASE_KW | DEFAULT_KW | R_CURLY)) {
-                return base + 1;
+            let before_case = next_sig.is_some_and(|n| {
+                matches!(n.kind(), CASE_KW | DEFAULT_KW | ENDSWITCH_KW)
+                    || n.kind() == R_CURLY && n.parent().is_some_and(|p| p.kind() == SWITCH_BODY)
+            });
+            if before_case {
+                let prev = Self::prev_significant(token);
+                // an empty `case 1:` body
+                let empty_case = prev.as_ref().is_some_and(|p| {
+                    p.kind() == COLON
+                        && p.parent().is_some_and(|c| matches!(c.kind(), CASE_CLAUSE | DEFAULT_CLAUSE))
+                });
+                // after `break;` Intelephense goes back to the `case` level
+                let after_break = prev.as_ref().is_some_and(|p| {
+                    p.kind() == SEMICOLON && p.parent().is_some_and(|s| s.kind() == BREAK_STMT)
+                });
+                if empty_case || prev_in_case && !after_break {
+                    return base + 1;
+                }
             }
         }
         if !self.is_continuation(token) {
             return base;
         }
         let Some(c) = inner.filter(|c| matches!(c.open_kind, L_PAREN | L_BRACK)) else { return base + 1 };
+        // a method chain: one level deeper than its receiver if that starts
+        // a line, else at the level of the enclosing list
         if matches!(token.kind(), ARROW | NULLSAFE_ARROW) {
+            if let Some(first) = token.parent().and_then(|chain| chain.first_token()) {
+                let line = self.line_of(first.text_range().start());
+                if line < self.line_of(pos) {
+                    return if self.starts_line(&first) { self.depth_of_line(line) + 1 } else { base };
+                }
+            }
             return base + 1;
         }
         let open = self.root.covering_element(TextRange::at(c.open, 1.into())).into_token();
+        // `if ((a\n && b) ...`: a group opened on the line of the condition's
+        // `(` is one level deeper (the condition's content is indented)
+        if open.as_ref().is_some_and(|o| o.parent().is_some_and(|p| p.kind() == PAREN_EXPR)) {
+            let outer = self
+                .containers
+                .iter()
+                .filter(|o| o.open < c.open && o.open_end <= pos && pos < o.close)
+                .max_by_key(|o| o.open);
+            let mut first = open.as_ref().and_then(|o| o.next_token());
+            while let Some(t) =
+                first.as_ref().filter(|t| matches!(t.kind(), WHITESPACE | COMMENT | DOC_COMMENT))
+            {
+                first = t.next_token();
+            }
+            let same_line = first.is_some_and(|f| self.line_of(f.text_range().start()) == c.open_line);
+            if let Some(outer) =
+                outer.filter(|o| o.open_kind == L_PAREN && o.open_line == c.open_line && same_line)
+            {
+                let tok = self.root.covering_element(TextRange::at(outer.open, 1.into())).into_token();
+                if tok.is_some_and(|t| t.parent().and_then(|stmt| condition_open(&stmt)).as_ref() == Some(&t))
+                {
+                    return base + 1;
+                }
+            }
+        }
         // inside a condition's (...) only method chains get an extra level
         if open.as_ref().is_some_and(|o| {
             o.parent().is_some_and(|p| p.kind() == PAREN_EXPR)
@@ -568,12 +637,34 @@ impl<'a> Formatter<'a> {
 
     /// The depth of the line opening container `c`.
     fn anchor(&self, c: &Container) -> usize {
+        // the block of a statement whose header spans lines (`if ($a ||\n
+        // $b) {`): the depth of the statement's first line
+        if c.open_kind == L_CURLY && !self.template {
+            let brace = self.root.covering_element(TextRange::at(c.open, 1.into())).into_token();
+            let stmt = brace.filter(is_block).and_then(|b| b.parent()).and_then(|b| b.parent()).filter(|s| {
+                matches!(
+                    s.kind(),
+                    IF_STMT | ELSE_IF_CLAUSE | WHILE_STMT | FOR_STMT | FOREACH_STMT | SWITCH_STMT
+                )
+            });
+            if let Some(first) = stmt.and_then(|s| s.first_token()) {
+                let line = self.line_of(first.text_range().start());
+                if line < c.open_line && self.starts_line(&first) {
+                    return self.depth_of_line(line);
+                }
+            }
+        }
         if self.template {
             let first = self.line_tokens[c.open_line].as_ref();
             if first
                 .is_none_or(|t| matches!(t.kind(), INLINE_HTML | OPEN_TAG | OPEN_TAG_WITH_ECHO | CLOSE_TAG))
             {
-                return self.region_base_at(c.open);
+                // the level in the region where the container opens (after
+                // lists closed by the region, e.g. `<?php elseif (...):`)
+                return match self.region_of(c.open) {
+                    Some(r) => self.region_base_after(r, c.open),
+                    None => 0,
+                };
             }
         }
         self.depth_of_line(c.open_line)
@@ -600,7 +691,7 @@ impl<'a> Formatter<'a> {
         let list = self
             .containers
             .iter()
-            .filter(|c| c.open_end <= open && open < c.close && self.is_statement_list(c))
+            .filter(|c| c.open_end <= open && open <= c.close && self.is_statement_list(c))
             .max_by_key(|c| c.open)
             .map_or(0, |c| self.anchor(c) + 1);
         let base = column.max(list);
@@ -616,7 +707,7 @@ impl<'a> Formatter<'a> {
         let closed = self
             .containers
             .iter()
-            .filter(|c| c.open_end <= open && open < c.close && c.close <= pos && self.is_statement_list(c))
+            .filter(|c| c.open_end <= open && open <= c.close && c.close <= pos && self.is_statement_list(c))
             .count();
         self.region_base(r).saturating_sub(closed)
     }
@@ -679,6 +770,10 @@ impl<'a> Formatter<'a> {
         {
             return false;
         }
+        // `foreach (...\n as $x)`
+        if token.kind() == AS_KW && token.parent().is_some_and(|p| p.kind() == FOREACH_STMT) {
+            return false;
+        }
         let Some(prev) = Self::prev_significant(token) else { return false };
         // lists without delimiters: `use A,\n B;`, `implements A,\n B`
         if prev.kind() == COMMA {
@@ -691,7 +786,6 @@ impl<'a> Formatter<'a> {
                         | USE_DECL
                         | GLOBAL_STMT
                         | STATIC_STMT
-                        | ECHO_STMT
                         | CONST_DECL
                         | CLASS_CONST_DECL
                         | PROPERTY_DECL
@@ -707,8 +801,9 @@ impl<'a> Formatter<'a> {
                 .is_some_and(|p| matches!(p.kind(), TERNARY_EXPR | RETURN_TYPE | ARG | ENUM_BACKING_TYPE)),
             // attributes before declarations
             R_BRACK => !prev.parent().is_some_and(|p| p.kind() == ATTRIBUTE_GROUP),
-            // `'key' =>\n'value'`
-            FAT_ARROW => !prev.parent().is_some_and(|p| p.kind() == ARRAY_ELEMENT),
+            // `'key' =>\n'value'`, `foreach ($a as $k =>\n$v)`
+            FAT_ARROW => !prev.parent().is_some_and(|p| matches!(p.kind(), ARRAY_ELEMENT | FOREACH_STMT)),
+            AS_KW if prev.parent().is_some_and(|p| p.kind() == FOREACH_STMT) => false,
             // `else` / `do` without braces: the statement is indented
             _ => true,
         }
@@ -763,8 +858,7 @@ impl<'a> Formatter<'a> {
                 }
             }
             // block comments other than doc comments are kept as written
-            // (and `/**#@+` marker comments)
-            if t.kind() == DOC_COMMENT && t.text()[3..].starts_with(char::is_whitespace) {
+            if is_doc_like(t) && t.text().len() > 4 {
                 self.reindent_comment(t);
             }
             prev = Some(t.clone());
@@ -838,6 +932,19 @@ impl<'a> Formatter<'a> {
 
     /// The whitespace between `prev` and `next`; `None` keeps the original.
     fn separator(&self, prev: &SyntaxToken, next: &SyntaxToken, original: &str) -> Option<String> {
+        // Intelephense leaves comments on their own lines before a doc
+        // comment where they are
+        if next.kind() == COMMENT && original.contains('\n') {
+            let mut t = next.next_token();
+            while let Some(tok) =
+                t.as_ref().filter(|t| t.kind() == WHITESPACE || t.kind() == COMMENT && !is_doc_like(t))
+            {
+                t = tok.next_token();
+            }
+            if t.is_some_and(|t| is_doc_like(&t)) && !is_doc_like(next) {
+                return None;
+            }
+        }
         if prev.kind() == OPEN_TAG {
             // `<?php` already contains one whitespace character
             let newlines = original.matches('\n').count();
@@ -885,7 +992,22 @@ impl<'a> Formatter<'a> {
         if next.kind() == SEMICOLON
             && !matches!(prev.kind(), COMMENT | DOC_COMMENT)
             && next.parent().is_some_and(|p| p.first_token().as_ref() != Some(next) && p.kind() != FOR_STMT)
-            && !(newlines > 0 && next.parent().is_some_and(|p| is_variable_call_chain(&p)))
+            && !(newlines > 0 && next.parent().is_some_and(|p| is_member_chain(&p)))
+        {
+            return Some(String::new());
+        }
+        // `<<<A\n...\nA\n)` -> `A)` (Intelephense; valid since PHP 7.3)
+        if prev.kind() == HEREDOC_END
+            && next.kind() == R_PAREN
+            && heredoc_end_unindented(prev)
+            && self.opts.php_version >= PhpVersion::PHP_7_3
+            && !heredoc_is_argument(prev)
+        {
+            return Some(String::new());
+        }
+        // empty lists spanning lines: `array(\n)` -> `array()`
+        if matches!((prev.kind(), next.kind()), (L_PAREN, R_PAREN) | (L_BRACK, R_BRACK))
+            && prev.parent() == next.parent()
         {
             return Some(String::new());
         }
@@ -913,6 +1035,7 @@ impl<'a> Formatter<'a> {
         if prev.kind() == R_CURLY
             && matches!(next.kind(), ELSE_KW | ELSEIF_KW | CATCH_KW | FINALLY_KW)
             && self.opts.braces != BraceStyle::Allman
+            && closes_clause_body(prev, next)
         {
             return Some(" ".into());
         }
@@ -941,9 +1064,11 @@ impl<'a> Formatter<'a> {
         if prev.kind() == COMMENT || prev.kind() == DOC_COMMENT {
             return Some(if original.is_empty() { String::new() } else { " ".into() });
         }
-        // spaces beyond the required one (alignment) are kept
-        let keep =
-            !original.is_empty() && !(next.kind() == L_PAREN && CONTROL_KEYWORDS.contains(&prev.kind()));
+        // spaces beyond the required one (alignment) are kept, not after a
+        // prefix operator (`!  $a` -> `! $a`)
+        let keep = !original.is_empty()
+            && !(next.kind() == L_PAREN && CONTROL_KEYWORDS.contains(&prev.kind()))
+            && !is_prefix_op(prev);
         Some(match self.spaces(prev, next, original) {
             Some(0) => String::new(),
             _ if keep => original.to_string(),
@@ -953,7 +1078,8 @@ impl<'a> Formatter<'a> {
     }
 
     fn list_layout(&self, list: &SyntaxNode) -> ListLayout {
-        if !matches!(list.kind(), ARG_LIST | PARAM_LIST | ARRAY_EXPR | LIST_EXPR | MATCH_EXPR) {
+        if !matches!(list.kind(), ARG_LIST | PARAM_LIST | ARRAY_EXPR | LIST_EXPR | MATCH_EXPR | FOREACH_STMT)
+        {
             return None;
         }
         if let Some(l) = self.lists.borrow().get(&list.text_range()) {
@@ -1012,11 +1138,24 @@ impl<'a> Formatter<'a> {
                 return 0;
             }
             if a.parent() == b.parent() {
-                let blank = matches!(b.kind(), NAMESPACE_DECL)
-                    || a.kind() == NAMESPACE_DECL && prev.kind() == SEMICOLON
-                    || a.kind() == DECLARE_STMT && prev.kind() == SEMICOLON
-                    || (a.kind() == USE_DECL) != (b.kind() == USE_DECL);
-                return if blank { 2 } else { 1 };
+                return if blank_between(&a, &b, prev) { 2 } else { 1 };
+            }
+        }
+        // a block comment does not count: `use A;\n/* c */\n\nclass B`
+        if prev.kind() == COMMENT && prev.text().starts_with("/*") {
+            if let (Some(before), Some(b)) = (Self::prev_significant(prev), statement_starting(next)) {
+                // (a doc comment in between already got the blank line)
+                let mut t = before.next_token();
+                let mut doc = false;
+                while let Some(tok) = t.filter(|t| t != next) {
+                    doc |= is_doc_like(&tok);
+                    t = tok.next_token();
+                }
+                if let Some(a) = statement_ending(&before).filter(|_| !doc) {
+                    if a.parent() == b.parent() && a.kind() != b.kind() && blank_between(&a, &b, &before) {
+                        return 2;
+                    }
+                }
             }
         }
         // the `use` block ends before a doc comment
@@ -1197,6 +1336,18 @@ impl<'a> Formatter<'a> {
             };
         }
         if pp == Some(PREFIX_EXPR) && is_prefix_op(prev) {
+            // `- -$x` must not become `--$x`
+            if matches!((p, n), (MINUS, MINUS | MINUS2) | (PLUS, PLUS | PLUS2)) {
+                return Some(1);
+            }
+            // Intelephense: `- ($a)`, `+ ($a)`
+            if matches!(p, MINUS | PLUS) && n == L_PAREN {
+                return Some(1);
+            }
+            return Some(0);
+        }
+        // `clone($a)` (Intelephense)
+        if p == CLONE_KW && n == L_PAREN {
             return Some(0);
         }
         if (p == DOT && pp == Some(BIN_EXPR)) || (n == DOT && np == Some(BIN_EXPR)) {
@@ -1259,10 +1410,11 @@ impl<'a> Formatter<'a> {
         if n == COLON {
             return Some(match np {
                 Some(RETURN_TYPE | ENUM_BACKING_TYPE | ARG | LABEL_STMT | CASE_CLAUSE | DEFAULT_CLAUSE) => 0,
-                // alternative syntax `if (...):` keeps its style
+                // `switch (...):` (Intelephense), the others keep their style
+                Some(SWITCH_BODY) => 0,
                 Some(
-                    STMT_LIST | SWITCH_BODY | ELSE_IF_CLAUSE | ELSE_CLAUSE | IF_STMT | WHILE_STMT | FOR_STMT
-                    | FOREACH_STMT | DECLARE_STMT,
+                    STMT_LIST | ELSE_IF_CLAUSE | ELSE_CLAUSE | IF_STMT | WHILE_STMT | FOR_STMT | FOREACH_STMT
+                    | DECLARE_STMT,
                 ) => return None,
                 Some(TERNARY_EXPR) if p == QUESTION => 0,
                 Some(TERNARY_EXPR) => 1,
@@ -1330,18 +1482,21 @@ fn top_level_newline(open: &SyntaxToken, close: &SyntaxToken) -> bool {
 
 /// `$x->a()\n    ->b()\n;`: a statement calling a chain of methods on a
 /// variable, which keeps its `;` on its own line.
-fn is_variable_call_chain(stmt: &SyntaxNode) -> bool {
-    if stmt.kind() != EXPR_STMT {
-        return false;
-    }
-    let Some(mut e) = stmt.first_child() else { return false };
-    let mut calls = 0;
-    while e.kind() == METHOD_CALL_EXPR {
-        calls += 1;
+fn is_member_chain(stmt: &SyntaxNode) -> bool {
+    // Intelephense keeps the `;` of a chain of two or more member accesses
+    // (an expression statement or `return`)
+    let first = match stmt.kind() {
+        EXPR_STMT | RETURN_STMT => stmt.first_child(),
+        _ => None,
+    };
+    let Some(mut e) = first else { return false };
+    let mut accesses = 0;
+    while matches!(e.kind(), METHOD_CALL_EXPR | PROPERTY_FETCH_EXPR) {
+        accesses += 1;
         let Some(receiver) = e.first_child() else { return false };
         e = receiver;
     }
-    calls >= 2 && e.kind() == VARIABLE_EXPR
+    accesses >= 2
 }
 
 fn newlines_in(text: &str, prev: &SyntaxToken, next: &SyntaxToken) -> usize {
@@ -1367,6 +1522,21 @@ fn statement_starting(token: &SyntaxToken) -> Option<SyntaxNode> {
         .parent_ancestors()
         .take_while(|n| n.first_token().as_ref() == Some(token))
         .find(|n| n.parent().is_some_and(|p| is_statement_list(p.kind())))
+}
+
+/// A doc comment, or a `/**#@+` marker comment (PHP lexes it as a plain
+/// comment, Intelephense formats it like a doc comment).
+fn is_doc_like(t: &SyntaxToken) -> bool {
+    t.kind() == DOC_COMMENT || t.kind() == COMMENT && t.text().starts_with("/**")
+}
+
+/// A blank line between the statements `a` (ending with `last`) and `b`:
+/// around `namespace`, `declare(...);` and the `use` block.
+fn blank_between(a: &SyntaxNode, b: &SyntaxNode, last: &SyntaxToken) -> bool {
+    matches!(b.kind(), NAMESPACE_DECL)
+        || a.kind() == NAMESPACE_DECL && last.kind() == SEMICOLON
+        || a.kind() == DECLARE_STMT && last.kind() == SEMICOLON
+        || (a.kind() == USE_DECL) != (b.kind() == USE_DECL)
 }
 
 /// Whether this `{` / `}` delimits a statement block or a class body.
@@ -1411,6 +1581,8 @@ fn list_delimiters(list: &SyntaxNode) -> Option<(SyntaxToken, SyntaxToken)> {
             (first.kind(), closer_of(first.kind()))
         }
         MATCH_EXPR => (L_CURLY, R_CURLY),
+        // the header `foreach (... as ...)`
+        FOREACH_STMT => (L_PAREN, R_PAREN),
         _ => return None,
     };
     let tokens: Vec<SyntaxToken> = list.children_with_tokens().filter_map(|e| e.into_token()).collect();
@@ -1426,6 +1598,11 @@ fn list_expands(text: &str, list: &SyntaxNode, open: &SyntaxToken, close: &Synta
         return true;
     }
     let inner = TextRange::new(open.text_range().end(), close.text_range().start());
+    // Intelephense: a `foreach` header spanning lines gets `(` and `)` on
+    // lines of their own
+    if list.kind() == FOREACH_STMT {
+        return text[inner].contains('\n');
+    }
     let elements: Vec<SyntaxNode> =
         list.children().filter(|c| inner.contains_range(c.text_range())).collect();
     if elements.is_empty() {
@@ -1441,7 +1618,24 @@ fn list_expands(text: &str, list: &SyntaxNode, open: &SyntaxToken, close: &Synta
         }
         from = e.text_range().end();
     }
+    // the line break after a heredoc's end does not count (it goes away)
+    let last = elements.last().and_then(|e| e.last_token());
+    if last.is_some_and(|t| t.kind() == HEREDOC_END && heredoc_end_unindented(&t) && !heredoc_is_argument(&t))
+    {
+        return false;
+    }
     gap(from, close.text_range().start())
+}
+
+/// The heredoc ending at `end` is a whole call argument (`f(<<<A ...`);
+/// Intelephense then puts it on a line of its own.
+fn heredoc_is_argument(end: &SyntaxToken) -> bool {
+    end.parent().and_then(|h| h.parent()).is_some_and(|p| p.kind() == ARG)
+}
+
+/// The closing label of a heredoc / nowdoc is not indented.
+fn heredoc_end_unindented(end: &SyntaxToken) -> bool {
+    !end.text().starts_with([' ', '\t'])
 }
 
 /// The `(` of a control structure's condition.
@@ -1460,6 +1654,17 @@ fn condition_close(stmt: &SyntaxNode, open: &SyntaxToken) -> Option<SyntaxToken>
     stmt.children_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == R_PAREN && t.text_range().start() >= open.text_range().end())
+}
+
+/// `}` ends the body of the statement `next` (`else`, `catch`, ...)
+/// continues, not e.g. a function declared in an `if (...) :` block.
+fn closes_clause_body(close: &SyntaxToken, next: &SyntaxToken) -> bool {
+    let (Some(owner), Some(stmt)) =
+        (close.parent().and_then(|b| b.parent()), next.parent().and_then(|c| c.parent()))
+    else {
+        return false;
+    };
+    owner == stmt || owner.parent().as_ref() == Some(&stmt)
 }
 
 fn is_prefix_op(t: &SyntaxToken) -> bool {
@@ -1529,6 +1734,33 @@ mod tests {
         assert_eq!(fmt(input), input);
         assert_eq!(format("<?php function (", &FormatOptions::default()), Err(FormatError::SyntaxErrors));
     }
+    /// Cases checked against Intelephense: anonymous class bodies and
+    /// method chains in argument lists, groups in conditions, the
+    /// alternative syntax.
+    #[test]
+    fn continuation_cases_like_intelephense() {
+        let cases: &[(&str, &str)] = &[
+            ("<?php\nfunction f() {\n    $app->instance('x', new class($called)\n    {\n        public function a()\n        {\n            return 1;\n        }\n    });\n    $s = (new class extends M\n    {\n        public function b() {}\n    })->owner();\n    foo(new class {\n        public $x;\n    });\n    foo(\n        new class\n        {\n            public $x;\n        }\n    );\n    $x = new class\n    {\n        public $y;\n    };\n}\n", "<?php\nfunction f()\n{\n    $app->instance('x', new class($called)\n    {\n        public function a()\n        {\n            return 1;\n        }\n    });\n    $s = (new class extends M\n    {\n        public function b() {}\n    })->owner();\n    foo(new class {\n        public $x;\n    });\n    foo(\n        new class\n        {\n            public $x;\n        }\n    );\n    $x = new class\n    {\n        public $y;\n    };\n}\n"),
+            ("<?php\n$r->header('Link', (new Collection($a))\n    ->when($limit, fn($assets) => $assets)\n    ->join(', '), false);\n", "<?php\n$r->header('Link', (new Collection($a))\n    ->when($limit, fn($assets) => $assets)\n    ->join(', '), false);\n"),
+            ("<?php\n$r->header('Link', $c\n    ->when($limit)\n    ->join(', '), false);\n", "<?php\n$r->header('Link', $c\n    ->when($limit)\n    ->join(', '), false);\n"),
+            ("<?php\nreturn (new Collection($e))\n    ->flatMap(fn($x) => (new Collection($m))\n        ->map(fn($i) => $i)\n        ->filter(fn($c) => $c))\n    ->all();\n", "<?php\nreturn (new Collection($e))\n    ->flatMap(fn($x) => (new Collection($m))\n        ->map(fn($i) => $i)\n        ->filter(fn($c) => $c))\n    ->all();\n"),
+            ("<?php\nreturn $e\n    ->flatMap(fn($x) => $m\n        ->map(fn($i) => $i))\n    ->all();\n", "<?php\nreturn $e\n    ->flatMap(fn($x) => $m\n        ->map(fn($i) => $i))\n    ->all();\n"),
+            ("<?php\n$a = $f->x()\n    ->addStmt($factory->method('a')\n        ->makeProtected()\n        ->addParam($p))\n    ->getNode();\n", "<?php\n$a = $f->x()\n    ->addStmt($factory->method('a')\n        ->makeProtected()\n        ->addParam($p))\n    ->getNode();\n"),
+            ("<?php\nfoo($factory->method('a')\n    ->makeProtected()\n    ->addParam($p));\n", "<?php\nfoo($factory->method('a')\n    ->makeProtected()\n    ->addParam($p));\n"),
+            ("<?php\nfoo((new A())\n    ->makeProtected());\n", "<?php\nfoo((new A())\n    ->makeProtected());\n"),
+            ("<?php\nif ((! $this->hasOption('force') ||\n     ! $this->option('force')) &&\n     $this->alreadyExists($this->getNameInput())) {\n    x();\n}\n", "<?php\nif ((! $this->hasOption('force') ||\n        ! $this->option('force')) &&\n    $this->alreadyExists($this->getNameInput())\n) {\n    x();\n}\n"),
+            ("<?php\nif ( ( is_taxonomy_hierarchical( $this->taxonomy )\n\t\t&& ! current_user_can( $taxonomy_obj->cap->edit_terms ) )\n\t|| ( ! is_taxonomy_hierarchical( $this->taxonomy )\n\t\t&& ! current_user_can( $taxonomy_obj->cap->assign_terms ) ) ) {\n\treturn 1;\n}\n", "<?php\nif ((is_taxonomy_hierarchical($this->taxonomy)\n        && ! current_user_can($taxonomy_obj->cap->edit_terms))\n    || (! is_taxonomy_hierarchical($this->taxonomy)\n        && ! current_user_can($taxonomy_obj->cap->assign_terms))\n) {\n    return 1;\n}\n"),
+            ("<?php\nif (($a\n    && $b)\n    || ($c\n    && $d)) {\n}\n", "<?php\nif (($a\n        && $b)\n    || ($c\n        && $d)\n) {\n}\n"),
+            ("<?php\n$x = ($a\n    && $b)\n    || ($c\n        && $d);\n", "<?php\n$x = ($a\n    && $b)\n    || ($c\n        && $d);\n"),
+            ("<?php\nfoo(($a\n    && $b), 1);\n", "<?php\nfoo(($a\n    && $b), 1);\n"),
+            ("<?php\nif ((($idx >= 0 && $idx < $this->actionTableSize && $this->actionCheck[$idx] === $symbol)\n     || ($state < $this->YY2TBLSTATE\n         && ($idx = $this->actionBase[$state + $this->numNonLeafStates] + $symbol) >= 0\n         && $idx < $this->actionTableSize && $this->actionCheck[$idx] === $symbol))\n    && ($action = $this->action[$idx]) !== $this->defaultAction) {\n    x();\n}\n", "<?php\nif ((($idx >= 0 && $idx < $this->actionTableSize && $this->actionCheck[$idx] === $symbol)\n        || ($state < $this->YY2TBLSTATE\n            && ($idx = $this->actionBase[$state + $this->numNonLeafStates] + $symbol) >= 0\n            && $idx < $this->actionTableSize && $this->actionCheck[$idx] === $symbol))\n    && ($action = $this->action[$idx]) !== $this->defaultAction\n) {\n    x();\n}\n"),
+            ("<?php\nif ( $a ) :\n    function f() {\n        return 1;\n    }\n\nelse :\n    function g() {\n    }\nendif;\n", "<?php\nif ($a) :\n    function f()\n    {\n        return 1;\n    }\n\nelse :\n    function g() {}\nendif;\n"),
+            ("<?php\nswitch ( $a ) :\n    case 1:\n        break;\nendswitch;\n", "<?php\nswitch ($a):\n    case 1:\n        break;\nendswitch;\n"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&fmt(input), expected, "input: {input}");
+        }
+    }
     /// Templates: Intelephense's output (js-beautify for the HTML, PHP
     /// indented from its `<?php`).
     #[test]
@@ -1543,6 +1775,8 @@ mod tests {
         ("<p><?php echo 1;?> <?php   echo 2 ?> <?=$x?> <?= $y; ?></p>\n", "<p><?php echo 1; ?> <?php echo 2 ?> <?= $x ?> <?= $y; ?></p>"),
         ("<?php\nif ($a) {\n?>\n<p>x</p>\n<?php\nfoo();\n}\n?>\n", "<?php\nif ($a) {\n?>\n    <p>x</p>\n<?php\n    foo();\n}\n?>"),
         ("<?php\nfunction f() {\n?>\n<div>\n<span>a</span>\n</div>\n<?php\n}\n", "<?php\nfunction f()\n{\n?>\n    <div>\n        <span>a</span>\n    </div>\n<?php\n}\n"),
+        ("<div>\n\t<div>\n\t\t<?php\n\t\tif ( $a ) :\n\t\t\t?>\n\t\t\t<h1>x</h1>\n\t\t<?php elseif ( $b ) : ?>\n\t\t\t<p>y</p>\n\t\t\t<?php\n\t\tendif;\n\n\t\t$d = 1;\n\t\t?>\n\t</div>\n</div>\n", "<div>\n    <div>\n        <?php\n        if ($a) :\n        ?>\n            <h1>x</h1>\n        <?php elseif ($b) : ?>\n            <p>y</p>\n        <?php\n        endif;\n\n        $d = 1;\n        ?>\n    </div>\n</div>"),
+        ("<?php\nfunction wp_dashboard_recent_comments_row( &$comment, $show_date = true ) {\n\t?>\n\n\n\n\t\t\t<?php if ( ! $comment->comment_type || 'comment' === $comment->comment_type ) : ?>\n\n\t\t\t<div class=\"dashboard-comment-wrap has-row-actions <?php echo $comment_row_class; ?>\">\n\t\t\t<p class=\"comment-meta\">\n\t\t\t</p>\n\n\t\t\t\t<?php\n\t\t\telse :\n\t\t\t\tswitch ( $comment->comment_type ) {\n\t\t\t\t\tcase 'pingback':\n\t\t\t\t\t\t$type = __( 'Pingback' );\n\t\t\t\t\t\tbreak;\n\t\t\t\t\tcase 'trackback':\n\t\t\t\t\t\t$type = __( 'Trackback' );\n\t\t\t\t\t\tbreak;\n\t\t\t\t\tdefault:\n\t\t\t\t\t\t$type = ucwords( $comment->comment_type );\n\t\t\t\t}\n\t\t\t\t$type = esc_html( $type );\n\t\t\t\t?>\n\t\t\t<div class=\"dashboard-comment-wrap has-row-actions\">\n\t\t\t<p class=\"comment-meta\">\n\t\t\t\t<?php\n\t\t\t\t// Pingbacks, Trackbacks or custom comment types might not have a post they relate to, e.g. programmatically created ones.\n\t\t\t\tif ( $comment_post_link ) {\n\t\t\t\t\tprintf(\n\t\t\t\t\t\t/* translators: 1: Type of comment, 2: Post link, 3: Notification if the comment is pending. */\n\t\t\t\t\t\t_x( '%1$s on %2$s %3$s', 'dashboard' ),\n\t\t\t\t\t\t\"<strong>$type</strong>\",\n\t\t\t\t\t\t$comment_post_link,\n\t\t\t\t\t\t'<span class=\"approve\">' . __( '[Pending]' ) . '</span>'\n\t\t\t\t\t);\n\t\t\t\t} else {\n\t\t\t\t\tprintf(\n\t\t\t\t\t\t/* translators: 1: Type of comment, 2: Notification if the comment is pending. */\n\t\t\t\t\t\t_x( '%1$s %2$s', 'dashboard' ),\n\t\t\t\t\t\t\"<strong>$type</strong>\",\n\t\t\t\t\t\t'<span class=\"approve\">' . __( '[Pending]' ) . '</span>'\n\t\t\t\t\t);\n\t\t\t\t}\n\t\t\t\t?>\n\t\t\t</p>\n\t\t\t<p class=\"comment-author\"><?php comment_author_link( $comment ); ?></p>\n\n\t\t\t<?php endif; // comment_type ?>\n\t\t\t<blockquote><p><?php comment_excerpt( $comment ); ?></p></blockquote>\n\t\t\t<?php if ( $actions_string ) : ?>\n\t\t\t<p class=\"row-actions\"><?php echo $actions_string; ?></p>\n\t\t\t<?php endif; ?>\n\t\t\t</div>\n\t\t</li>\n\t<?php\n\t$GLOBALS['comment'] = null;\n}\n", "<?php\nfunction wp_dashboard_recent_comments_row(&$comment, $show_date = true)\n{\n?>\n\n\n\n    <?php if (! $comment->comment_type || 'comment' === $comment->comment_type) : ?>\n\n        <div class=\"dashboard-comment-wrap has-row-actions <?php echo $comment_row_class; ?>\">\n            <p class=\"comment-meta\">\n            </p>\n\n        <?php\n    else :\n        switch ($comment->comment_type) {\n            case 'pingback':\n                $type = __('Pingback');\n                break;\n            case 'trackback':\n                $type = __('Trackback');\n                break;\n            default:\n                $type = ucwords($comment->comment_type);\n        }\n        $type = esc_html($type);\n        ?>\n            <div class=\"dashboard-comment-wrap has-row-actions\">\n                <p class=\"comment-meta\">\n                    <?php\n                    // Pingbacks, Trackbacks or custom comment types might not have a post they relate to, e.g. programmatically created ones.\n                    if ($comment_post_link) {\n                        printf(\n                            /* translators: 1: Type of comment, 2: Post link, 3: Notification if the comment is pending. */\n                            _x('%1$s on %2$s %3$s', 'dashboard'),\n                            \"<strong>$type</strong>\",\n                            $comment_post_link,\n                            '<span class=\"approve\">' . __('[Pending]') . '</span>'\n                        );\n                    } else {\n                        printf(\n                            /* translators: 1: Type of comment, 2: Notification if the comment is pending. */\n                            _x('%1$s %2$s', 'dashboard'),\n                            \"<strong>$type</strong>\",\n                            '<span class=\"approve\">' . __('[Pending]') . '</span>'\n                        );\n                    }\n                    ?>\n                </p>\n                <p class=\"comment-author\"><?php comment_author_link($comment); ?></p>\n\n            <?php endif; // comment_type \n            ?>\n            <blockquote>\n                <p><?php comment_excerpt($comment); ?></p>\n            </blockquote>\n            <?php if ($actions_string) : ?>\n                <p class=\"row-actions\"><?php echo $actions_string; ?></p>\n            <?php endif; ?>\n            </div>\n            </li>\n        <?php\n        $GLOBALS['comment'] = null;\n    }\n"),
         ];
         for (input, expected) in cases {
             assert_eq!(&fmt(input), expected, "input: {input}");

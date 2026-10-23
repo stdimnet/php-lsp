@@ -391,7 +391,27 @@ fn file_references_of(
     let mut out = Vec::new();
     let is_class = matches!(def, Definition::Class(_));
     let variable = matches!(def, Definition::Variable { .. });
+    let function = match def {
+        Definition::Function(f) => Some(f),
+        _ => None,
+    };
     for token in root.descendants_with_tokens().filter_map(|e| e.into_token()) {
+        // like Intelephense: a string argument naming the function
+        // (`function_exists('f')`, `add_filter('x', 'f')`) and `@see f()`
+        if let Some(fqn) = function {
+            if token.kind() == STRING {
+                if let Some(range) = function_string_ref(&token, fqn) {
+                    out.push(Reference { file: sema.file, range, kind: ReferenceKind::Read });
+                }
+                continue;
+            }
+            if token.kind() == DOC_COMMENT {
+                if token.text().to_ascii_lowercase().contains(&name.to_ascii_lowercase()) {
+                    out.extend(see_function_refs(sema, &token, fqn));
+                }
+                continue;
+            }
+        }
         // `/** @var Foo $name */` in the scope
         if variable && token.kind() == DOC_COMMENT && crate::sema::in_variable_scope(&token, &root) {
             out.extend(doc_tag_variables(sema, &token, "@var", name));
@@ -446,17 +466,49 @@ fn file_references_of(
 }
 
 pub(crate) fn references(sema: &Sema, offset: TextSize, include_declaration: bool) -> Vec<Reference> {
+    references_with(sema, offset, include_declaration, false)
+}
+
+/// `for_rename`: only `compact()` arguments in the variable's own scope
+/// (Intelephense also reports those of other functions).
+pub(crate) fn references_with(
+    sema: &Sema,
+    offset: TextSize,
+    include_declaration: bool,
+    for_rename: bool,
+) -> Vec<Reference> {
     if let Some(refs) = this_references(sema, offset) {
         return refs;
     }
-    let Some((def, _)) = classify(sema, offset) else { return Vec::new() };
+    let Some((mut def, _)) = classify(sema, offset) else { return Vec::new() };
     let name = def.search_name();
+    // a promoted constructor parameter used as a variable: the property
+    if let Definition::Variable { scope, .. } = &def {
+        if let Some(class) = promoted_param(sema, *scope, &name).and_then(|p| sema.enclosing_class(&p)) {
+            def = Definition::Property { class, name: name.clone() };
+        }
+    }
     if let Definition::Variable { scope, .. } = &def {
         let mut out = file_references(sema, &def, &name, include_declaration);
         out.extend(param_doc_references(sema, *scope, &name));
         // the same parameter of overridden / overriding methods (named
         // arguments)
-        out.extend(related_param_references(sema, *scope, &name, include_declaration));
+        let related = related_param_references(sema, *scope, &name, include_declaration);
+        // `compact('name')` anywhere in these files (as Intelephense)
+        let mut files: Vec<FileId> = related.iter().map(|r| r.file).collect();
+        files.sort();
+        files.dedup();
+        if for_rename {
+            out.extend(compact_references(sema, &name).into_iter().filter(|r| scope.contains_range(r.range)));
+        } else {
+            out.extend(compact_references(sema, &name));
+            for file in files.into_iter().filter(|f| *f != sema.file) {
+                if let Some(s) = Sema::new(sema.ws, file) {
+                    out.extend(compact_references(&s, &name));
+                }
+            }
+        }
+        out.extend(related);
         // a global variable: the file scope and the functions declaring it;
         // closures importing the variable with `use`
         let mut others = global_scopes(sema, *scope, &name);
@@ -534,6 +586,17 @@ pub(crate) fn references(sema: &Sema, offset: TextSize, include_declaration: boo
                 let Some(s) = Sema::new(ws, loc.file) else { continue };
                 let Some(token) = s.root.token_at_offset(loc.focus.start()).right_biased() else { continue };
                 let promoted = token.parent().filter(|p| p.kind() == PARAM);
+                if let Some(param) = &promoted {
+                    // the parameter inside the constructor and `compact()`
+                    let scope = s.variable_scope(param).text_range();
+                    let var = Definition::Variable { name: name.clone(), scope };
+                    out.extend(file_references(&s, &var, name, include_declaration));
+                    out.extend(
+                        compact_references(&s, name)
+                            .into_iter()
+                            .filter(|r| !for_rename || scope.contains_range(r.range)),
+                    );
+                }
                 if let Some(method) = promoted.and_then(|p| p.ancestors().find(|a| a.kind() == METHOD_DECL)) {
                     out.extend(param_doc_references(&s, method.text_range(), name));
                 }
@@ -675,6 +738,46 @@ fn closure_scopes(sema: &Sema, scope: TextRange, name: &str) -> Vec<TextRange> {
     done
 }
 
+/// A string literal that is a whole call argument and names the global
+/// function `fqn` (case-insensitive, optionally with a leading `\\`): the
+/// range of its content.
+fn function_string_ref(token: &SyntaxToken, fqn: &php_hir::Fqn) -> Option<TextRange> {
+    let literal = token.parent().filter(|p| p.kind() == LITERAL)?;
+    literal.parent().filter(|p| p.kind() == ARG)?;
+    let text = token.text();
+    let quote = text.chars().next().filter(|c| *c == '\'' || *c == '"')?;
+    if text.len() < 2 || !text.ends_with(quote) {
+        return None;
+    }
+    let content = &text[1..text.len() - 1];
+    // only plain names, so only global functions (as Intelephense)
+    let name = content.strip_prefix('\\').unwrap_or(content);
+    if name.contains('\\') || !name.eq_ignore_ascii_case(fqn.as_str()) {
+        return None;
+    }
+    let start = token.text_range().start() + TextSize::from(1);
+    Some(TextRange::at(start, TextSize::from(content.len() as u32)))
+}
+
+/// `@see f()` / `@uses f()` naming the function `fqn`.
+fn see_function_refs(sema: &Sema, token: &SyntaxToken, fqn: &php_hir::Fqn) -> Vec<Reference> {
+    let text = token.text();
+    let base = token.text_range().start();
+    see_refs(token)
+        .into_iter()
+        .filter(|r| {
+            let end = usize::from(r.range.end() - base);
+            text[end..].starts_with("()")
+        })
+        .filter(|r| {
+            let resolved = crate::classify::resolve_doc_name(sema, token, &r.name);
+            resolved.is_some_and(|f| f.eq_ignore_case(fqn))
+                || !r.name.contains('\\') && r.name.eq_ignore_ascii_case(fqn.as_str())
+        })
+        .map(|r| Reference { file: sema.file, range: r.range, kind: ReferenceKind::Read })
+        .collect()
+}
+
 /// Class names after `@see` / `@uses` (`@see Foo`, `{@see Foo::bar()}`).
 fn see_refs(token: &SyntaxToken) -> Vec<crate::doc_types::DocTypeRef> {
     let text = token.text();
@@ -779,6 +882,53 @@ fn doc_tag_variables(sema: &Sema, doc: &SyntaxToken, tag: &str, name: &str) -> V
             }
         }
         line_start += line.len();
+    }
+    out
+}
+
+/// The promoted constructor parameter `$name` of the method `scope`.
+fn promoted_param(sema: &Sema, scope: TextRange, name: &str) -> Option<SyntaxNode> {
+    let method = node_with_range(&sema.root, scope).filter(|n| n.kind() == METHOD_DECL)?;
+    method.descendants().filter(|n| n.kind() == PARAM).find(|p| {
+        <php_syntax::ast::Param as php_syntax::ast::AstNode>::cast(p.clone())
+            .is_some_and(|param| param.modifiers().is_some())
+            && p.children_with_tokens()
+                .any(|e| e.as_token().is_some_and(|t| t.kind() == VARIABLE && &t.text()[1..] == name))
+    })
+}
+
+/// `'name'` arguments of `compact()` calls in the file (their content).
+fn compact_references(sema: &Sema, name: &str) -> Vec<Reference> {
+    let mut out = Vec::new();
+    if !sema.root.text().contains_char('\'') && !sema.root.text().contains_char('"') {
+        return out;
+    }
+    for call in sema.root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        let Some(callee) = call.first_child().filter(|c| c.kind() == NAME_EXPR) else { continue };
+        if !php_syntax::ast::text_without_trivia(&callee)
+            .trim_start_matches('\\')
+            .eq_ignore_ascii_case("compact")
+        {
+            continue;
+        }
+        let Some(args) = call.children().find(|c| c.kind() == ARG_LIST) else { continue };
+        for arg in args.children().filter(|c| c.kind() == ARG) {
+            let Some(tok) = arg.first_child().filter(|c| c.kind() == LITERAL).and_then(|l| l.first_token())
+            else {
+                continue;
+            };
+            let text = tok.text();
+            if tok.kind() == STRING && text.len() >= 2 && &text[1..text.len() - 1] == name {
+                out.push(Reference {
+                    file: sema.file,
+                    range: TextRange::at(
+                        tok.text_range().start() + TextSize::from(1),
+                        TextSize::from(name.len() as u32),
+                    ),
+                    kind: ReferenceKind::Read,
+                });
+            }
+        }
     }
     out
 }
