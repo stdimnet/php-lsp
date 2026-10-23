@@ -101,6 +101,6 @@ PHP-Parser:
 | Area | Result |
 |---|---|
 | Diagnostics | all codes checked case by case for PHP 7.4 to 8.5 |
-| Formatting | identical output for 97 % of PHP files, 95 % of WordPress files including templates |
-| Find references | 97.6 to 99.9 % of Intelephense's locations |
-| Rename | ~2100 renames: 99.5 % add no diagnostic and round-trip exactly |
+| Formatting | identical output for 1197 of 1200 files (300 per project, templates included) |
+| Find references | 99.1 to 99.97 % of Intelephense's locations |
+| Rename | ~1500 renames: 99.3 % add no diagnostic and round-trip exactly |

@@ -139,20 +139,24 @@ Intelephense's `initializationOptions` (`storagePath`, `globalStoragePath`, `cle
   file rename → class rename + PSR-4 namespace update (`workspace/willRenameFiles`),
   HTML in templates (tag / attribute / closing tag completion, linked editing of tag names).
   Compared with Intelephense on Laravel, Symfony, WordPress and PHP-Parser:
-  - the formatter produces Intelephense's output for 97 % of the PHP files (keeps
+  - the formatter produces Intelephense's output for 1197 of 1200 sampled files (300 per
+    project, templates included; keeps
     alignment, one statement per line, multi-line lists one element per line, blank lines
     around `namespace` / `use`, empty bodies as `{}`). Templates mixing HTML and PHP are
     formatted like Intelephense too: a port of js-beautify (HTML, CSS, JavaScript, with
     Intelephense's patches) gives identical output on 846 WordPress templates and 129 Blade
-    views; WordPress overall: 284 of 300 files identical
-  - find references returns 97.6–99.9 % of Intelephense's locations: a method with the
-    methods it overrides / implements and those overriding it (also through traits), a
-    parameter with its `@param` tag and the same parameter of related methods, `new Foo()`
-    for constructors, `$this` within its method, global variables across functions,
+    views
+  - find references returns 99.1–99.97 % of Intelephense's locations (94–99.9 % of
+    php-lsp's are also Intelephense's; most of the rest are sibling overrides that
+    Intelephense misses depending on the file order): a method with the methods it
+    overrides / implements and those overriding it (also through traits), a parameter
+    with its `@param` tag and the same parameter of related methods, `new Foo()` for
+    constructors, `$this` within its method, global variables across functions and files,
+    promoted parameters, `compact()`, function names in string arguments and `@see`,
     whole qualified names
   - rename (Intelephense premium, not available without a licence) is checked for
-    consistency instead (`examples/rename_check.rs`): of ~2100 renames in the four
-    projects 99.5 % add no diagnostic and are undone exactly by renaming back. Renames
+    consistency instead (`examples/rename_check.rs`): of ~1500 renames in the four
+    projects 99.3 % add no diagnostic and are undone exactly by renaming back. Renames
     follow closure `use` clauses, `@param` / `@var` tags, promoted constructor
     parameters and import aliases (renamed in their file only)
 - [x] **Phase 5, Intelephense compatibility:** `intelephense.*` settings, `--node-ipc`,
