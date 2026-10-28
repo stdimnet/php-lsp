@@ -271,6 +271,13 @@ fn stubs_are_indexed() {
     assert_eq!(syms[0].name, "DateTimeImmutable");
 }
 
+/// phpstorm-stubs' `meta` attributes are loaded by default (issue #2).
+#[test]
+fn jetbrains_attributes_are_known() {
+    let text = "<?php\nuse JetBrains\\PhpStorm\\Pure;\nuse JetBrains\\PhpStorm\\Deprecated;\nfinal class Money\n{\n    #[Pure]\n    public function cents(): int { return 1; }\n    #[Deprecated(reason: 'Use cents()')]\n    public function amount(): int { return 1; }\n}\n(new Money())->amount();\n";
+    assert_eq!(diags(text), vec!["P1007 'Money::amount' is deprecated. Use cents()"]);
+}
+
 fn diags(text: &str) -> Vec<String> {
     let mut ws = Workspace::new(Config::default());
     ws.load_stubs();
