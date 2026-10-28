@@ -132,6 +132,11 @@ for message in server.receive() {
 | `workspace()` | the underlying `php_ide::Workspace` |
 | `register_plugin(plugin)` | add a [plugin](plugins.md) |
 
+## Version
+
+`php_lsp::VERSION` and `php_ide::VERSION` hold the crates' version (the
+same as `serverInfo.version` and `php-lsp --version`).
+
 ## `php_lsp::format_document`
 
 ```rust

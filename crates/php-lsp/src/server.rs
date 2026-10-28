@@ -14,6 +14,8 @@ use crate::config::{ServerConfig, SECTIONS};
 use crate::{convert, uri};
 
 pub const SERVER_NAME: &str = "php-lsp";
+/// The version of php-lsp (also sent as `serverInfo.version`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `workspace/executeCommand`: run PHPUnit (`[uri, filter]`).
 pub const CMD_RUN_TEST: &str = "php-lsp.runTest";
 /// `workspace/executeCommand`: re-index the workspace.
@@ -126,7 +128,7 @@ impl Server {
             capabilities: capabilities(encoding),
             server_info: Some(lsp::ServerInfo {
                 name: SERVER_NAME.to_string(),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                version: Some(VERSION.to_string()),
             }),
         };
         let mut result = serde_json::to_value(result)?;
@@ -141,8 +143,7 @@ impl Server {
                 .unwrap_or_else(temp_dir)
                 .join("php-lsp"),
         };
-        let stub_dir =
-            storage.unwrap_or_else(temp_dir).join(format!("php-lsp-stubs-{}", env!("CARGO_PKG_VERSION")));
+        let stub_dir = storage.unwrap_or_else(temp_dir).join(format!("php-lsp-stubs-{VERSION}"));
         let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let server = Server {
             connection,

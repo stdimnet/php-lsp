@@ -22,7 +22,7 @@ pub mod uri;
 
 pub use embedded::{format_document, Embedded};
 pub use lsp_server;
-pub use server::{Result, Server, SERVER_NAME};
+pub use server::{Result, Server, SERVER_NAME, VERSION};
 
 /// Runs the server over stdin/stdout until the client exits.
 pub fn run_stdio() -> Result<()> {

@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "--stdio" => {}
             "--version" | "-V" => {
-                println!("php-lsp {}", env!("CARGO_PKG_VERSION"));
+                println!("php-lsp {}", php_lsp::VERSION);
                 return ExitCode::SUCCESS;
             }
             "--help" | "-h" => {

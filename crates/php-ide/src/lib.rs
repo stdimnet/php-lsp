@@ -52,6 +52,8 @@ mod workspace_symbols;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The version of php-ide (the same for all php-lsp crates).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use classify::Definition;
 pub use code_actions::{CodeAction, CodeActionKind};
 pub use completion::{CompletionItem, CompletionKind, CompletionList, TextEdit};
