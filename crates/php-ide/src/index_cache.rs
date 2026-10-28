@@ -89,17 +89,23 @@ impl IndexCache {
     }
 
     fn load(path: &Path, header: &Header) -> Option<Map> {
-        let mut r = BufReader::new(std::fs::File::open(path).ok()?);
+        use bincode::Options;
+        let file = std::fs::File::open(path).ok()?;
+        // a damaged file must not make a length field allocate gigabytes
+        let len = file.metadata().ok()?.len();
+        let options =
+            || bincode::DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(len);
+        let mut r = BufReader::new(file);
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).ok()?;
         if &magic != MAGIC {
             return None;
         }
-        let stored: Header = bincode::deserialize_from(&mut r).ok()?;
+        let stored: Header = options().deserialize_from(&mut r).ok()?;
         if &stored != header {
             return None;
         }
-        let entries: Vec<Entry> = bincode::deserialize_from(&mut r).ok()?;
+        let entries: Vec<Entry> = options().deserialize_from(&mut r).ok()?;
         Some(entries.into_iter().map(|e| (e.path, (e.hash, e.stub, Arc::new(e.symbols)))).collect())
     }
 
@@ -210,6 +216,22 @@ mod tests {
         );
         assert!(other.is_empty());
         cache.clear();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged file (here: a huge entry count) is ignored, not allocated.
+    #[test]
+    fn damaged_file_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("php-lsp-cache-damaged-{}", std::process::id()));
+        let opts = ExtractOptions::new(php_syntax::PhpVersion::PHP_8_4);
+        let cache = IndexCache::open(&dir, std::slice::from_ref(&dir), opts);
+        cache.save().unwrap();
+        let mut bytes = std::fs::read(cache.path()).unwrap();
+        let n = bytes.len();
+        bytes[n - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(cache.path(), &bytes).unwrap();
+        let cache = IndexCache::open(&dir, std::slice::from_ref(&dir), opts);
+        assert!(cache.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

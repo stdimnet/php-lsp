@@ -471,3 +471,60 @@ fn twig_over_lsp() {
     c.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A change republishes the diagnostics of the other open documents
+/// (issue #6: a rename across files left stale errors behind).
+#[test]
+fn diagnostics_of_dependent_documents_are_refreshed() {
+    use php_lsp::Embedded;
+    let (mut server, _) = Embedded::new(json!({ "capabilities": {} })).unwrap();
+    // undefined members are reported once indexing has finished
+    let started = std::time::Instant::now();
+    while !server.wait(std::time::Duration::from_millis(200)).iter().any(|m| m.contains("indexingEnded")) {
+        assert!(started.elapsed().as_secs() < 60, "indexing did not finish");
+    }
+    let service = "file:///p/src/Service.php";
+    let controller = "file:///p/src/Controller.php";
+    let open = |uri: &str, text: &str| {
+        json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {
+            "uri": uri, "languageId": "php", "version": 1, "text": text }}})
+        .to_string()
+    };
+    let change = |uri: &str, version: i32, text: &str| {
+        json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }})
+        .to_string()
+    };
+    // the last diagnostics published for `uri` in `messages`
+    let last = |messages: &[String], uri: &str| -> Option<Vec<String>> {
+        messages.iter().rev().find_map(|m| {
+            let v: Value = serde_json::from_str(m).ok()?;
+            (v["method"] == "textDocument/publishDiagnostics" && v["params"]["uri"] == uri).then(|| {
+                v["params"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["message"].to_string())
+                    .collect()
+            })
+        })
+    };
+    let svc = |m: &str| {
+        format!("<?php\nnamespace App;\n\nclass Service\n{{\n    public function {m}(): int {{ return 1; }}\n}}\n")
+    };
+    let ctl = |m: &str| {
+        format!("<?php\nnamespace App;\n\nclass Controller\n{{\n    public function run(Service $s): int {{ return $s->{m}(); }}\n}}\n")
+    };
+    server.send(&open(service, &svc("computeTotal"))).unwrap();
+    server.send(&open(controller, &ctl("computeTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller), Some(vec![]));
+    server.send(&change(controller, 2, &ctl("fooTotal"))).unwrap();
+    let m = server.receive();
+    assert_eq!(last(&m, controller).unwrap().len(), 1, "{m:?}");
+    // renaming the method in Service.php fixes Controller.php
+    server.send(&change(service, 2, &svc("fooTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller), Some(vec![]));
+    // and breaking it again reports the error there
+    server.send(&change(service, 3, &svc("computeTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller).map(|d| d.len()), Some(1));
+}

@@ -69,6 +69,9 @@ pub struct Server {
     /// URIs as sent by the client for open documents.
     pub(crate) client_uris: HashMap<FileId, lsp::Uri>,
     versions: HashMap<FileId, i32>,
+    /// Open documents whose diagnostics may be outdated because another
+    /// file changed; published once no message is waiting.
+    stale_diagnostics: std::collections::HashSet<FileId>,
     roots: Vec<PathBuf>,
     pub(crate) stub_dir: PathBuf,
     /// Where the index cache is stored.
@@ -152,6 +155,7 @@ impl Server {
             encoding,
             caps,
             client_uris: HashMap::new(),
+            stale_diagnostics: Default::default(),
             versions: HashMap::new(),
             roots,
             stub_dir,
@@ -229,7 +233,24 @@ impl Server {
             }
             Message::Response(resp) => self.on_response(resp),
         }
+        if self.connection.receiver.is_empty() {
+            self.publish_stale_diagnostics();
+        }
         false
+    }
+
+    /// The other open documents may use symbols of `changed`.
+    fn mark_others_stale(&mut self, changed: Option<FileId>) {
+        let others = self.client_uris.keys().copied().filter(|id| Some(*id) != changed);
+        self.stale_diagnostics.extend(others);
+    }
+
+    fn publish_stale_diagnostics(&mut self) {
+        let mut ids: Vec<FileId> = self.stale_diagnostics.drain().collect();
+        ids.sort();
+        for id in ids {
+            self.publish_now(id);
+        }
     }
 
     // ------------------------------------------------------------------ io
@@ -432,6 +453,7 @@ impl Server {
                     if let Some(id) = self.file_for(&p.text_document.uri) {
                         if self.config.diagnostics_on_save {
                             self.publish_now(id);
+                            self.mark_others_stale(Some(id));
                         }
                         self.run_tools(id);
                     }
@@ -740,6 +762,9 @@ impl Server {
     }
 
     fn did_change_watched_files(&mut self, p: lsp::DidChangeWatchedFilesParams) {
+        if !self.config.diagnostics_on_save {
+            self.mark_others_stale(None);
+        }
         for change in p.changes {
             let key = uri::key_from_uri(change.uri.as_str());
             let open = self.workspace.file_id(&key).is_some_and(|id| self.client_uris.contains_key(&id));
@@ -778,6 +803,7 @@ impl Server {
         self.client_uris.insert(id, p.text_document.uri);
         self.versions.insert(id, p.text_document.version);
         self.publish_diagnostics(id);
+        self.mark_others_stale(Some(id));
         self.run_tools(id);
     }
 
@@ -801,6 +827,7 @@ impl Server {
         self.versions.insert(id, p.text_document.version);
         if !self.config.diagnostics_on_save {
             self.publish_diagnostics(id);
+            self.mark_others_stale(Some(id));
         }
     }
 
@@ -808,6 +835,7 @@ impl Server {
         let key = uri::key_from_uri(p.text_document.uri.as_str());
         let Some(id) = self.workspace.file_id(&key) else { return };
         self.client_uris.remove(&id);
+        self.stale_diagnostics.remove(&id);
         self.versions.remove(&id);
         self.tool_diags.remove(&id);
         // keep files that exist on disk indexed; forget untitled buffers
