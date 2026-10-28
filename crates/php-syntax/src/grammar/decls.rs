@@ -44,6 +44,19 @@ fn is_named_function(p: &mut Parser, n: usize) -> bool {
     super::nth_identifier_like(p, n) && p.nth_at(n + 1, L_PAREN)
 }
 
+/// `readonly` among the modifiers of a property or promoted parameter.
+fn require_readonly(p: &mut Parser) {
+    let mut i = 0;
+    while p.nth(i).is_modifier() {
+        if p.nth_at(i, READONLY_KW) {
+            let range = p.nth_range(i);
+            p.require_version(PhpVersion::PHP_8_1, "readonly properties", range);
+            return;
+        }
+        i += 1;
+    }
+}
+
 fn modifiers(p: &mut Parser) {
     if !p.current().is_modifier() {
         return;
@@ -378,6 +391,7 @@ fn class_const(p: &mut Parser) {
 fn property(p: &mut Parser) {
     p.start(PROPERTY_DECL);
     attributes(p);
+    require_readonly(p);
     modifiers(p);
     if !p.at(VARIABLE) {
         p.require_version_here(PhpVersion::PHP_7_4, "typed properties");
@@ -524,6 +538,7 @@ pub(crate) fn param_list(p: &mut Parser) {
         if p.current().is_modifier() {
             p.require_version_here(PhpVersion::PHP_8_0, "constructor property promotion");
         }
+        require_readonly(p);
         modifiers(p);
         if at_type_start(p) {
             type_decl(p);

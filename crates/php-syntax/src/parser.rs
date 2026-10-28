@@ -111,6 +111,14 @@ impl<'t> Parser<'t> {
         self.pos
     }
 
+    /// Range of the `n`th significant token from the current one.
+    pub(crate) fn nth_range(&self, n: usize) -> TextRange {
+        match self.significant.get(self.pos + n) {
+            Some(&i) => TextRange::new(self.offsets[i].into(), self.offsets[i + 1].into()),
+            None => TextRange::empty(TextSize::from(*self.offsets.last().unwrap())),
+        }
+    }
+
     pub(crate) fn current_range(&self) -> TextRange {
         match self.significant.get(self.pos) {
             Some(&i) => TextRange::new(self.offsets[i].into(), self.offsets[i + 1].into()),

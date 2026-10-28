@@ -86,7 +86,19 @@ fn valid_snippets() {
 #[test]
 fn version_gating() {
     assert!(errors("<?php enum A {}", PhpVersion::PHP_8_0).iter().any(|e| e.contains("enums")));
-    assert!(!errors("<?php $x = match($a) { default => 1 };", PhpVersion::PHP_7_4).is_empty());
+    // one version error each, no follow-up syntax errors (issue #4)
+    let e = errors("<?php $x = match($a) { default => 1 };", PhpVersion::PHP_7_4);
+    assert!(e.len() == 1 && e[0].contains("match expressions"), "{e:?}");
+    let e = errors("<?php echo $p?->x;", PhpVersion::PHP_7_4);
+    assert!(e.len() == 1 && e[0].contains("nullsafe operator"), "{e:?}");
+    assert!(errors("<?php match($a);", PhpVersion::PHP_7_4).is_empty());
+    assert!(errors("<?php echo \"$p?->x\";", PhpVersion::PHP_7_4).is_empty());
+    // readonly properties, also promoted (issue #3)
+    let e = errors("<?php class A { public readonly int $x; }", PhpVersion::PHP_8_0);
+    assert!(e.len() == 1 && e[0].contains("readonly properties"), "{e:?}");
+    let e = errors("<?php class A { function __construct(private readonly int $y) {} }", PhpVersion::PHP_8_0);
+    assert!(e.len() == 1 && e[0].contains("readonly properties"), "{e:?}");
+    assert!(errors("<?php class A { public readonly int $x; }", PhpVersion::PHP_8_1).is_empty());
     assert!(errors("<?php f(a: 1);", PhpVersion::PHP_7_4).iter().any(|e| e.contains("named arguments")));
     assert!(errors("<?php $a ??= 1;", PhpVersion::PHP_7_3).iter().any(|e| e.contains("??=")));
     assert!(errors("<?php fn() => 1;", PhpVersion::PHP_7_3).iter().any(|e| e.contains("arrow functions")));

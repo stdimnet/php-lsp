@@ -312,7 +312,9 @@ fn primary(p: &mut Parser) -> Option<SyntaxKind> {
         }
         FUNCTION_KW | FN_KW | HASH_BRACK => closure(p),
         STATIC_KW if matches!(p.nth(1), FUNCTION_KW | FN_KW) => closure(p),
-        MATCH_KW if p.version >= PhpVersion::PHP_8_0 && p.nth_at(1, L_PAREN) => match_expr(p),
+        MATCH_KW if p.nth_at(1, L_PAREN) && (p.version >= PhpVersion::PHP_8_0 || match_follows(p)) => {
+            match_expr(p)
+        }
         // contextual keywords used as plain names on older versions
         MATCH_KW | READONLY_KW => {
             p.start(NAME_EXPR);
@@ -410,6 +412,9 @@ fn postfix(p: &mut Parser, cp: Checkpoint, mut lhs: SyntaxKind) -> SyntaxKind {
                 lhs = INDEX_EXPR;
             }
             ARROW | NULLSAFE_ARROW => {
+                if p.at(NULLSAFE_ARROW) {
+                    p.require_version_here(PhpVersion::PHP_8_0, "the nullsafe operator");
+                }
                 p.bump();
                 dynamic_member_name(p);
                 lhs = if p.at(L_PAREN) {
@@ -747,7 +752,29 @@ fn closure(p: &mut Parser) -> SyntaxKind {
     kind
 }
 
+/// Before PHP 8 `match` is a name: `match (...) {` is still parsed as a
+/// `match` expression (a call cannot be followed by `{`), so that the
+/// version is reported instead of a cascade of syntax errors.
+fn match_follows(p: &mut Parser) -> bool {
+    let mut depth = 0usize;
+    for i in 1..2000 {
+        match p.nth(i) {
+            L_PAREN => depth += 1,
+            R_PAREN => {
+                depth -= 1;
+                if depth == 0 {
+                    return p.nth_at(i + 1, L_CURLY);
+                }
+            }
+            EOF | SEMICOLON | L_CURLY | R_CURLY => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn match_expr(p: &mut Parser) -> SyntaxKind {
+    p.require_version_here(PhpVersion::PHP_8_0, "match expressions");
     p.start(MATCH_EXPR);
     p.bump();
     p.expect(L_PAREN);
@@ -876,6 +903,9 @@ fn class_name_variable(p: &mut Parser) {
                 lhs = INDEX_EXPR;
             }
             ARROW | NULLSAFE_ARROW => {
+                if p.at(NULLSAFE_ARROW) {
+                    p.require_version_here(PhpVersion::PHP_8_0, "the nullsafe operator");
+                }
                 p.start_at(cp, PROPERTY_FETCH_EXPR);
                 p.bump();
                 dynamic_member_name(p);

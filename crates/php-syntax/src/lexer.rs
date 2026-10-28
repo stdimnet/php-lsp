@@ -495,7 +495,9 @@ impl<'a> Lexer<'a> {
                 return Some((k, 3));
             }
         }
-        if self.starts_with(b"?->") && self.version >= PhpVersion::PHP_8_0 {
+        // also before PHP 8 (never valid code there): the parser reports the
+        // version instead of a cascade of syntax errors
+        if self.starts_with(b"?->") {
             return Some((NULLSAFE_ARROW, 3));
         }
         if self.starts_with(b"|>") {
