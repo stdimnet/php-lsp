@@ -1068,7 +1068,8 @@ impl<'a> Formatter<'a> {
         // prefix operator (`!  $a` -> `! $a`)
         let keep = !original.is_empty()
             && !(next.kind() == L_PAREN && CONTROL_KEYWORDS.contains(&prev.kind()))
-            && !is_prefix_op(prev);
+            && !is_prefix_op(prev)
+            && !declaration_keyword(prev);
         Some(match self.spaces(prev, next, original) {
             Some(0) => String::new(),
             _ if keep => original.to_string(),
@@ -1524,6 +1525,13 @@ fn statement_starting(token: &SyntaxToken) -> Option<SyntaxNode> {
         .find(|n| n.parent().is_some_and(|p| is_statement_list(p.kind())))
 }
 
+/// Modifiers and declaring keywords: `public   static   function   f()`
+/// becomes `public static function f()` (no alignment meant there).
+fn declaration_keyword(t: &SyntaxToken) -> bool {
+    t.kind().is_modifier() && t.parent().is_some_and(|p| p.kind() == MODIFIER_LIST)
+        || matches!(t.kind(), FUNCTION_KW | FN_KW | CONST_KW | CLASS_KW | INTERFACE_KW | TRAIT_KW)
+}
+
 /// A doc comment, or a `/**#@+` marker comment (PHP lexes it as a plain
 /// comment, Intelephense formats it like a doc comment).
 fn is_doc_like(t: &SyntaxToken) -> bool {
@@ -1761,6 +1769,14 @@ mod tests {
             assert_eq!(&fmt(input), expected, "input: {input}");
         }
     }
+    /// Issue #7: one space after modifiers and declaring keywords.
+    #[test]
+    fn declaration_keywords_take_one_space() {
+        let input = "<?php\nclass Fmt{\npublic function   sum( array $items ):int{ return 0; }\npublic   static   function make(){}\nprivate  $a  = 1;\n}\n$f = function   () {};\n";
+        let expected = "<?php\nclass Fmt\n{\n    public function sum(array $items): int\n    {\n        return 0;\n    }\n    public static function make() {}\n    private $a  = 1;\n}\n$f = function () {};\n";
+        assert_eq!(fmt(input), expected);
+    }
+
     /// Templates: Intelephense's output (js-beautify for the HTML, PHP
     /// indented from its `<?php`).
     #[test]
