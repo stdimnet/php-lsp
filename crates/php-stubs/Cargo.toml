@@ -1,0 +1,14 @@
+[package]
+name = "php-stubs"
+description = "JetBrains phpstorm-stubs (PHP core and extension declarations) embedded as compressed data"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+miniz_oxide.workspace = true
+
+[build-dependencies]
+miniz_oxide.workspace = true

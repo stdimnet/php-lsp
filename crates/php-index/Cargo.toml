@@ -1,0 +1,13 @@
+[package]
+name = "php-index"
+description = "Global symbol index with inheritance aware member lookup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+php-hir.workspace = true
+
+[dev-dependencies]
+php-syntax.workspace = true

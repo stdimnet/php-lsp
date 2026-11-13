@@ -1,0 +1,17 @@
+[package]
+name = "php-lsp-wasm"
+description = "The PHP language server as WebAssembly (browsers, Node.js, web workers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+php-lsp.workspace = true
+serde_json.workspace = true
+# must match the wasm-bindgen CLI used by build.sh
+wasm-bindgen = "=0.2.100"

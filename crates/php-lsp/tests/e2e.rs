@@ -1,0 +1,530 @@
+//! End-to-end tests talking LSP to an in-process server.
+
+use std::thread;
+
+use lsp_server::{Connection, Message, Notification, Request, RequestId};
+use serde_json::{json, Value};
+
+struct Client {
+    conn: Connection,
+    server: Option<thread::JoinHandle<()>>,
+    next_id: i32,
+}
+
+impl Client {
+    fn start(init_options: Value) -> Client {
+        Client::start_with(
+            json!({"capabilities": {"general": {"positionEncodings": ["utf-16"]}}, "initializationOptions": init_options}),
+        )
+    }
+
+    fn start_with(params: Value) -> Client {
+        let (server_conn, client_conn) = Connection::memory();
+        let server = thread::spawn(move || {
+            php_lsp::Server::initialize(server_conn).unwrap().run().unwrap();
+        });
+        let mut client = Client { conn: client_conn, server: Some(server), next_id: 0 };
+        let result = client.request("initialize", params);
+        assert_eq!(result["serverInfo"]["name"], "php-lsp");
+        assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
+        client.notify("initialized", json!({}));
+        client
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.next_id += 1;
+        let id = RequestId::from(self.next_id);
+        self.conn
+            .sender
+            .send(Message::Request(Request { id: id.clone(), method: method.into(), params }))
+            .unwrap();
+        loop {
+            match self.conn.receiver.recv().unwrap() {
+                Message::Response(r) if r.id == id => return r.response_result.expect("request failed"),
+                _ => {}
+            }
+        }
+    }
+
+    fn notify(&self, method: &str, params: Value) {
+        self.conn.sender.send(Message::Notification(Notification { method: method.into(), params })).unwrap();
+    }
+
+    fn wait_notification(&self, method: &str) -> Value {
+        loop {
+            let msg = self
+                .conn
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("timed out waiting for notification");
+            if std::env::var("E2E_DEBUG").is_ok() {
+                eprintln!("<- {msg:?}");
+            }
+            match msg {
+                Message::Notification(n) if n.method == method => return n.params,
+                _ => {}
+            }
+        }
+    }
+
+    fn open(&self, uri: &str, text: &str) {
+        self.notify(
+            "textDocument/didOpen",
+            json!({"textDocument": {"uri": uri, "languageId": "php", "version": 1, "text": text}}),
+        );
+    }
+
+    fn shutdown(mut self) {
+        self.request("shutdown", Value::Null);
+        self.notify("exit", Value::Null);
+        self.server.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+fn diagnostics_symbols_folding_selection() {
+    let mut c = Client::start(json!({}));
+    let uri = "file:///project/a.php";
+    c.open(uri, "<?php\nclass A {\n    function f() {\n        return 1\n    }\n}\n");
+
+    let diags = c.wait_notification("textDocument/publishDiagnostics");
+    assert_eq!(diags["uri"], uri);
+    let d = &diags["diagnostics"][0];
+    assert_eq!(d["message"], "expected `;`");
+    assert_eq!(d["range"]["start"], json!({"line": 3, "character": 16}));
+    assert_eq!(d["source"], "php-lsp");
+
+    let symbols = c.request("textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}));
+    assert_eq!(symbols[0]["name"], "A");
+    assert_eq!(symbols[0]["kind"], 5);
+    assert_eq!(symbols[0]["children"][0]["name"], "f");
+    assert_eq!(symbols[0]["children"][0]["kind"], 6);
+
+    let folds = c.request("textDocument/foldingRange", json!({"textDocument": {"uri": uri}}));
+    let folds: Vec<(u64, u64)> = folds
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["startLine"].as_u64().unwrap(), f["endLine"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(folds, vec![(1, 4), (2, 3)]);
+
+    let sel = c.request(
+        "textDocument/selectionRange",
+        json!({"textDocument": {"uri": uri}, "positions": [{"line": 3, "character": 15}]}),
+    );
+    assert_eq!(
+        sel[0]["range"],
+        json!({"start": {"line": 3, "character": 15}, "end": {"line": 3, "character": 16}})
+    );
+    assert!(sel[0]["parent"].is_object());
+
+    c.shutdown();
+}
+
+#[test]
+fn incremental_changes_with_utf16() {
+    let mut c = Client::start(json!({}));
+    let uri = "file:///b.php";
+    c.open(uri, "<?php\n$s = '😀'; $x = 1\n");
+    let d = c.wait_notification("textDocument/publishDiagnostics");
+    assert_eq!(d["diagnostics"].as_array().unwrap().len(), 1);
+    // insert the missing `;` after `1` (utf-16 column: emoji counts as 2)
+    c.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri, "version": 2},
+            "contentChanges": [{"range": {"start": {"line": 1, "character": 18}, "end": {"line": 1, "character": 18}}, "text": ";"}]
+        }),
+    );
+    let d = loop {
+        let d = c.wait_notification("textDocument/publishDiagnostics");
+        if d["version"] == 2 {
+            break d;
+        }
+    };
+    assert_eq!(d["diagnostics"], json!([]));
+    let tree = c.request("php-lsp/syntaxTree", json!({"textDocument": {"uri": uri}}));
+    assert!(tree.as_str().unwrap().contains("SEMICOLON@"));
+    c.shutdown();
+}
+
+#[test]
+fn php_version_from_intelephense_settings() {
+    let c = Client::start(json!({}));
+    let uri = "file:///c.php";
+    c.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"intelephense": {"environment": {"phpVersion": "7.4.0"}}}}),
+    );
+    c.open(uri, "<?php enum A {}\n");
+    let d = c.wait_notification("textDocument/publishDiagnostics");
+    assert!(d["diagnostics"][0]["message"].as_str().unwrap().contains("PHP 8.1+ syntax found"));
+    c.notify(
+        "workspace/didChangeConfiguration",
+        json!({"settings": {"intelephense.environment.phpVersion": "8.3"}}),
+    );
+    // diagnostics may be republished several times (re-indexing); wait for the new result
+    while c.wait_notification("textDocument/publishDiagnostics")["diagnostics"] != json!([]) {}
+    c.shutdown();
+}
+
+#[test]
+fn indexes_workspace_and_navigates() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src/Models")).unwrap();
+    std::fs::create_dir_all(dir.join("vendor/acme/lib")).unwrap();
+    std::fs::write(
+        dir.join("src/Models/User.php"),
+        "<?php\nnamespace App\\Models;\n\n/** A user. */\nclass User\n{\n    public function posts(): array { return []; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("vendor/acme/lib/Helper.php"),
+        "<?php\nnamespace Acme;\nfunction help(): int { return 1; }\n",
+    )
+    .unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {"window": {"workDoneProgress": true}},
+        "initializationOptions": {"storagePath": dir.join(".storage").display().to_string()},
+    }));
+    c.wait_notification("indexingEnded");
+
+    let uri = format!("{root_uri}/src/main.php");
+    let text =
+        "<?php\nuse App\\Models\\User;\n$u = new User();\n$u->posts();\n$n = strlen('x');\n\\Acme\\help();\n";
+    c.open(&uri, text);
+    c.wait_notification("textDocument/publishDiagnostics");
+
+    // definition in another (unopened) file
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 6}}),
+    );
+    assert!(def[0]["uri"].as_str().unwrap().ends_with("src/Models/User.php"), "{def}");
+    assert_eq!(def[0]["range"]["start"]["line"], 6);
+
+    // stubs: hover and definition (materialized on disk)
+    let hover = c.request(
+        "textDocument/hover",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 7}}),
+    );
+    assert!(hover["contents"]["value"].as_str().unwrap().contains("function strlen"), "{hover}");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 4, "character": 7}}),
+    );
+    let stub_uri = def[0]["uri"].as_str().unwrap().to_string();
+    assert!(stub_uri.starts_with("file://") && stub_uri.contains("php-lsp-stubs"), "{stub_uri}");
+    let path = php_lsp::uri::path_from_uri(&stub_uri).unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("function strlen"));
+
+    // vendor files are indexed
+    let hover = c.request(
+        "textDocument/hover",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 5, "character": 7}}),
+    );
+    assert!(hover["contents"]["value"].as_str().unwrap().contains("function help(): int"), "{hover}");
+
+    // member completion
+    let comp = c.request(
+        "textDocument/completion",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 3, "character": 4}}),
+    );
+    let labels: Vec<&str> =
+        comp["items"].as_array().unwrap().iter().map(|i| i["label"].as_str().unwrap()).collect();
+    assert!(labels.contains(&"posts"), "{labels:?}");
+
+    // references to User across files
+    let refs = c.request(
+        "textDocument/references",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 10}, "context": {"includeDeclaration": true}}),
+    );
+    assert_eq!(refs.as_array().unwrap().len(), 3, "{refs}");
+
+    // workspace symbols
+    let syms = c.request("workspace/symbol", json!({"query": "User"}));
+    assert_eq!(syms[0]["name"], "User");
+    assert_eq!(syms[0]["containerName"], "App\\Models");
+
+    // signature help
+    c.notify(
+        "textDocument/didChange",
+        json!({"textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": "<?php\nstr_replace('a', \n"}]}),
+    );
+    let sh = c.request(
+        "textDocument/signatureHelp",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 17}}),
+    );
+    assert_eq!(sh["activeParameter"], 1, "{sh}");
+    assert!(sh["signatures"][0]["label"].as_str().unwrap().starts_with("str_replace("));
+
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn editing_features_over_lsp() {
+    let mut c = Client::start(json!({}));
+    let uri = "file:///edit.php";
+    c.open(uri, "<?php\nclass Greeter{\npublic function hi($name){return 'hi '.$name;}\n}\n$g=new Greeter();\n$g->hi('x');\n");
+    c.wait_notification("textDocument/publishDiagnostics");
+
+    let edits = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(!edits.as_array().unwrap().is_empty());
+
+    let prep = c.request(
+        "textDocument/prepareRename",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 17}}),
+    );
+    assert_eq!(prep["placeholder"], "hi");
+    let edit = c.request(
+        "textDocument/rename",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 17}, "newName": "greet"}),
+    );
+    assert_eq!(edit["changes"][uri].as_array().unwrap().len(), 2, "{edit}");
+
+    let actions = c.request(
+        "textDocument/codeAction",
+        json!({"textDocument": {"uri": uri}, "range": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 7}}, "context": {"diagnostics": []}}),
+    );
+    let titles: Vec<&str> =
+        actions.as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"Add PHPDoc"), "{titles:?}");
+
+    let lenses = c.request("textDocument/codeLens", json!({"textDocument": {"uri": uri}}));
+    let resolved = c.request("codeLens/resolve", lenses[0].clone());
+    assert_eq!(resolved["command"]["title"], "1 reference");
+
+    let hints = c.request(
+        "textDocument/inlayHint",
+        json!({"textDocument": {"uri": uri}, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}}}),
+    );
+    assert!(hints.as_array().unwrap().iter().any(|h| h["label"] == "name:"), "{hints}");
+    let toks = c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri}}));
+    assert!(!toks["data"].as_array().unwrap().is_empty());
+    c.shutdown();
+}
+
+/// Needs `PHP_LSP_TOOLS_DIR` with phpstan.phar and php-cs-fixer.phar.
+#[test]
+#[ignore]
+fn external_tools() {
+    let tools = std::env::var("PHP_LSP_TOOLS_DIR").expect("PHP_LSP_TOOLS_DIR");
+    let dir = std::env::temp_dir().join(format!("php-lsp-tools-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let file = dir.join("src/a.php");
+    let text = "<?php\nnamespace App;\nclass A {\n  public function f(int $x): string { return $x; }\n}\n";
+    std::fs::write(&file, text).unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {},
+        "initializationOptions": {"php-lsp": {
+            "tools": {
+                "phpstan": {"enable": true, "path": format!("{tools}/phpstan.phar"), "args": ["--level=5"]},
+                "phpCsFixer": {"path": format!("{tools}/php-cs-fixer.phar")}
+            },
+            "format": {"provider": "php-cs-fixer"}
+        }},
+    }));
+    let uri = format!("{root_uri}/src/a.php");
+    c.open(&uri, text);
+    let d = loop {
+        let d = c.wait_notification("textDocument/publishDiagnostics");
+        if d["diagnostics"].as_array().unwrap().iter().any(|x| x["source"] == "phpstan") {
+            break d;
+        }
+    };
+    let stan =
+        d["diagnostics"].as_array().unwrap().iter().find(|x| x["source"] == "phpstan").unwrap().clone();
+    assert!(stan["message"].as_str().unwrap().contains("should return string"), "{stan}");
+    assert_eq!(stan["range"]["start"]["line"], 3);
+    let edits = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(edits[0]["newText"].as_str().unwrap().contains("class A\n{"), "{edits}");
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `indexed N files in M ms (K from cache)` log line.
+fn wait_index_log(c: &Client) -> (usize, usize) {
+    loop {
+        let m = c.wait_notification("window/logMessage");
+        let text = m["message"].as_str().unwrap_or_default().to_string();
+        if let Some(rest) = text.strip_prefix("indexed ") {
+            let count = rest.split(' ').next().unwrap().parse().unwrap();
+            let cached = rest.split('(').nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+            return (count, cached);
+        }
+    }
+}
+
+#[test]
+fn index_cache_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/A.php"), "<?php\nclass A { public function a(): int { return 1; } }\n")
+        .unwrap();
+    std::fs::write(dir.join("src/B.php"), "<?php\nclass B extends A {}\n").unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let storage = dir.join(".storage");
+    let start = || {
+        let c = Client::start_with(json!({
+            "rootUri": root_uri,
+            "capabilities": {},
+            "initializationOptions": {"storagePath": storage.display().to_string()},
+        }));
+        let counts = wait_index_log(&c);
+        (c, counts)
+    };
+    let (c, (count, cached)) = start();
+    assert_eq!((count, cached), (2, 0));
+    c.shutdown();
+    let cache_file =
+        std::fs::read_dir(storage.join("php-lsp-index")).unwrap().next().unwrap().unwrap().path();
+
+    // unchanged: everything (stubs included) comes from the cache
+    let (mut c, (count, cached)) = start();
+    assert_eq!(count, 2);
+    assert!(cached > 2, "{cached}");
+    let uri = format!("{root_uri}/src/main.php");
+    c.open(&uri, "<?php\n(new B())->a();\n");
+    c.wait_notification("textDocument/publishDiagnostics");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 11}}),
+    );
+    assert!(def.to_string().contains("A.php"), "{def}");
+    c.shutdown();
+
+    // one file changed: parsed again
+    std::fs::write(dir.join("src/B.php"), "<?php\nclass B extends A { }\n").unwrap();
+    let (c, (_, cached_after_change)) = start();
+    assert_eq!(cached_after_change, cached - 1);
+    c.shutdown();
+
+    // a damaged cache is ignored
+    std::fs::write(&cache_file, b"garbage").unwrap();
+    let (c, (count, cached)) = start();
+    assert_eq!((count, cached), (2, 0));
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn twig_over_lsp() {
+    let dir = std::env::temp_dir().join(format!("php-lsp-twig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("templates")).unwrap();
+    std::fs::write(dir.join("composer.json"), "{}").unwrap();
+    std::fs::write(dir.join("templates/base.html.twig"), "{% block body %}{% endblock %}").unwrap();
+    let root_uri = format!("file://{}", dir.display());
+    let mut c = Client::start_with(json!({
+        "rootUri": root_uri,
+        "capabilities": {},
+        "initializationOptions": {"storagePath": dir.join(".storage").display().to_string()},
+    }));
+    let uri = format!("{root_uri}/templates/page.html.twig");
+    let text = "{% extends 'base.html.twig' %}\n{% block body %}\n  {% for i in 1..3 %}{{ i }}{% e\n{% endblock %}\n";
+    c.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": uri, "languageId": "twig", "version": 1, "text": text}}),
+    );
+    let d = c.wait_notification("textDocument/publishDiagnostics");
+    assert_eq!(d["diagnostics"], json!([]));
+    let items = c.request(
+        "textDocument/completion",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 2, "character": 32}}),
+    );
+    let labels: Vec<String> = items["items"]
+        .as_array()
+        .or_else(|| items.as_array())
+        .unwrap()
+        .iter()
+        .map(|i| i["label"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(labels[0], "endfor", "{labels:?}");
+    let def = c.request(
+        "textDocument/definition",
+        json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 14}}),
+    );
+    assert!(def.to_string().contains("base.html.twig"), "{def}");
+    let symbols = c.request("textDocument/documentSymbol", json!({"textDocument": {"uri": uri}}));
+    assert!(symbols.to_string().contains("\"body\""), "{symbols}");
+    let tokens = c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": uri}}));
+    assert!(!tokens["data"].as_array().unwrap().is_empty());
+    let fmt = c.request(
+        "textDocument/formatting",
+        json!({"textDocument": {"uri": uri}, "options": {"tabSize": 4, "insertSpaces": true}}),
+    );
+    assert!(fmt.is_null() || fmt == json!([]), "{fmt}");
+    c.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A change republishes the diagnostics of the other open documents
+/// (issue #6: a rename across files left stale errors behind).
+#[test]
+fn diagnostics_of_dependent_documents_are_refreshed() {
+    use php_lsp::Embedded;
+    let (mut server, _) = Embedded::new(json!({ "capabilities": {} })).unwrap();
+    // undefined members are reported once indexing has finished
+    let started = std::time::Instant::now();
+    while !server.wait(std::time::Duration::from_millis(200)).iter().any(|m| m.contains("indexingEnded")) {
+        assert!(started.elapsed().as_secs() < 60, "indexing did not finish");
+    }
+    let service = "file:///p/src/Service.php";
+    let controller = "file:///p/src/Controller.php";
+    let open = |uri: &str, text: &str| {
+        json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {
+            "uri": uri, "languageId": "php", "version": 1, "text": text }}})
+        .to_string()
+    };
+    let change = |uri: &str, version: i32, text: &str| {
+        json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+            "textDocument": { "uri": uri, "version": version }, "contentChanges": [{ "text": text }] }})
+        .to_string()
+    };
+    // the last diagnostics published for `uri` in `messages`
+    let last = |messages: &[String], uri: &str| -> Option<Vec<String>> {
+        messages.iter().rev().find_map(|m| {
+            let v: Value = serde_json::from_str(m).ok()?;
+            (v["method"] == "textDocument/publishDiagnostics" && v["params"]["uri"] == uri).then(|| {
+                v["params"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|d| d["message"].to_string())
+                    .collect()
+            })
+        })
+    };
+    let svc = |m: &str| {
+        format!("<?php\nnamespace App;\n\nclass Service\n{{\n    public function {m}(): int {{ return 1; }}\n}}\n")
+    };
+    let ctl = |m: &str| {
+        format!("<?php\nnamespace App;\n\nclass Controller\n{{\n    public function run(Service $s): int {{ return $s->{m}(); }}\n}}\n")
+    };
+    server.send(&open(service, &svc("computeTotal"))).unwrap();
+    server.send(&open(controller, &ctl("computeTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller), Some(vec![]));
+    server.send(&change(controller, 2, &ctl("fooTotal"))).unwrap();
+    let m = server.receive();
+    assert_eq!(last(&m, controller).unwrap().len(), 1, "{m:?}");
+    // renaming the method in Service.php fixes Controller.php
+    server.send(&change(service, 2, &svc("fooTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller), Some(vec![]));
+    // and breaking it again reports the error there
+    server.send(&change(service, 3, &svc("computeTotal"))).unwrap();
+    assert_eq!(last(&server.receive(), controller).map(|d| d.len()), Some(1));
+}

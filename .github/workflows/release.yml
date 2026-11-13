@@ -1,0 +1,141 @@
+name: Release
+
+# Builds the language server, the C library and the npm package for all
+# platforms. A tag `v*` publishes them as a GitHub release (and to npm when
+# the NPM_TOKEN secret is set); a manual run only uploads the artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, cross: true }
+          # fully static server binaries (no C library: musl has no cdylib)
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, cross: true, nolib: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-22.04, cross: true, nolib: true }
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build the server
+        run: cargo build --release --locked --target ${{ matrix.target }} -p php-lsp
+      - name: Build the C library
+        if: ${{ !matrix.nolib }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p php-lsp-ffi
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#v}
+          [ "$GITHUB_REF_TYPE" = tag ] || version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-${GITHUB_SHA::7}
+          target=${{ matrix.target }}
+          out=target/$target/release
+          mkdir -p dist
+          exe=""; [[ $target == *windows* ]] && exe=.exe
+          # the language server
+          name=php-lsp-$version-$target
+          mkdir -p "$name"
+          cp "$out/php-lsp$exe" README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "$name/"
+          mkdir -p "$name/node" && cp editors/node/* "$name/node/" 2>/dev/null || true
+          # the C library
+          if [ "${{ matrix.nolib }}" != true ]; then
+            lib=libphplsp-$version-$target
+            mkdir -p "$lib/include" "$lib/lib" "$lib/bindings"
+            cp crates/php-lsp-ffi/include/php_lsp.h "$lib/include/"
+            cp -r crates/php-lsp-ffi/bindings/* "$lib/bindings/"
+            cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md "$lib/"
+            for f in libphplsp.so libphplsp.dylib libphplsp.a phplsp.dll phplsp.dll.lib phplsp.lib; do
+              [ -f "$out/$f" ] && cp "$out/$f" "$lib/lib/"
+            done
+          fi
+          if [[ $target == *windows* ]]; then
+            for d in php-lsp-* libphplsp-*; do [ -d "$d" ] && 7z a -tzip "dist/$d.zip" "$d" > /dev/null; done
+          else
+            for d in php-lsp-* libphplsp-*; do [ -d "$d" ] && tar czf "dist/$d.tar.gz" "$d"; done
+          fi
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/*
+
+  wasm:
+    name: npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.100
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: crates/php-lsp-wasm/build.sh
+      - run: node crates/php-lsp-wasm/tests/node.mjs
+      - name: Pack
+        run: |
+          mkdir -p dist
+          cp LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md crates/php-lsp-wasm/pkg/
+          cd crates/php-lsp-wasm/pkg && npm pack --pack-destination ../../../dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-wasm
+          path: dist/*
+      - name: Publish to npm
+        if: github.ref_type == 'tag'
+        working-directory: crates/php-lsp-wasm/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -n "$NODE_AUTH_TOKEN" ]; then npm publish --access public; else echo "NPM_TOKEN not set, skipping"; fi
+
+  release:
+    name: GitHub release
+    needs: [build, wasm]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

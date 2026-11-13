@@ -1,0 +1,11 @@
+{
+  "name": "php-lsp-vscode-test",
+  "private": true,
+  "description": "Runs php-lsp inside the real Intelephense VS Code extension",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "2.4.1"
+  }
+}

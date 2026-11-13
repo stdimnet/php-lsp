@@ -1,0 +1,25 @@
+[package]
+name = "php-lsp"
+description = "PHP language server (LSP) built on php-ide, usable as a drop-in replacement for Intelephense"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "php-lsp"
+path = "src/main.rs"
+
+[features]
+default = ["parallel"]
+# Index and search references on several threads.
+parallel = ["php-ide/parallel"]
+
+[dependencies]
+php-ide.workspace = true
+php-tools.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "php-lsp-ffi"
+description = "C library of the PHP language server: LSP messages in and out as JSON, plus a formatter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# libphplsp.so / libphplsp.dylib / phplsp.dll and the static libphplsp.a
+name = "phplsp"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+php-lsp = { workspace = true, features = ["parallel"] }
+serde_json.workspace = true

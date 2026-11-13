@@ -1,0 +1,1187 @@
+//! The language server main loop: documents, settings and background indexing.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crossbeam_channel::{select, Receiver, Sender};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
+use lsp_types::{self as lsp, notification::Notification as _, request::Request as _};
+use php_ide::{FileId, FileKind, IndexedFile, PositionEncoding, Workspace};
+use serde_json::Value;
+
+use crate::config::{ServerConfig, SECTIONS};
+use crate::{convert, uri};
+
+pub const SERVER_NAME: &str = "php-lsp";
+/// The version of php-lsp (also sent as `serverInfo.version`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `workspace/executeCommand`: run PHPUnit (`[uri, filter]`).
+pub const CMD_RUN_TEST: &str = "php-lsp.runTest";
+/// `workspace/executeCommand`: re-index the workspace.
+pub const CMD_INDEX: &str = "php-lsp.indexWorkspace";
+const PROGRESS_TOKEN: &str = "php-lsp/indexing";
+
+/// Result type of the server functions.
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Messages from background threads to the main loop.
+pub(crate) enum Task {
+    Indexed {
+        generation: u32,
+        files: Vec<IndexedFile>,
+        stubs: bool,
+    },
+    IndexingDone {
+        generation: u32,
+        count: usize,
+        /// Files taken from the on-disk cache.
+        cached: usize,
+        millis: u128,
+    },
+    ToolDiagnostics {
+        file: FileId,
+        tool: php_tools::Tool,
+        run: u32,
+        result: std::result::Result<Vec<php_tools::ToolDiagnostic>, String>,
+    },
+}
+
+/// What the client supports.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ClientCaps {
+    pub config_pull: bool,
+    pub work_done_progress: bool,
+    pub watch_registration: bool,
+    pub snippets: bool,
+    pub location_links: bool,
+    pub vscode: bool,
+    pub markdown: bool,
+}
+
+/// A running language server instance.
+pub struct Server {
+    pub(crate) connection: Connection,
+    pub(crate) workspace: Workspace,
+    pub(crate) config: ServerConfig,
+    pub(crate) encoding: PositionEncoding,
+    pub(crate) caps: ClientCaps,
+    /// URIs as sent by the client for open documents.
+    pub(crate) client_uris: HashMap<FileId, lsp::Uri>,
+    versions: HashMap<FileId, i32>,
+    /// Open documents whose diagnostics may be outdated because another
+    /// file changed; published once no message is waiting.
+    stale_diagnostics: std::collections::HashSet<FileId>,
+    roots: Vec<PathBuf>,
+    pub(crate) stub_dir: PathBuf,
+    /// Where the index cache is stored.
+    pub(crate) cache_dir: PathBuf,
+    /// `clearCache` in the initialization options: rebuild once.
+    pub(crate) clear_cache: bool,
+    next_request_id: i32,
+    pending: HashMap<RequestId, &'static str>,
+    shutdown_requested: bool,
+    task_tx: Sender<Task>,
+    pub(crate) task_rx: Receiver<Task>,
+    generation: u32,
+    indexing: bool,
+    cancel_indexing: Arc<std::sync::atomic::AtomicBool>,
+    /// Held while the index cache is written (shutdown waits for it).
+    cache_writer: Arc<std::sync::Mutex<()>>,
+    loaded_stubs: Vec<String>,
+    tool_runs: HashMap<(FileId, php_tools::Tool), u32>,
+    tool_diags: HashMap<FileId, HashMap<php_tools::Tool, Vec<php_tools::ToolDiagnostic>>>,
+    reported_tool_errors: std::collections::HashSet<php_tools::Tool>,
+}
+
+impl Server {
+    /// Performs the `initialize` handshake and creates the server.
+    pub fn initialize(connection: Connection) -> Result<Server> {
+        let (id, params) = connection.initialize_start()?;
+        let (server, result) = Server::create(connection, params)?;
+        server.connection.initialize_finish(id, result)?;
+        Ok(server)
+    }
+
+    /// Creates the server for the `initialize` params (without the
+    /// handshake); returns it and the `initialize` result.
+    pub(crate) fn create(connection: Connection, params: Value) -> Result<(Server, Value)> {
+        let params: lsp::InitializeParams = serde_json::from_value(params)?;
+        let encoding = negotiate_encoding(&params.capabilities);
+        let mut config = ServerConfig::default();
+        let mut storage: Option<PathBuf> = None;
+        let mut clear_cache = false;
+        if let Some(opts) = &params.initialization_options {
+            config.update(opts);
+            config.update(&serde_json::json!({ "intelephense": opts }));
+            if let Some(s) = opts.get("storagePath").and_then(Value::as_str) {
+                storage = Some(PathBuf::from(s));
+            }
+            clear_cache = opts.get("clearCache").and_then(Value::as_bool) == Some(true);
+        }
+        let mut caps = client_caps(&params);
+        // sent by the Intelephense VS Code extension
+        if params.initialization_options.as_ref().and_then(|o| o.get("isVscode")).and_then(Value::as_bool)
+            == Some(true)
+        {
+            caps.vscode = true;
+        }
+        // answer with the client's spelling of Windows drive letters
+        for folder in params.workspace_folders.iter().flatten() {
+            uri::learn_style(folder.uri.as_str());
+        }
+        #[allow(deprecated)]
+        if let Some(root) = &params.root_uri {
+            uri::learn_style(root.as_str());
+        }
+        let roots = workspace_roots(&params);
+        let result = lsp::InitializeResult {
+            capabilities: capabilities(encoding),
+            server_info: Some(lsp::ServerInfo {
+                name: SERVER_NAME.to_string(),
+                version: Some(VERSION.to_string()),
+            }),
+        };
+        let mut result = serde_json::to_value(result)?;
+        // not modelled by lsp-types yet
+        result["capabilities"]["typeHierarchyProvider"] = Value::Bool(true);
+        let workspace = Workspace::new(config.ide_config());
+        let cache_dir = match &storage {
+            Some(s) => s.join("php-lsp-index"),
+            None => cache_base().join("php-lsp"),
+        };
+        let stub_dir = storage.unwrap_or_else(cache_base).join(format!("php-lsp-stubs-{VERSION}"));
+        let (task_tx, task_rx) = crossbeam_channel::unbounded();
+        let server = Server {
+            connection,
+            workspace,
+            config,
+            encoding,
+            caps,
+            client_uris: HashMap::new(),
+            stale_diagnostics: Default::default(),
+            versions: HashMap::new(),
+            roots,
+            stub_dir,
+            cache_dir,
+            clear_cache,
+            next_request_id: 0,
+            pending: HashMap::new(),
+            shutdown_requested: false,
+            task_tx,
+            task_rx,
+            generation: 0,
+            indexing: false,
+            cancel_indexing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache_writer: Arc::new(std::sync::Mutex::new(())),
+            loaded_stubs: Vec::new(),
+            tool_runs: HashMap::new(),
+            tool_diags: HashMap::new(),
+            reported_tool_errors: std::collections::HashSet::new(),
+        };
+        Ok((server, result))
+    }
+
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    /// Adds a framework plugin (see [`php_ide::plugins::Plugin`]).
+    pub fn register_plugin(&mut self, plugin: std::sync::Arc<dyn php_ide::plugins::Plugin>) {
+        self.workspace.register_plugin(plugin);
+    }
+
+    /// Runs until the client sends `exit`.
+    pub fn run(mut self) -> Result<()> {
+        // `initialize_finish` already consumed the `initialized` notification
+        self.on_initialized();
+        let receiver = self.connection.receiver.clone();
+        let tasks = self.task_rx.clone();
+        loop {
+            select! {
+                recv(receiver) -> msg => {
+                    let Ok(msg) = msg else { return Ok(()) };
+                    if self.on_message(msg) {
+                        return Ok(());
+                    }
+                }
+                recv(tasks) -> task => {
+                    if let Ok(task) = task {
+                        self.on_task(task);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles one message; returns `true` on `exit`.
+    pub(crate) fn on_message(&mut self, msg: Message) -> bool {
+        match msg {
+            Message::Request(req) => {
+                if self.shutdown_requested {
+                    self.respond_error(req.id, ErrorCode::InvalidRequest, "server is shutting down");
+                } else if req.method == lsp::request::Shutdown::METHOD {
+                    self.shutdown_requested = true;
+                    // let a running cache write finish
+                    drop(self.cache_writer.lock());
+                    self.respond(req.id, Value::Null);
+                } else {
+                    self.on_request(req);
+                }
+            }
+            Message::Notification(not) => {
+                if not.method == lsp::notification::Exit::METHOD {
+                    return true;
+                }
+                self.on_notification(not);
+            }
+            Message::Response(resp) => self.on_response(resp),
+        }
+        if self.connection.receiver.is_empty() {
+            self.publish_stale_diagnostics();
+        }
+        false
+    }
+
+    /// The other open documents may use symbols of `changed`.
+    fn mark_others_stale(&mut self, changed: Option<FileId>) {
+        let others = self.client_uris.keys().copied().filter(|id| Some(*id) != changed);
+        self.stale_diagnostics.extend(others);
+    }
+
+    fn publish_stale_diagnostics(&mut self) {
+        let mut ids: Vec<FileId> = self.stale_diagnostics.drain().collect();
+        ids.sort();
+        for id in ids {
+            self.publish_now(id);
+        }
+    }
+
+    // ------------------------------------------------------------------ io
+
+    pub(crate) fn send(&self, msg: Message) {
+        // The client went away if this fails; the loop ends on its own.
+        let _ = self.connection.sender.send(msg);
+    }
+
+    pub(crate) fn respond(&self, id: RequestId, result: Value) {
+        self.send(Message::Response(Response { id, response_result: Ok(result) }));
+    }
+
+    pub(crate) fn respond_error(&self, id: RequestId, code: ErrorCode, msg: &str) {
+        self.send(Message::Response(Response::new_err(id, code as i32, msg.to_string())));
+    }
+
+    pub(crate) fn notify<N: lsp::notification::Notification>(&self, params: N::Params) {
+        let params = serde_json::to_value(params).unwrap_or(Value::Null);
+        self.send(Message::Notification(Notification { method: N::METHOD.to_string(), params }));
+    }
+
+    fn notify_raw(&self, method: &str, params: Value) {
+        self.send(Message::Notification(Notification { method: method.to_string(), params }));
+    }
+
+    fn request<R: lsp::request::Request>(&mut self, params: R::Params) {
+        self.next_request_id += 1;
+        let id = RequestId::from(format!("php-lsp-{}", self.next_request_id));
+        self.pending.insert(id.clone(), R::METHOD);
+        let params = serde_json::to_value(params).unwrap_or(Value::Null);
+        self.send(Message::Request(Request { id, method: R::METHOD.to_string(), params }));
+    }
+
+    pub(crate) fn show_message(&self, message: &str) {
+        self.notify::<lsp::notification::ShowMessage>(lsp::ShowMessageParams {
+            typ: lsp::MessageType::INFO,
+            message: message.to_string(),
+        });
+    }
+
+    /// The project root of a file: the workspace folder containing it, else
+    /// the nearest directory with a composer.json.
+    pub(crate) fn root_for(&self, path: &std::path::Path) -> PathBuf {
+        if let Some(r) = self.roots.iter().filter(|r| path.starts_with(r)).max_by_key(|r| r.as_os_str().len())
+        {
+            return r.clone();
+        }
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d.join("composer.json").exists() {
+                return d.to_path_buf();
+            }
+            dir = d.parent();
+        }
+        path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    }
+
+    /// Runs the enabled external analysers for a file in the background.
+    fn run_tools(&mut self, id: FileId) {
+        let Some(uri) = self.client_uris.get(&id) else { return };
+        let Some(path) = uri::path_from_uri(uri.as_str()) else { return };
+        let Some(file) = self.workspace.file(id) else { return };
+        // PHP tools do not understand templates
+        if file.path.ends_with(".twig") {
+            return;
+        }
+        let text = file.text.to_string();
+        let root = self.root_for(&path);
+        for (tool, cfg) in [
+            (php_tools::Tool::PhpStan, &self.config.tools.phpstan),
+            (php_tools::Tool::Psalm, &self.config.tools.psalm),
+            (php_tools::Tool::Phpcs, &self.config.tools.phpcs),
+        ] {
+            if !cfg.enabled {
+                continue;
+            }
+            let run = self.tool_runs.entry((id, tool)).or_insert(0);
+            *run += 1;
+            let run = *run;
+            let (cfg, root, path, text, tx) =
+                (cfg.clone(), root.clone(), path.clone(), text.clone(), self.task_tx.clone());
+            spawn(move || {
+                let result = php_tools::diagnostics(tool, &root, &path, &text, &cfg);
+                let _ = tx.send(Task::ToolDiagnostics { file: id, tool, run, result });
+            });
+        }
+    }
+
+    /// Formats with php-cs-fixer / phpcbf on a background thread and
+    /// answers the request when done.
+    pub(crate) fn external_format(&mut self, request: RequestId, uri: lsp::Uri) {
+        let (Some(id), Some(path)) = (self.file_for(&uri), uri::path_from_uri(uri.as_str())) else {
+            self.respond(request, Value::Null);
+            return;
+        };
+        let Some(file) = self.workspace.file(id) else { return };
+        if file.path.ends_with(".twig") || file.path.ends_with(".blade.php") {
+            self.respond(request, Value::Null);
+            return;
+        }
+        let text = file.text.to_string();
+        let index = file.line_index.clone();
+        let root = self.root_for(&path);
+        let (formatter, cfg) = match self.config.format_provider {
+            crate::config::FormatProvider::Phpcbf => {
+                (php_tools::Formatter::Phpcbf, self.config.tools.phpcbf.clone())
+            }
+            _ => (php_tools::Formatter::PhpCsFixer, self.config.tools.php_cs_fixer.clone()),
+        };
+        let encoding = self.encoding;
+        let sender = self.connection.sender.clone();
+        spawn(move || {
+            let response = match php_tools::format(formatter, &root, &path, &text, &cfg) {
+                Ok(new_text) if new_text != text => {
+                    let end = convert::position(&index, encoding, php_ide::TextSize::from(text.len() as u32));
+                    let edit =
+                        lsp::TextEdit { range: lsp::Range::new(lsp::Position::new(0, 0), end), new_text };
+                    Response {
+                        id: request,
+                        response_result: Ok(serde_json::to_value(vec![edit]).unwrap_or(Value::Null)),
+                    }
+                }
+                Ok(_) => Response { id: request, response_result: Ok(Value::Array(Vec::new())) },
+                Err(e) => Response::new_err(request, ErrorCode::RequestFailed as i32, e),
+            };
+            let _ = sender.send(Message::Response(response));
+        });
+    }
+
+    pub(crate) fn execute_command(&mut self, p: lsp::ExecuteCommandParams) {
+        match p.command.as_str() {
+            CMD_RUN_TEST => {
+                let uri = p.arguments.first().and_then(Value::as_str).map(str::to_string);
+                let filter =
+                    p.arguments.get(1).and_then(Value::as_str).filter(|f| !f.is_empty()).map(str::to_string);
+                let Some(path) = uri.as_deref().and_then(uri::path_from_uri) else { return };
+                let root = self.root_for(&path);
+                let cfg = self.config.tools.phpunit.clone();
+                let sender = self.connection.sender.clone();
+                self.show_message(&format!("Running {}…", filter.as_deref().unwrap_or("tests")));
+                spawn(move || {
+                    let (typ, message, log) =
+                        match php_tools::run_phpunit(&root, &path, filter.as_deref(), &cfg) {
+                            Ok(run) => (
+                                if run.success { lsp::MessageType::INFO } else { lsp::MessageType::ERROR },
+                                format!("PHPUnit: {}", run.summary),
+                                run.output,
+                            ),
+                            Err(e) => (lsp::MessageType::ERROR, format!("PHPUnit: {e}"), String::new()),
+                        };
+                    let send = |method: &str, params: Value| {
+                        let _ = sender
+                            .send(Message::Notification(Notification { method: method.into(), params }));
+                    };
+                    if !log.is_empty() {
+                        send("window/logMessage", serde_json::json!({"type": 4, "message": log}));
+                    }
+                    send("window/showMessage", serde_json::json!({"type": typ, "message": message}));
+                });
+            }
+            CMD_INDEX => self.reindex(),
+            _ => self.log(&format!("unknown command {}", p.command)),
+        }
+    }
+
+    /// `cancelIndexing` (Intelephense): stops the running indexing job.
+    pub(crate) fn cancel_indexing(&mut self) {
+        self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn log(&self, message: &str) {
+        self.notify::<lsp::notification::LogMessage>(lsp::LogMessageParams {
+            typ: lsp::MessageType::LOG,
+            message: message.to_string(),
+        });
+    }
+
+    // ------------------------------------------------------------------ dispatch
+
+    fn on_request(&mut self, req: Request) {
+        let id = req.id.clone();
+        match crate::handlers::dispatch(self, req) {
+            Some(Ok(value)) => self.respond(id, value),
+            Some(Err(e)) => self.respond_error(id, ErrorCode::InvalidParams, &e.to_string()),
+            None => {}
+        }
+    }
+
+    fn on_notification(&mut self, not: Notification) {
+        use lsp::notification::*;
+        let method = not.method.clone();
+        let result: Result<()> = (|| {
+            match not.method.as_str() {
+                DidOpenTextDocument::METHOD => self.did_open(serde_json::from_value(not.params)?),
+                DidChangeTextDocument::METHOD => self.did_change(serde_json::from_value(not.params)?),
+                DidCloseTextDocument::METHOD => self.did_close(serde_json::from_value(not.params)?),
+                DidSaveTextDocument::METHOD => {
+                    let p: lsp::DidSaveTextDocumentParams = serde_json::from_value(not.params)?;
+                    if let Some(id) = self.file_for(&p.text_document.uri) {
+                        if self.config.diagnostics_on_save {
+                            self.publish_now(id);
+                            self.mark_others_stale(Some(id));
+                        }
+                        self.run_tools(id);
+                    }
+                }
+                DidChangeWatchedFiles::METHOD => {
+                    self.did_change_watched_files(serde_json::from_value(not.params)?)
+                }
+                DidChangeConfiguration::METHOD => {
+                    let p: lsp::DidChangeConfigurationParams = serde_json::from_value(not.params)?;
+                    if p.settings.is_null() || p.settings.as_object().is_some_and(|o| o.is_empty()) {
+                        self.pull_config();
+                    } else {
+                        self.apply_config(&p.settings);
+                    }
+                }
+                DidChangeWorkspaceFolders::METHOD => {
+                    let p: lsp::DidChangeWorkspaceFoldersParams = serde_json::from_value(not.params)?;
+                    for f in p.event.removed {
+                        if let Some(path) = uri::path_from_uri(f.uri.as_str()) {
+                            self.roots.retain(|r| r != &path);
+                        }
+                    }
+                    for f in p.event.added {
+                        if let Some(path) = uri::path_from_uri(f.uri.as_str()) {
+                            self.roots.push(path);
+                        }
+                    }
+                    self.start_indexing();
+                }
+                Initialized::METHOD => {}
+                // Intelephense compatible commands
+                "indexWorkspace" | "intelephense/index" => self.reindex(),
+                // files of the project sent by the client (no file system,
+                // e.g. WebAssembly): `{"files": [{"uri": ..., "text": ...}]}`
+                "php/indexFiles" => {
+                    let files: Vec<(String, Arc<str>, FileKind)> = not
+                        .params
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|f| {
+                            let uri = f.get("uri")?.as_str()?;
+                            let text = f.get("text")?.as_str()?;
+                            Some((uri::key_from_uri(uri), Arc::<str>::from(text), FileKind::Workspace))
+                        })
+                        .collect();
+                    self.workspace.index_files(files);
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.log(&format!("failed to handle {method}: {e}"));
+        }
+    }
+
+    pub(crate) fn on_initialized(&mut self) {
+        self.register_watchers();
+        self.pull_config();
+        self.start_indexing();
+    }
+
+    fn on_response(&mut self, resp: Response) {
+        let Some(method) = self.pending.remove(&resp.id) else { return };
+        if method == lsp::request::WorkspaceConfiguration::METHOD {
+            if let Ok(Value::Array(items)) = resp.response_result {
+                let mut merged = serde_json::Map::new();
+                for (section, value) in SECTIONS.iter().zip(items) {
+                    if !value.is_null() {
+                        merged.insert(section.to_string(), value);
+                    }
+                }
+                self.apply_config(&Value::Object(merged));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ config
+
+    fn pull_config(&mut self) {
+        if !self.caps.config_pull {
+            return;
+        }
+        let items = SECTIONS
+            .iter()
+            .map(|s| lsp::ConfigurationItem { scope_uri: None, section: Some(s.to_string()) })
+            .collect();
+        self.request::<lsp::request::WorkspaceConfiguration>(lsp::ConfigurationParams { items });
+    }
+
+    fn apply_config(&mut self, settings: &Value) {
+        let old = self.config.clone();
+        self.config.update(settings);
+        if self.config == old {
+            return;
+        }
+        let reindex = old.php_version != self.config.php_version
+            || old.stubs != self.config.stubs
+            || old.exclude != self.config.exclude
+            || old.associations != self.config.associations
+            || old.max_file_size != self.config.max_file_size
+            || old.include_paths != self.config.include_paths;
+        let mut ide = self.config.ide_config();
+        if reindex {
+            // keep the old stubs until re-indexing replaces them
+            ide.stubs = self.workspace.config().stubs.clone();
+        }
+        self.workspace.set_config(ide);
+        if reindex && self.generation > 0 {
+            self.start_indexing();
+        }
+        let ids: Vec<FileId> = self.client_uris.keys().copied().collect();
+        for id in ids {
+            self.publish_diagnostics(id);
+        }
+    }
+
+    fn register_watchers(&mut self) {
+        if !self.caps.watch_registration {
+            return;
+        }
+        let watchers = self
+            .config
+            .associations
+            .iter()
+            .map(|a| lsp::FileSystemWatcher {
+                glob_pattern: lsp::GlobPattern::String(format!("**/{a}")),
+                kind: None,
+            })
+            .collect();
+        let options = lsp::DidChangeWatchedFilesRegistrationOptions { watchers };
+        self.request::<lsp::request::RegisterCapability>(lsp::RegistrationParams {
+            registrations: vec![lsp::Registration {
+                id: "php-lsp-watch".into(),
+                method: lsp::notification::DidChangeWatchedFiles::METHOD.into(),
+                register_options: serde_json::to_value(options).ok(),
+            }],
+        });
+    }
+
+    // ------------------------------------------------------------------ indexing
+
+    /// "Index workspace": rebuilds the index without the on-disk cache.
+    fn reindex(&mut self) {
+        self.open_index_cache().inspect(|c| c.clear());
+        self.start_indexing();
+    }
+
+    fn open_index_cache(&self) -> Option<Arc<php_ide::IndexCache>> {
+        self.config.index_cache.then(|| {
+            Arc::new(php_ide::IndexCache::open(
+                &self.cache_dir,
+                &self.roots,
+                self.workspace.extract_options(),
+            ))
+        })
+    }
+
+    /// Re-indexes stubs and all workspace folders on a background thread.
+    fn start_indexing(&mut self) {
+        self.generation += 1;
+        let generation = self.generation;
+        // apply the new stub list now; the stubs are re-indexed below
+        self.workspace.set_config(self.config.ide_config());
+        self.workspace.set_index_ready(false);
+        if std::mem::take(&mut self.clear_cache) {
+            self.open_index_cache().inspect(|c| c.clear());
+        }
+        let cache = self.open_index_cache();
+        self.workspace.set_index_cache(cache.clone());
+        // stubs are small: index them right away so hover / completion of
+        // built-ins work from the first request
+        if self.workspace.config().stubs != self.loaded_stubs || self.generation == 1 {
+            self.workspace.load_stubs();
+            self.loaded_stubs = self.workspace.config().stubs.clone();
+        }
+        let mut roots: Vec<(PathBuf, FileKind)> =
+            self.roots.iter().map(|r| (r.clone(), FileKind::Workspace)).collect();
+        roots.extend(self.config.include_paths.iter().map(|p| (PathBuf::from(p), FileKind::Vendor)));
+        let scan = self.config.scan_config();
+        let opts = self.workspace.extract_options();
+        let tx = self.task_tx.clone();
+        self.cancel_indexing.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancel_indexing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.cancel_indexing.clone();
+        let cache_writer = self.cache_writer.clone();
+        if !self.indexing {
+            self.indexing = true;
+            self.notify_raw("indexingStarted", Value::Null);
+            if self.caps.work_done_progress {
+                self.request::<lsp::request::WorkDoneProgressCreate>(lsp::WorkDoneProgressCreateParams {
+                    token: lsp::NumberOrString::String(PROGRESS_TOKEN.into()),
+                });
+                self.progress(lsp::WorkDoneProgress::Begin(lsp::WorkDoneProgressBegin {
+                    title: "Indexing PHP files".into(),
+                    cancellable: Some(false),
+                    message: None,
+                    percentage: None,
+                }));
+            }
+        }
+        spawn(move || {
+            let start = Stopwatch::start();
+            let mut count = 0;
+            for (root, root_kind) in roots {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let mut paths = php_ide::collect_files(&root, &scan);
+                if root_kind == FileKind::Vendor {
+                    for p in &mut paths {
+                        p.1 = FileKind::Vendor;
+                    }
+                }
+                // read and index in chunks to keep memory bounded and the UI updated
+                for chunk in paths.chunks(2000) {
+                    let texts: Vec<(String, Arc<str>, FileKind)> = chunk
+                        .iter()
+                        .filter_map(|(p, kind)| {
+                            let bytes = std::fs::read(p).ok()?;
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            Some((uri::key_from_path(p), Arc::<str>::from(text), *kind))
+                        })
+                        .collect();
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    count += texts.len();
+                    let files = php_ide::index_files_cached(texts, opts, cache.as_deref());
+                    if tx.send(Task::Indexed { generation, files, stubs: false }).is_err() {
+                        return;
+                    }
+                }
+            }
+            let cached = cache.as_ref().map_or(0, |c| c.hits());
+            let writing = cache_writer.lock();
+            let _ = tx.send(Task::IndexingDone { generation, count, cached, millis: start.millis() });
+            // after reporting: writing does not delay the first requests
+            if let Some(c) = cache.filter(|_| !cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                let _ = c.save();
+            }
+            drop(writing);
+        });
+    }
+
+    fn progress(&self, value: lsp::WorkDoneProgress) {
+        self.notify::<lsp::notification::Progress>(lsp::ProgressParams {
+            token: lsp::NumberOrString::String(PROGRESS_TOKEN.into()),
+            value: lsp::ProgressParamsValue::WorkDone(value),
+        });
+    }
+
+    pub(crate) fn on_task(&mut self, task: Task) {
+        match task {
+            Task::ToolDiagnostics { file, tool, run, result } => {
+                if self.tool_runs.get(&(file, tool)) != Some(&run) {
+                    return;
+                }
+                match result {
+                    Ok(diags) => {
+                        self.tool_diags.entry(file).or_default().insert(tool, diags);
+                        self.publish_now(file);
+                    }
+                    Err(e) => {
+                        self.log(&format!("{}: {e}", tool.name()));
+                        if self.reported_tool_errors.insert(tool) {
+                            self.show_message(&format!("{} could not be run: {e}", tool.name()));
+                        }
+                    }
+                }
+            }
+            Task::Indexed { generation, files, stubs } => {
+                if generation != self.generation {
+                    return;
+                }
+                for f in files {
+                    self.workspace.add_indexed(f);
+                }
+                if stubs {
+                    self.workspace.mark_stubs_loaded();
+                }
+            }
+            Task::IndexingDone { generation, count, cached, millis } => {
+                if generation != self.generation {
+                    return;
+                }
+                self.indexing = false;
+                self.workspace.set_index_ready(true);
+                // later stub reloads (config changes) parse again
+                self.workspace.set_index_cache(None);
+                self.log(&format!("indexed {count} files in {millis} ms ({cached} from cache)"));
+                let ids: Vec<FileId> = self.client_uris.keys().copied().collect();
+                for id in ids {
+                    self.publish_diagnostics(id);
+                }
+                self.notify_raw("indexingEnded", Value::Null);
+                if self.caps.work_done_progress {
+                    self.progress(lsp::WorkDoneProgress::End(lsp::WorkDoneProgressEnd {
+                        message: Some(format!("{count} files")),
+                    }));
+                }
+            }
+        }
+    }
+
+    fn did_change_watched_files(&mut self, p: lsp::DidChangeWatchedFilesParams) {
+        if !self.config.diagnostics_on_save {
+            self.mark_others_stale(None);
+        }
+        for change in p.changes {
+            let key = uri::key_from_uri(change.uri.as_str());
+            let open = self.workspace.file_id(&key).is_some_and(|id| self.client_uris.contains_key(&id));
+            if open {
+                continue;
+            }
+            match change.typ {
+                lsp::FileChangeType::DELETED => {
+                    if let Some(id) = self.workspace.file_id(&key) {
+                        self.workspace.remove_file(id);
+                    }
+                }
+                _ => {
+                    let Some(path) = uri::path_from_uri(change.uri.as_str()) else { continue };
+                    let Ok(bytes) = std::fs::read(&path) else { continue };
+                    if bytes.len() as u64 > self.config.max_file_size {
+                        continue;
+                    }
+                    let kind = if path.components().any(|c| c.as_os_str() == "vendor") {
+                        FileKind::Vendor
+                    } else {
+                        FileKind::Workspace
+                    };
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    self.workspace.index_file(&key, text.into(), kind);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ documents
+
+    fn did_open(&mut self, p: lsp::DidOpenTextDocumentParams) {
+        uri::learn_style(p.text_document.uri.as_str());
+        let key = uri::key_from_uri(p.text_document.uri.as_str());
+        let id = self.workspace.set_file(&key, p.text_document.text);
+        self.client_uris.insert(id, p.text_document.uri);
+        self.versions.insert(id, p.text_document.version);
+        self.publish_diagnostics(id);
+        self.mark_others_stale(Some(id));
+        self.run_tools(id);
+    }
+
+    fn did_change(&mut self, p: lsp::DidChangeTextDocumentParams) {
+        let key = uri::key_from_uri(p.text_document.uri.as_str());
+        let Some(id) = self.workspace.file_id(&key) else { return };
+        let Some(file) = self.workspace.file(id) else { return };
+        let mut text = file.text.to_string();
+        for change in p.content_changes {
+            match change.range {
+                Some(range) => {
+                    // Positions refer to the document after the previous change.
+                    let index = php_ide::LineIndex::new(&text);
+                    let r = convert::text_range(&index, self.encoding, range);
+                    text.replace_range(usize::from(r.start())..usize::from(r.end()), &change.text);
+                }
+                None => text = change.text,
+            }
+        }
+        self.workspace.set_file(&key, text);
+        self.versions.insert(id, p.text_document.version);
+        if !self.config.diagnostics_on_save {
+            self.publish_diagnostics(id);
+            self.mark_others_stale(Some(id));
+        }
+    }
+
+    fn did_close(&mut self, p: lsp::DidCloseTextDocumentParams) {
+        let key = uri::key_from_uri(p.text_document.uri.as_str());
+        let Some(id) = self.workspace.file_id(&key) else { return };
+        self.client_uris.remove(&id);
+        self.stale_diagnostics.remove(&id);
+        self.versions.remove(&id);
+        self.tool_diags.remove(&id);
+        // keep files that exist on disk indexed; forget untitled buffers
+        let on_disk = uri::path_from_uri(p.text_document.uri.as_str()).is_some_and(|p| p.exists());
+        if on_disk {
+            self.workspace.close_file(id);
+        } else {
+            self.workspace.remove_file(id);
+        }
+        self.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+            uri: p.text_document.uri,
+            diagnostics: Vec::new(),
+            version: None,
+        });
+    }
+
+    pub(crate) fn publish_diagnostics(&mut self, id: FileId) {
+        self.publish_now(id);
+    }
+
+    fn publish_now(&mut self, id: FileId) {
+        let (Some(uri), Some(index), Some(file)) =
+            (self.client_uris.get(&id).cloned(), self.workspace.line_index(id), self.workspace.file(id))
+        else {
+            return;
+        };
+        let diagnostics = if file.text.len() as u64 > self.config.max_file_size {
+            Vec::new()
+        } else {
+            self.workspace
+                .diagnostics(id)
+                .into_iter()
+                .map(|d| {
+                    let mut tags = Vec::new();
+                    if d.unnecessary {
+                        tags.push(lsp::DiagnosticTag::UNNECESSARY);
+                    }
+                    if d.deprecated {
+                        tags.push(lsp::DiagnosticTag::DEPRECATED);
+                    }
+                    lsp::Diagnostic {
+                        range: convert::range(&index, self.encoding, d.range),
+                        severity: Some(convert::severity(d.severity)),
+                        code: Some(lsp::NumberOrString::String(d.code.as_str().to_string())),
+                        code_description: None,
+                        source: Some(SERVER_NAME.to_string()),
+                        message: d.message,
+                        related_information: None,
+                        tags: if tags.is_empty() { None } else { Some(tags) },
+                        data: None,
+                    }
+                })
+                .collect()
+        };
+        let mut diagnostics = diagnostics;
+        if let Some(tools) = self.tool_diags.get(&id) {
+            let text = &file.text;
+            for d in tools.values().flatten() {
+                diagnostics.push(tool_diagnostic(&index, text, self.encoding, d));
+            }
+        }
+        let version = self.versions.get(&id).copied();
+        self.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+            uri,
+            diagnostics,
+            version,
+        });
+    }
+
+    pub(crate) fn file_for(&self, uri: &lsp::Uri) -> Option<FileId> {
+        self.workspace.file_id(&uri::key_from_uri(uri.as_str()))
+    }
+
+    /// URI for a file, materializing embedded stubs on disk so that clients
+    /// can open them.
+    pub(crate) fn uri_for(&self, id: FileId) -> Option<lsp::Uri> {
+        if let Some(u) = self.client_uris.get(&id) {
+            return Some(u.clone());
+        }
+        let file = self.workspace.file(id)?;
+        let key: &str = &file.path;
+        let s = match key.strip_prefix(php_ide::STUB_SCHEME) {
+            Some(rel) => {
+                let path = self.stub_dir.join(rel);
+                if !path.exists() {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&path, file.text.as_bytes()).ok()?;
+                }
+                uri::uri_from_key(&uri::key_from_path(&path))
+            }
+            None => uri::uri_from_key(key),
+        };
+        s.parse().ok()
+    }
+
+    /// Location of a range in a file.
+    pub(crate) fn location(&self, id: FileId, range: php_ide::TextRange) -> Option<lsp::Location> {
+        let index = self.workspace.line_index(id)?;
+        Some(lsp::Location { uri: self.uri_for(id)?, range: convert::range(&index, self.encoding, range) })
+    }
+}
+
+fn tool_diagnostic(
+    index: &php_ide::LineIndex,
+    text: &str,
+    enc: PositionEncoding,
+    d: &php_tools::ToolDiagnostic,
+) -> lsp::Diagnostic {
+    // tools report lines (and sometimes columns); without columns the whole
+    // line (without indentation) is marked
+    let line_start = index.offset(php_ide::LineCol { line: d.line, col: 0 });
+    let line_end = index.offset(php_ide::LineCol { line: d.line + 1, col: 0 });
+    let line_text = &text[usize::from(line_start)..usize::from(line_end).min(text.len())];
+    let indent = (line_text.len() - line_text.trim_start().len()) as u32;
+    let content_end = line_text.trim_end().len() as u32;
+    let start = match d.column {
+        Some(c) => convert::position(index, enc, line_start + php_ide::TextSize::from(c.min(content_end))),
+        None => convert::position(index, enc, line_start + php_ide::TextSize::from(indent.min(content_end))),
+    };
+    let end = match (d.end_line, d.end_column) {
+        (Some(l), Some(c)) => {
+            let o = index.offset(php_ide::LineCol { line: l, col: c });
+            convert::position(index, enc, o)
+        }
+        _ => convert::position(index, enc, line_start + php_ide::TextSize::from(content_end)),
+    };
+    lsp::Diagnostic {
+        range: lsp::Range::new(start, end),
+        severity: Some(match d.severity {
+            php_tools::ToolSeverity::Error => lsp::DiagnosticSeverity::ERROR,
+            php_tools::ToolSeverity::Warning => lsp::DiagnosticSeverity::WARNING,
+            php_tools::ToolSeverity::Information => lsp::DiagnosticSeverity::INFORMATION,
+        }),
+        code: d.code.clone().map(lsp::NumberOrString::String),
+        code_description: None,
+        source: Some(d.source.to_string()),
+        message: d.message.clone(),
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+fn client_caps(params: &lsp::InitializeParams) -> ClientCaps {
+    let caps = &params.capabilities;
+    let td = caps.text_document.as_ref();
+    ClientCaps {
+        config_pull: caps.workspace.as_ref().and_then(|w| w.configuration).unwrap_or(false),
+        work_done_progress: caps.window.as_ref().and_then(|w| w.work_done_progress).unwrap_or(false),
+        watch_registration: caps
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false),
+        snippets: td
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|i| i.snippet_support)
+            .unwrap_or(false),
+        location_links: td.and_then(|t| t.definition.as_ref()).and_then(|d| d.link_support).unwrap_or(false),
+        vscode: params
+            .client_info
+            .as_ref()
+            .is_some_and(|c| c.name.contains("Visual Studio Code") || c.name.contains("VSCodium")),
+        markdown: td
+            .and_then(|t| t.hover.as_ref())
+            .and_then(|h| h.content_format.as_ref())
+            .is_none_or(|f| f.contains(&lsp::MarkupKind::Markdown)),
+    }
+}
+
+/// Where caches go without a `storagePath`: `$XDG_CACHE_HOME`, `~/.cache`,
+/// `%LOCALAPPDATA%` on Windows (the temporary directory is cleaned there),
+/// else the temporary directory.
+fn cache_base() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from) } else { None })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(temp_dir)
+}
+
+#[allow(deprecated)]
+fn workspace_roots(params: &lsp::InitializeParams) -> Vec<PathBuf> {
+    if let Some(folders) = &params.workspace_folders {
+        let roots: Vec<PathBuf> = folders.iter().filter_map(|f| uri::path_from_uri(f.uri.as_str())).collect();
+        if !roots.is_empty() {
+            return roots;
+        }
+    }
+    if let Some(root) = &params.root_uri {
+        if let Some(p) = uri::path_from_uri(root.as_str()) {
+            return vec![p];
+        }
+    }
+    params.root_path.as_ref().map(|p| vec![PathBuf::from(p)]).unwrap_or_default()
+}
+
+fn negotiate_encoding(caps: &lsp::ClientCapabilities) -> PositionEncoding {
+    let offered = caps.general.as_ref().and_then(|g| g.position_encodings.as_ref());
+    if let Some(encodings) = offered {
+        if encodings.contains(&lsp::PositionEncodingKind::UTF8) {
+            return PositionEncoding::Utf8;
+        }
+        if encodings.contains(&lsp::PositionEncodingKind::UTF32)
+            && !encodings.contains(&lsp::PositionEncodingKind::UTF16)
+        {
+            return PositionEncoding::Utf32;
+        }
+    }
+    PositionEncoding::Utf16
+}
+
+fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
+    lsp::ServerCapabilities {
+        position_encoding: Some(match encoding {
+            PositionEncoding::Utf8 => lsp::PositionEncodingKind::UTF8,
+            PositionEncoding::Utf16 => lsp::PositionEncodingKind::UTF16,
+            PositionEncoding::Utf32 => lsp::PositionEncodingKind::UTF32,
+        }),
+        text_document_sync: Some(lsp::TextDocumentSyncCapability::Options(lsp::TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(lsp::TextDocumentSyncKind::INCREMENTAL),
+            will_save: None,
+            will_save_wait_until: None,
+            save: Some(lsp::TextDocumentSyncSaveOptions::Supported(true)),
+        })),
+        document_symbol_provider: Some(lsp::OneOf::Left(true)),
+        folding_range_provider: Some(lsp::FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(lsp::SelectionRangeProviderCapability::Simple(true)),
+        hover_provider: Some(lsp::HoverProviderCapability::Simple(true)),
+        definition_provider: Some(lsp::OneOf::Left(true)),
+        declaration_provider: Some(lsp::DeclarationCapability::Simple(true)),
+        type_definition_provider: Some(lsp::TypeDefinitionProviderCapability::Simple(true)),
+        implementation_provider: Some(lsp::ImplementationProviderCapability::Simple(true)),
+        references_provider: Some(lsp::OneOf::Left(true)),
+        document_highlight_provider: Some(lsp::OneOf::Left(true)),
+        workspace_symbol_provider: Some(lsp::OneOf::Left(true)),
+        inlay_hint_provider: Some(lsp::OneOf::Left(true)),
+        rename_provider: Some(lsp::OneOf::Right(lsp::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
+        code_action_provider: Some(lsp::CodeActionProviderCapability::Options(lsp::CodeActionOptions {
+            code_action_kinds: Some(vec![
+                lsp::CodeActionKind::QUICKFIX,
+                lsp::CodeActionKind::REFACTOR,
+                lsp::CodeActionKind::REFACTOR_EXTRACT,
+                lsp::CodeActionKind::REFACTOR_INLINE,
+                lsp::CodeActionKind::REFACTOR_REWRITE,
+                lsp::CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            work_done_progress_options: Default::default(),
+            resolve_provider: Some(false),
+        })),
+        linked_editing_range_provider: Some(lsp::LinkedEditingRangeServerCapabilities::Simple(true)),
+        document_link_provider: Some(lsp::DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
+        call_hierarchy_provider: Some(lsp::CallHierarchyServerCapability::Simple(true)),
+        document_formatting_provider: Some(lsp::OneOf::Left(true)),
+        execute_command_provider: Some(lsp::ExecuteCommandOptions {
+            commands: vec![CMD_RUN_TEST.into(), CMD_INDEX.into()],
+            work_done_progress_options: Default::default(),
+        }),
+        document_range_formatting_provider: Some(lsp::OneOf::Left(true)),
+        code_lens_provider: Some(lsp::CodeLensOptions { resolve_provider: Some(true) }),
+        semantic_tokens_provider: Some(lsp::SemanticTokensServerCapabilities::SemanticTokensOptions(
+            lsp::SemanticTokensOptions {
+                work_done_progress_options: Default::default(),
+                legend: crate::handlers::semantic_tokens_legend(),
+                range: Some(true),
+                full: Some(lsp::SemanticTokensFullOptions::Bool(true)),
+            },
+        )),
+        completion_provider: Some(lsp::CompletionOptions {
+            trigger_characters: Some(
+                ["$", ">", ":", "\\", "@", "#", "[", "<", "/"].iter().map(|s| s.to_string()).collect(),
+            ),
+            resolve_provider: Some(false),
+            ..Default::default()
+        }),
+        signature_help_provider: Some(lsp::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".into(), ",".into()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
+        workspace: Some(lsp::WorkspaceServerCapabilities {
+            workspace_folders: Some(lsp::WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(lsp::OneOf::Left(true)),
+            }),
+            file_operations: Some(lsp::WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(lsp::FileOperationRegistrationOptions {
+                    filters: vec![lsp::FileOperationFilter {
+                        scheme: Some("file".into()),
+                        pattern: lsp::FileOperationPattern {
+                            glob: "**/*.php".into(),
+                            matches: Some(lsp::FileOperationPatternKind::File),
+                            options: None,
+                        },
+                    }],
+                }),
+                ..Default::default()
+            }),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Runs `f` on a new thread; inline where there are no threads
+/// (WebAssembly): its results arrive as tasks like those of a thread.
+fn spawn(f: impl FnOnce() + Send + 'static) {
+    #[cfg(not(target_family = "wasm"))]
+    std::thread::Builder::new().stack_size(php_ide::STACK_SIZE).spawn(f).expect("thread");
+    #[cfg(target_family = "wasm")]
+    f();
+}
+
+/// The temporary directory (none in WebAssembly).
+fn temp_dir() -> PathBuf {
+    if cfg!(target_family = "wasm") {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// Elapsed time, where a clock exists.
+struct Stopwatch(Option<std::time::Instant>);
+
+impl Stopwatch {
+    fn start() -> Stopwatch {
+        Stopwatch((!cfg!(target_family = "wasm")).then(std::time::Instant::now))
+    }
+
+    fn millis(&self) -> u128 {
+        self.0.map_or(0, |s| s.elapsed().as_millis())
+    }
+}

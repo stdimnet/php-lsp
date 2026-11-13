@@ -1,0 +1,9 @@
+{
+  "name": "php-lsp-launcher",
+  "version": "0.1.0",
+  "description": "Node.js launcher for the native php-lsp language server (stdio, socket and Node IPC transports)",
+  "main": "php-lsp.js",
+  "bin": { "php-lsp-node": "php-lsp.js" },
+  "license": "MIT OR Apache-2.0",
+  "files": ["php-lsp.js", "bin/"]
+}

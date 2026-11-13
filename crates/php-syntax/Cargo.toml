@@ -1,0 +1,14 @@
+[package]
+name = "php-syntax"
+description = "Error tolerant PHP lexer and parser producing a lossless syntax tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+rowan.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true

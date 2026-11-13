@@ -1,0 +1,27 @@
+[package]
+name = "php-ide"
+description = "IDE features for PHP (completion, hover, navigation, diagnostics, ...) as a plain Rust API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+bincode.workspace = true
+php-syntax.workspace = true
+php-hir.workspace = true
+php-index.workspace = true
+php-stubs.workspace = true
+php-fmt.workspace = true
+rayon = { workspace = true, optional = true }
+walkdir.workspace = true
+globset.workspace = true
+
+[features]
+default = ["parallel"]
+# Use several threads for indexing and references (rayon).
+parallel = ["dep:rayon"]
+
+[dev-dependencies]
+expect-test.workspace = true
