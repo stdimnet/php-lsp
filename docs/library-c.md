@@ -52,6 +52,9 @@ Rules:
   the response is already in the queue for `php_lsp_receive`.
 - A handle must not be used from two threads at once; different handles
   are independent. Indexing runs on internal worker threads.
+- Deeply nested code is analysed recursively: call the library from a
+  thread with a large stack (e.g. 256 MB), not from the main thread
+  (1 MB on Windows).
 - Files that are not open are read from disk (workspace root) or can be
   passed with the notification `php/indexFiles`
   (`{"files":[{"uri":"file:///p/a.php","text":"<?php ..."}]}`) when there

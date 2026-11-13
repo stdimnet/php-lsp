@@ -97,6 +97,20 @@ io_threads.join()?;
 `php_lsp::run_stdio()`, `run_socket(port)` and `run_node_ipc()` do this for
 the standard transports (the binary is a thin `main` around them).
 
+## Stack size
+
+Deeply nested code (long `.` chains in generated files) is walked
+recursively. `run_stdio` / `run_socket` / `run_node_ipc` and the threads
+php-lsp starts use `php_ide::STACK_SIZE` (256 MB reserved, used only as
+needed). Call `Workspace`, `Server::run` or `Embedded` from a thread with
+such a stack too, not from the main thread (1 MB on Windows):
+
+```rust
+std::thread::Builder::new()
+    .stack_size(php_ide::STACK_SIZE)
+    .spawn(move || { /* use the workspace / server here */ })?;
+```
+
 ## `php_lsp::Embedded`
 
 The server without any transport, driven with JSON strings (this is what

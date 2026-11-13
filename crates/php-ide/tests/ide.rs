@@ -2201,3 +2201,22 @@ fn references_parity() {
     let text = "//- a.php\n<?php\nclass A { function fo<|>o() {} }\nfunction g() { global $x; $x->foo(); }\n//- b.php\n<?php\n$x = new A();\n";
     assert_eq!(refs(text), vec!["1:foo", "2:foo"]);
 }
+
+/// Deeply nested trees (long `.` chains) fit into a thread with
+/// `STACK_SIZE` (issue #8: the server died with a stack overflow).
+#[test]
+fn deep_trees_fit_the_stack() {
+    let text = format!("<?php\n$a = {};\n$a->\n", vec!["'x'"; 20_000].join(" . "));
+    let handle = std::thread::Builder::new()
+        .stack_size(php_ide::STACK_SIZE)
+        .spawn(move || {
+            let mut ws = Workspace::new(Config::default());
+            let id = ws.set_file("file:///deep.php", text.clone());
+            let _ = ws.diagnostics(id);
+            let _ = ws.completions(id, TextSize::from(text.len() as u32 - 1));
+            let _ = ws.format(id, None, &php_ide::FormatOptions::default());
+            let _ = ws.semantic_tokens(id, None);
+        })
+        .unwrap();
+    handle.join().unwrap();
+}

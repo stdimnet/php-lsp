@@ -36,6 +36,7 @@ mod lint_compat;
 mod lint_types;
 mod navigation;
 mod par;
+pub use par::STACK_SIZE;
 pub mod plugins;
 mod refactor;
 mod rename;
