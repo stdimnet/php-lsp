@@ -126,6 +126,14 @@ impl Server {
         {
             caps.vscode = true;
         }
+        // answer with the client's spelling of Windows drive letters
+        for folder in params.workspace_folders.iter().flatten() {
+            uri::learn_style(folder.uri.as_str());
+        }
+        #[allow(deprecated)]
+        if let Some(root) = &params.root_uri {
+            uri::learn_style(root.as_str());
+        }
         let roots = workspace_roots(&params);
         let result = lsp::InitializeResult {
             capabilities: capabilities(encoding),
@@ -140,13 +148,9 @@ impl Server {
         let workspace = Workspace::new(config.ide_config());
         let cache_dir = match &storage {
             Some(s) => s.join("php-lsp-index"),
-            None => std::env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-                .unwrap_or_else(temp_dir)
-                .join("php-lsp"),
+            None => cache_base().join("php-lsp"),
         };
-        let stub_dir = storage.unwrap_or_else(temp_dir).join(format!("php-lsp-stubs-{VERSION}"));
+        let stub_dir = storage.unwrap_or_else(cache_base).join(format!("php-lsp-stubs-{VERSION}"));
         let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let server = Server {
             connection,
@@ -798,6 +802,7 @@ impl Server {
     // ------------------------------------------------------------------ documents
 
     fn did_open(&mut self, p: lsp::DidOpenTextDocumentParams) {
+        uri::learn_style(p.text_document.uri.as_str());
         let key = uri::key_from_uri(p.text_document.uri.as_str());
         let id = self.workspace.set_file(&key, p.text_document.text);
         self.client_uris.insert(id, p.text_document.uri);
@@ -1010,6 +1015,17 @@ fn client_caps(params: &lsp::InitializeParams) -> ClientCaps {
     }
 }
 
+/// Where caches go without a `storagePath`: `$XDG_CACHE_HOME`, `~/.cache`,
+/// `%LOCALAPPDATA%` on Windows (the temporary directory is cleaned there),
+/// else the temporary directory.
+fn cache_base() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from) } else { None })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(temp_dir)
+}
+
 #[allow(deprecated)]
 fn workspace_roots(params: &lsp::InitializeParams) -> Vec<PathBuf> {
     if let Some(folders) = &params.workspace_folders {
@@ -1143,7 +1159,7 @@ fn capabilities(encoding: PositionEncoding) -> lsp::ServerCapabilities {
 /// (WebAssembly): its results arrive as tasks like those of a thread.
 fn spawn(f: impl FnOnce() + Send + 'static) {
     #[cfg(not(target_family = "wasm"))]
-    std::thread::spawn(f);
+    std::thread::Builder::new().stack_size(php_ide::STACK_SIZE).spawn(f).expect("thread");
     #[cfg(target_family = "wasm")]
     f();
 }

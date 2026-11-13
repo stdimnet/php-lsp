@@ -89,7 +89,8 @@ Intelephense's `initializationOptions` are accepted:
 | `isVscode` | Enables VS Code commands in results (trigger signature help after completing a function, editor commands for code lenses) |
 
 Without a storage path the cache lives in `$XDG_CACHE_HOME/php-lsp`, else
-`~/.cache/php-lsp`, else the temporary directory. Any other key in
+`~/.cache/php-lsp` (`%LOCALAPPDATA%\php-lsp` on Windows), else the
+temporary directory. Any other key in
 `initializationOptions` is read like an `intelephense` setting.
 
 ## Command line
