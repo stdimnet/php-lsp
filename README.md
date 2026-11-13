@@ -1,8 +1,6 @@
 # php-lsp
 
-A PHP language server written in pure Rust. Goal: every Intelephense feature (premium ones
-included), completely free, plus extras like refactorings, framework support and tool
-integration.
+A PHP language server written in pure Rust.
 
 It can be used in these ways:
 
